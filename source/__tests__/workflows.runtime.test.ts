@@ -59,12 +59,12 @@ describe("executeRun", () => {
     expect(done.nodes[0]!.error).toMatch(/headless/);
   });
 
-  it("refuses an unresolved scalar reference", async () => {
+  it("refuses an unresolved reference", async () => {
     const host = fakeHost();
     const run = await createRun(store, def([{ id: "w", type: "tool", tool: "write_file", input: { path: "o", content: "${inputs.missing}" } }]), {});
     const done = await executeRun(store, run.id, registry, config, undefined, host);
     expect(done.status).toBe("failed");
-    expect(done.nodes[0]!.error).toMatch(/Unresolved scalar workflow reference/);
+    expect(done.nodes[0]!.error).toMatch(/Unresolved workflow reference/);
     expect(host.calls).toHaveLength(0);
   });
 

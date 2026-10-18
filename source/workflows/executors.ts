@@ -6,6 +6,7 @@ import { applyJobOutcome, JobCancellationIncompleteError, runJobNode, type JobNo
 import { jobRequestId, type NodeCheckpoint, type WorkflowRun, type WorkflowStore } from "./store.js";
 import { createPendingDecision, DecisionPendingError, parkCheckpoint } from "./decisions.js";
 import { appendEvent } from "./events.js";
+import { resolveTemplate } from "./interpolate.js";
 
 /** Everything a node executor may use; trusted host callbacks never come from the definition. */
 export interface NodeExecutionContext {
@@ -32,21 +33,9 @@ export interface NodeExecutor {
   execute(ctx: NodeExecutionContext): Promise<NodeResult>;
 }
 
+/** Resolves `${...}` references in tool input against run inputs and node checkpoints (see interpolate.ts). */
 export function interpolate(value: unknown, run: WorkflowRun): unknown {
-  if (typeof value === "string") return value.replace(/\$\{([^}]+)\}/g, (_match, key: string) => {
-    const parts = key.split(".");
-    let resolved: unknown;
-    if (parts[0] === "inputs" && parts.length === 2 && Object.hasOwn(run.inputs, parts[1]!)) resolved = run.inputs[parts[1]!];
-    else if (parts[0] === "nodes" && parts.length === 3 && parts[2] === "output") {
-      const source = run.nodes.find(node => node.id === parts[1] && node.status === "passed");
-      resolved = source?.output;
-    }
-    if (resolved === undefined || (typeof resolved !== "string" && typeof resolved !== "number" && typeof resolved !== "boolean")) throw new Error(`Unresolved scalar workflow reference: ${key}`);
-    return String(resolved);
-  });
-  if (Array.isArray(value)) return value.map(item => interpolate(item, run));
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, interpolate(item, run)]));
-  return value;
+  return resolveTemplate(value, { inputs: run.inputs, nodes: Object.fromEntries(run.nodes.map(cp => [cp.id, { status: cp.status, output: cp.output }])) });
 }
 
 /** Approval gates park the node on an inbox decision; other ready branches still run. */
