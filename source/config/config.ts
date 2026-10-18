@@ -74,7 +74,21 @@ export interface AgavConfig {
   statusBar?: import("./status-bar-layout.js").StatusBarLayout;
   /** Opt-in; when unset or false, `run_background_job` and `/job` refuse to do anything. */
   backgroundJobsEnabled?: boolean;
-  /** "paused" makes `agav job tick`/daemon do nothing. Global-only (PROJECT_CONFIG_DENY). */
+  /** Global-only opt-in to foreground JSON workflows; also requires backgroundJobsEnabled. */
+  workflowsEnabled?: boolean;
+  /** Pool size for background workflow runner processes (separate from maxConcurrentJobs). Defaults to 2. */
+  maxConcurrentWorkflowRuns?: number;
+  /**
+   * When true, `run_command` refuses to run if the effective sandbox backend
+   * is "none". Defaults to false. Global-only: project config cannot set it
+   * (listed in PROJECT_CONFIG_DENY) so a repository cannot disable it.
+  */
+ sandboxRequired?: boolean;
+ /**
+  * Master switch for headless background automation (`agav job tick` /
+  * daemon). "paused" makes tick/daemon exit early. Defaults to "on".
+  * Global-only (listed in PROJECT_CONFIG_DENY).
+ */
   backgroundAutomation?: "on" | "paused";
   search?: boolean;
 }
@@ -155,6 +169,21 @@ export const PROJECT_CONFIG_TEMPLATE = {
   },
   backgroundJobsEnabled: {
     description: "Opt in to the background-jobs subsystem, enabling the run_background_job tool and /job command for launching, polling, tailing logs for, waiting on and stopping long-running commands outside the normal shell timeout and sandbox.",
+    type: "boolean",
+    eg: false,
+  },
+  workflowsEnabled: {
+    description: "Opt in to foreground JSON workflows (tool, approval and job nodes). Also requires backgroundJobsEnabled. Global-only.",
+    type: "boolean",
+    eg: false,
+  },
+  maxConcurrentWorkflowRuns: {
+    description: "Maximum number of background workflow runs executing at once; further runs wait as queued. Separate from the background-job pool.",
+    type: "number",
+    eg: 2,
+  },
+  sandboxRequired: {
+    description: "Refuse to run shell commands when no sandbox backend is available. Only honored from the global config (~/.agav/config.json); ignored in project config.",
     type: "boolean",
     eg: false,
   },
@@ -269,7 +298,9 @@ const DEFAULT_CONFIG: AgavConfig = {
   maxTokens: 16384,
   maxIterations: 800,
   errorRetries: 5,
+  sandboxRequired: false,
   backgroundAutomation: "on",
+  maxConcurrentWorkflowRuns: 2,
 };
 
 /** Merge nested config objects while letting later sources override scalar values. */
@@ -341,7 +372,11 @@ const PROJECT_CONFIG_DENY = new Set<string>([
   "deepseekApiKey",
   "geminiApiKey",
   "permissionMode",
+  // A repository must not be able to disable sandbox enforcement or
+  // re-enable/pause headless automation (decisions D1, D8).
+  "sandboxRequired",
   "backgroundAutomation",
+  "workflowsEnabled",
 ]);
 
 /** Ignore invalid hand-edited values instead of passing unsupported effort levels to providers. */
@@ -354,6 +389,25 @@ function sanitizeConfig(merged: AgavConfig): void {
   }
   if (!Number.isInteger(merged.errorRetries) || merged.errorRetries < 0) {
     merged.errorRetries = DEFAULT_CONFIG.errorRetries;
+  }
+  if (merged.backgroundAutomation !== "on" && merged.backgroundAutomation !== "paused") {
+    merged.backgroundAutomation = DEFAULT_CONFIG.backgroundAutomation;
+  }
+  // Ignore invalid hand-edited values instead of passing unsupported effort levels to providers.
+  if (!isEffortLevel(merged.effort)) {
+    merged.effort = DEFAULT_CONFIG.effort;
+  }
+  if (!Number.isInteger(merged.maxIterations) || merged.maxIterations < 1) {
+    merged.maxIterations = DEFAULT_CONFIG.maxIterations;
+  }
+  if (!Number.isInteger(merged.errorRetries) || merged.errorRetries < 0) {
+    merged.errorRetries = DEFAULT_CONFIG.errorRetries;
+  }
+  if (typeof merged.sandboxRequired !== "boolean") {
+    merged.sandboxRequired = DEFAULT_CONFIG.sandboxRequired;
+  }
+  if (!Number.isInteger(merged.maxConcurrentWorkflowRuns) || merged.maxConcurrentWorkflowRuns! < 1) {
+    merged.maxConcurrentWorkflowRuns = DEFAULT_CONFIG.maxConcurrentWorkflowRuns;
   }
   if (merged.backgroundAutomation !== "on" && merged.backgroundAutomation !== "paused") {
     merged.backgroundAutomation = DEFAULT_CONFIG.backgroundAutomation;
@@ -407,7 +461,7 @@ export async function loadConfig(): Promise<AgavConfig> {
   ) as unknown as AgavConfig;
 
   sanitizeConfig(merged);
-
+  
   // Treat allowed tools as additive so projects can extend, not erase, a user's global allowlist.
   if (projectConfig.allowedTools) {
     merged.allowedTools = [

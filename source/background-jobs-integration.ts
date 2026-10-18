@@ -40,6 +40,30 @@ export function reconcileOnStartup(
   return startupReconcilePromise;
 }
 
+let workflowReconcilePromise: Promise<void> | null = null;
+
+/**
+ * Once per process, fire-and-forget reconcile of background workflow runs (dead runners relaunched,
+ * queued runs admitted). Never rejects; errors are logged so they cannot block startup.
+ */
+export function reconcileWorkflowRunsOnStartup(opts: { maxConcurrentWorkflowRuns?: number } = {}): Promise<void> {
+  if (workflowReconcilePromise !== null) return workflowReconcilePromise;
+  workflowReconcilePromise = Promise.resolve()
+    .then(async () => {
+      const [{ reconcileRuns }, { WorkflowStore }, { cliEntryPath }] = await Promise.all([
+        import("./workflows/reconcile.js"),
+        import("./workflows/store.js"),
+        import("./workflows/background.js"),
+      ]);
+      const results = await reconcileRuns(new WorkflowStore(), { coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: opts.maxConcurrentWorkflowRuns });
+      for (const result of results) if (result.reason && result.action === "none") debugLog(`workflow reconcile ${result.runId}`, result.reason);
+    })
+    .catch((err: unknown) => {
+      debugLog("workflow startup reconcile failed", err);
+    });
+  return workflowReconcilePromise;
+}
+
 /** Test-only: clear the once-per-process guard; `enabled: false` disables the reconcile. */
 export function __resetStartupReconcileForTests(opts?: { enabled?: boolean }): void {
   startupReconcilePromise = null;

@@ -368,7 +368,7 @@ export interface Repositories {
 // Authorization / grants
 // ---------------------------------------------------------------------------
 
-export type GrantAction = "start" | "stop" | "cleanup" | "schedule-create" | "schedule-revoke" | "headless-start";
+export type GrantAction = "start" | "stop" | "cleanup" | "schedule-create" | "schedule-revoke" | "headless-start" | "workflow-run";
 
 export interface Grant {
   grantId: GrantId;
@@ -401,6 +401,8 @@ export interface SessionPolicySnapshot {
     action: GrantAction,
     spec: Omit<LaunchSpec, "requestId" | "createdAt">,
     subject?: ConfirmSubject,
+    /** Aborts when the authorizer stops waiting (session.signal); the host should withdraw its prompt. */
+    signal?: AbortSignal,
   ) => Promise<boolean>;
   signal?: AbortSignal;
 }

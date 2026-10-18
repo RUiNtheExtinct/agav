@@ -35,8 +35,14 @@ export const SUPERVISOR_INTERNAL_FLAG = "--internal-background-jobs-supervisor";
  */
 export const BACKGROUND_TICK_INTERNAL_FLAG = "--internal-background-jobs-tick";
 
+/**
+ * Private headless mode that executes one workflow run (`<flag> <runId>`) as a supervised background job
+ * and exits without rendering the Ink UI. Not a user command and not an authorization bypass.
+ */
+export const WORKFLOW_RUNNER_INTERNAL_FLAG = "--internal-workflow-runner";
+
 /** Every private self-reexec flag recognised as `process.argv[2]` by `cli.tsx`. */
-export const INTERNAL_FLAGS = [SUPERVISOR_INTERNAL_FLAG, BACKGROUND_TICK_INTERNAL_FLAG] as const;
+export const INTERNAL_FLAGS = [SUPERVISOR_INTERNAL_FLAG, BACKGROUND_TICK_INTERNAL_FLAG, WORKFLOW_RUNNER_INTERNAL_FLAG] as const;
 
 /**
  * Arguments that make the current executable run one headless tick.

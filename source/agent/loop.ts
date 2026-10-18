@@ -22,7 +22,7 @@ export type AgentEvent =
   | { type: "compacted"; droppedCount: number }
   | { type: "tool_call_start"; toolName: string; toolCallId: string }
   | { type: "tool_call_input_delta"; toolCallId: string; argsJson: string }
-  | { type: "tool_confirmation_request"; toolName: string; toolCallId: string; input: Record<string, unknown>; diffLines?: import("../utils/diff.js").DiffLine[] }
+  | { type: "tool_confirmation_request"; toolName: string; toolCallId: string; input: Record<string, unknown>; diffLines?: import("../utils/diff.js").DiffLine[]; warning?: string }
   | { type: "tool_result"; toolName: string; toolCallId?: string; output: string; isError: boolean; diffLines?: import("../utils/diff.js").DiffLine[] }
   | { type: "assistant_message_complete"; text: string }
   | { type: "turn_complete" }
@@ -42,12 +42,15 @@ export type ConfirmToolFn = (
   input: Record<string, unknown>,
   diffLines?: DiffLine[],
   mcpServerName?: string,
+  /** Informational one-line warning (e.g. write target outside the project). */
+  warning?: string,
 ) => Promise<ConfirmResult>;
 
 import type { PermissionMode } from "../config/config.js";
 import { runHook, getHookForTool } from "./hooks.js";
 import { isDestructiveCommand } from "../utils/sandbox.js";
 import { boundToolResult } from "../utils/tool-output.js";
+import { checkWrite, formatWorkspaceWarning } from "../utils/workspace-guard.js";
 
 interface LoopParams {
   provider: LLMProvider;
@@ -538,11 +541,22 @@ export async function* runAgentLoop(
           }
         } catch { }
 
+        // Warn-only: flag write targets that resolve outside the project.
+        // Denial is still checkPathBoundary's job inside the tools.
+        let warning: string | undefined;
+        if (WRITE_TOOLS.has(call.name) && typeof input.path === "string" && input.path) {
+          try {
+            warning = formatWorkspaceWarning(await checkWrite(input.path, process.cwd()));
+          } catch { }
+        }
+
         if (signal?.aborted) break;
-        yield { type: "tool_confirmation_request", toolName: call.name, toolCallId: id, input, diffLines: previewDiff };
+        yield { type: "tool_confirmation_request", toolName: call.name, toolCallId: id, input, diffLines: previewDiff, ...(warning ? { warning } : {}) };
         // Yielding also hands control to the UI, which may cancel the turn.
         if (signal?.aborted) break;
-        const choice = await confirmTool(call.name, input, previewDiff, tool?.mcpServerName);
+        const choice = warning
+          ? await confirmTool(call.name, input, previewDiff, tool?.mcpServerName, warning)
+          : await confirmTool(call.name, input, previewDiff, tool?.mcpServerName);
         if (signal?.aborted) break;
         if (choice === "always") {
           permissionMode = "auto-accept";

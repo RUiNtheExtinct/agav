@@ -116,11 +116,17 @@ Across **all** sandbox backends (including unsandboxed), environment variables w
 
 ### Requiring a sandbox
 
-Set `sandboxRequired: true` in `~/.agav/config.json` or `.agav/config.json` to make Agav refuse to start if no OS-level sandbox backend is available. This is recommended for CI, automation, and shared environments.
+Set `sandboxRequired: true` in the global `~/.agav/config.json`, or pass `--sandbox-required`, to refuse any `run_command` call that would execute without an OS-level sandbox. This is recommended for CI, automation, and shared environments.
 
 ```json
 { "sandboxRequired": true }
 ```
+
+Enforcement happens per `run_command` call against the *effective* backend: the requested `sandbox` override when one is given, otherwise the auto-detected backend. A call is refused, without executing, when that backend is `none`. This includes an explicit `sandbox: "none"` override, even with `AGAV_NO_SANDBOX=1`. An installed override such as `sandbox: "docker"` still runs.
+
+Agav still starts when no sandbox backend is available, but prints a startup warning that `run_command` calls will be refused.
+
+Project config (`.agav/config.json`) can't set or override `sandboxRequired`, so a repository can't turn it off. The setting covers only `run_command`. Skill shell blocks and background-job commands don't go through it, so they aren't covered.
 
 ## File tool path boundaries
 

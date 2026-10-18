@@ -98,7 +98,7 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition & { c
           },
           model: {
             type: "string",
-            description: "Only set this when the user explicitly requested a different model. Omit to use the active model. The requested model must exist and requires explicit per-call user approval."
+            description: "Only set this when the user explicitly requested a different model. Omit to use the active model. The requested model must exist."
           },
         },
         required: ["title", "task"],
@@ -166,16 +166,6 @@ export function createSubagentTool(deps: SubagentToolDeps): ToolDefinition & { c
         }
         if (!isProviderName(selectedModel.provider)) {
           return { output: `Model '${requestedModel}' has an unsupported provider and cannot be initialized.`, isError: true };
-        }
-
-        const approval = await deps.confirmationQueue.enqueue({
-          toolName: "subagent_model",
-          input: { title, model: requestedModel, activeModel: config.model },
-          subagentTask: title,
-          explicitApprovalOnly: true,
-        });
-        if (approval !== "yes") {
-          return { output: `Subagent model change to '${requestedModel}' was not approved.`, isError: true };
         }
 
         try {

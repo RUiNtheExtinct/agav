@@ -1,0 +1,1 @@
+{"version":1,"name":"long-tool","nodes":[{"id":"s","type":"tool","tool":"run_command","input":{"command":"sleep 30"}},{"id":"after","type":"tool","dependsOn":["s"],"tool":"list_directory","input":{"path":"."}}]}
