@@ -9,6 +9,8 @@ import { createRun, executeRun } from "../workflows/runtime.js";
 import { startRunner } from "../workflows/runner.js";
 import { buildConsent } from "../workflows/grant.js";
 import { WorkflowStore } from "../workflows/store.js";
+import { cancelRun } from "../workflows/control.js";
+import { createPendingDecision, decide, readDecision } from "../workflows/decisions.js";
 import { def, fakeHost, FakeCoordinator, registry, tempStore, testConfig } from "./helpers/workflow-fixtures.js";
 
 let store: WorkflowStore, cleanup: () => Promise<void>;
@@ -94,5 +96,37 @@ describe("notifications", () => {
     await postRunNotification(store, { ...(await store.read(run.id, registry)), status: "failed" });
     const [a, b] = await Promise.all([claimUnseenNotifications(store, "a"), claimUnseenNotifications(store, "b")]);
     expect(a.length + b.length).toBe(1);
+  });
+
+  it("the resumed runner posts its terminal notification once", async () => {
+    const run = await createRun(store, gated, {}, { host: "background" });
+    run.consent = buildConsent(gated, run.cwd, "ask", []);
+    await store.lock(run.id, () => store.save(run));
+    const ctx = { store, registry, config: testConfig({ permissionMode: "ask" }), getCoordinator: async () => new FakeCoordinator() };
+    await startRunner(run.id, ctx).done;
+    const [pending] = await listPendingDecisions(store, run.id);
+    await decide(store, run.id, pending!.decisionId, true, "u@h");
+    expect((await startRunner(run.id, ctx).done).status).toBe("passed");
+    expect((await startRunner(run.id, ctx).done).status).toBe("passed"); // a re-run of a terminal run posts nothing new
+    const shown = await claimUnseenNotifications(store, "s");
+    expect(shown.map(item => item.text)).toEqual([`Run ${run.id.slice(0, 8)} waiting for approval: gate`, `Run ${run.id.slice(0, 8)} passed`]);
+    expect(await claimUnseenNotifications(store, "s2")).toEqual([]);
+  });
+
+  it("cancelling a parked run (no runner) posts a cancelled notification", async () => {
+    const run = await createRun(store, gated, {});
+    await executeRun(store, run.id, registry, testConfig(), undefined, fakeHost());
+    expect((await cancelRun(store, run.id, registry)).status).toBe("cancelled");
+    expect((await claimUnseenNotifications(store, "s")).map(item => item.kind)).toEqual(["cancelled"]);
+  });
+});
+
+describe("agent_tool_consent records", () => {
+  it("round-trips and is decided once", async () => {
+    const run = await createRun(store, gated, {});
+    const pending = await createPendingDecision(store, run.id, { kind: "agent_tool_consent", nodeId: "gate", summary: "agent wants shell", resolved: { toolName: "shell", input: { command: "ls" }, inputHash: "x" } });
+    expect((await readDecision(store, run.id, pending.decisionId))?.pending.kind).toBe("agent_tool_consent");
+    expect((await decide(store, run.id, pending.decisionId, true, "a")).won).toBe(true);
+    expect((await decide(store, run.id, pending.decisionId, false, "b"))).toMatchObject({ won: false, record: { decision: "approve", decidedBy: "a" } });
   });
 });

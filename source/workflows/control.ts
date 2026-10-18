@@ -4,6 +4,7 @@ import { jobRequestId, WorkflowStore, type WorkflowRun } from "./store.js";
 import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, type JobNodeDeps } from "./job-node.js";
 import { decide, defaultDecider, isDecisionId, listPendingDecisions, readDecision, type DecidedRecord, type DecisionKind, type PendingDecision } from "./decisions.js";
 import { findRunnerJob, launchRun, type LaunchDeps, type LaunchResult } from "./launch.js";
+import { postRunNotification } from "./notify.js";
 
 export interface DecideOptions {
   registry: ToolRegistry;
@@ -125,7 +126,12 @@ export async function cancelRun(store: WorkflowStore, id: string, registry: Tool
           await store.save(run); // Real outcome (or the kept linkage/reason) is durable before anything else.
           if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
         }
-        if (!["passed", "failed", "cancelled", "timed_out"].includes(run.status)) { run.status = "cancelled"; await store.save(run); }
+        if (!["passed", "failed", "cancelled", "timed_out"].includes(run.status)) {
+          run.status = "cancelled";
+          await store.save(run);
+          // No runner settles a parked run, so announce it here (create-once: a duplicate from the runner is a no-op).
+          await postRunNotification(store, run);
+        }
         return run;
       });
     } catch (error) {

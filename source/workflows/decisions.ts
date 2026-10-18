@@ -11,7 +11,7 @@ import type { NodeCheckpoint, WorkflowRun, WorkflowStore } from "./store.js";
  * creating `<id>.decided.json` with `createExclusive`, so exactly one decider wins and run.json is never
  * touched by a decider (the runner stays its single writer).
  */
-export type DecisionKind = "approval" | "tool_consent" | "job_start" | "uncertain_tool";
+export type DecisionKind = "approval" | "tool_consent" | "agent_tool_consent" | "job_start" | "uncertain_tool";
 export interface ResolvedInput { toolName: string; input: unknown; inputHash: string }
 export interface PendingDecision {
   version: 1;
@@ -28,7 +28,7 @@ export interface DecidedRecord { decisionId: string; decision: "approve" | "deny
 export interface DecisionState { pending: PendingDecision; decided?: DecidedRecord }
 
 const DECISION_ID = /^dec_[a-f0-9]{16}$/;
-const KINDS = new Set<string>(["approval", "tool_consent", "job_start", "uncertain_tool"]);
+const KINDS = new Set<string>(["approval", "tool_consent", "agent_tool_consent", "job_start", "uncertain_tool"]);
 
 export function isDecisionId(value: string): boolean { return DECISION_ID.test(value); }
 function assertDecisionId(id: string): void { if (!DECISION_ID.test(id)) throw new Error(`Invalid workflow decision id: ${id}`); }
