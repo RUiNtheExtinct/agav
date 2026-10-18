@@ -4,7 +4,8 @@ import type { NodeStatus, RunStatus, WorkflowStore } from "./store.js";
 
 /** Display-only trace (`<runDir>/events.jsonl`); run.json remains the source of truth. */
 export type WorkflowEvent =
-  | { type: "node_started"; nodeId: string }
+  | { type: "node_started"; nodeId: string; attempt?: number }
+  | { type: "node_retry"; nodeId: string; attempt: number; error?: string }
   | { type: "node_completed"; nodeId: string; status: NodeStatus; error?: string }
   | { type: "run_status"; status: RunStatus; reason?: string }
   | { type: "decision_requested"; nodeId: string; decisionId: string; kind: string }

@@ -5,6 +5,9 @@ import { parse as parseYAML } from "yaml";
 import type { ToolRegistry } from "../tools/registry.js";
 import { EFFORT_LEVELS } from "../config/config.js";
 import { extractReferences } from "./interpolate.js";
+import { parseExpression, referencedNodes } from "./expr.js";
+import { SAFE_TOOLS } from "./gated-tools.js";
+import type { PermissionMode } from "../config/config.js";
 
 export interface WorkflowNode {
   id: string;
@@ -29,6 +32,32 @@ export interface WorkflowNode {
   outputSchema?: Record<string, unknown>;
   /** `prompt` nodes: built-in tools the synthetic agent may use (subset of WORKFLOW_TOOLS). */
   allowedTools?: string[];
+  /** Condition (see expr.ts); false gives `skipped`. It may only reference dependencies. */
+  when?: string;
+  /** Accept `skipped` dependencies as satisfied; without it a node with a skipped dependency is skipped too (cascade). */
+  allowSkipped?: boolean;
+  /** Automatic retries after a failed/timed-out attempt: `max` extra attempts (total attempts = max + 1). */
+  retry?: RetryPolicy;
+}
+export interface RetryPolicy { max: number; backoffSeconds?: number }
+/** Run-level policies (R3). `maxConcurrency` is stored only (scheduling is sequential until S1). */
+export interface WorkflowPolicies {
+  maxRuntimeSeconds?: number;
+  maxConcurrency?: number;
+  /** Default true. False: a failed node does not stop independent branches; its dependents are skipped. */
+  stopOnFailure?: boolean;
+  /** Narrows (never widens) the session/run permission mode. */
+  permissionMode?: PermissionMode;
+}
+/** Least to most permissive. */
+export const PERMISSION_MODE_ORDER: readonly PermissionMode[] = ["deny-writes", "ask", "auto-accept"];
+/** The stricter of the session mode and the workflow policy mode; a policy can never widen the session. */
+export function narrowPermissionMode(session: PermissionMode, policy: PermissionMode | undefined): PermissionMode {
+  if (policy === undefined) return session;
+  const s = PERMISSION_MODE_ORDER.indexOf(session), p = PERMISSION_MODE_ORDER.indexOf(policy);
+  // An unrecognised session mode is treated as the strictest.
+  if (s < 0) return "deny-writes";
+  return p >= 0 && p < s ? policy : session;
 }
 /** Fields only agent/prompt nodes may carry (besides `agent`/`task`/`allowedTools`, checked per type). */
 const AGENT_FIELDS = ["model", "effort", "maxIterations", "retrySafe", "output", "outputSchema"] as const;
@@ -45,6 +74,7 @@ export interface WorkflowDefinition {
   name: string;
   description?: string;
   inputs?: Record<string, WorkflowInputSpec>;
+  policies?: WorkflowPolicies;
   nodes: WorkflowNode[];
 }
 /** Input names are plain identifiers so `${inputs.<name>}` stays unambiguous. */
@@ -72,6 +102,15 @@ const validate = ajv.compile({
         properties: { type: { enum: INPUT_TYPES }, default: {}, required: { type: "boolean" }, description: { type: "string" } },
       },
     },
+    policies: {
+      type: "object", additionalProperties: false,
+      properties: {
+        maxRuntimeSeconds: { type: "number", exclusiveMinimum: 0, maximum: 604800 },
+        maxConcurrency: { type: "integer", minimum: 1, maximum: 64 },
+        stopOnFailure: { type: "boolean" },
+        permissionMode: { enum: ["ask", "auto-accept", "deny-writes"] },
+      },
+    },
     nodes: { type: "array", minItems: 1, maxItems: 1000, items: {
       type: "object", additionalProperties: false, required: ["id", "type"],
       properties: {
@@ -85,6 +124,11 @@ const validate = ajv.compile({
         maxIterations: { type: "integer", minimum: 1, maximum: 200 }, retrySafe: { type: "boolean" },
         output: { enum: ["text", "json"] }, outputSchema: { type: "object" },
         allowedTools: { type: "array", uniqueItems: true, items: { type: "string" } },
+        when: { type: "string", minLength: 1, maxLength: 2000 }, allowSkipped: { type: "boolean" },
+        retry: {
+          type: "object", additionalProperties: false, required: ["max"],
+          properties: { max: { type: "integer", minimum: 1, maximum: 10 }, backoffSeconds: { type: "number", minimum: 0, maximum: 3600 } },
+        },
       },
     } },
   },
@@ -112,19 +156,23 @@ export function validateDefinition(value: unknown, registry: ToolRegistry): Work
     if (node.type === "agent" || node.type === "prompt") {
       validateAgentNode(node, has);
     } else if (node.type === "approval") {
-      if (!node.prompt || node.tool !== undefined || node.input !== undefined || node.command !== undefined || node.timeoutSeconds !== undefined) throw new Error(`Invalid approval node: ${node.id}`);
+      // Approvals wait for a human indefinitely: no timeout and no automatic retry.
+      if (node.timeoutSeconds !== undefined) throw new Error(`Approval nodes do not support timeoutSeconds (approvals wait until decided): ${node.id}`);
+      if (node.retry !== undefined) throw new Error(`Approval nodes do not support retry: ${node.id}`);
+      if (!node.prompt || node.tool !== undefined || node.input !== undefined || node.command !== undefined) throw new Error(`Invalid approval node: ${node.id}`);
     } else if (node.type === "job") {
-      // Literal command only; the supervisor has no runtime-timeout support, so timeoutSeconds is refused.
+      // Literal command only. timeoutSeconds is enforced by the runtime with an explicit stop (until supervisor maxRuntimeMs, G3).
       if (typeof node.command !== "string" || node.command.trim() === "") throw new Error(`Job node requires a non-empty command: ${node.id}`);
       if (node.command.includes("${")) throw new Error("Shell interpolation is not supported; use a literal command.");
-      if (node.tool !== undefined || node.input !== undefined || node.prompt !== undefined) throw new Error(`Invalid job node (only command and dependsOn are allowed): ${node.id}`);
-      if (node.timeoutSeconds !== undefined) throw new Error(`Job nodes do not support timeoutSeconds: ${node.id}`);
+      if (node.tool !== undefined || node.input !== undefined || node.prompt !== undefined) throw new Error(`Invalid job node (tool, input and prompt are not allowed): ${node.id}`);
     } else {
       if (node.command !== undefined) throw new Error(`Tool node cannot have command: ${node.id}`);
       if (!node.tool || !WORKFLOW_TOOLS.includes(node.tool as typeof WORKFLOW_TOOLS[number]) || !registry.get(node.tool)) throw new Error(`Unsupported workflow tool: ${node.tool}`);
       if (node.prompt !== undefined) throw new Error(`Tool node cannot have prompt: ${node.id}`);
       if (node.tool === "run_command" && JSON.stringify(node.input ?? {}).includes("${")) throw new Error("Shell interpolation is not supported; use a literal command.");
       if (!JSON.stringify(node.input ?? {}).includes("${")) validateToolInput(registry, node.tool, node.input ?? {});
+      // Mutating tools are never re-run automatically.
+      if (node.retry !== undefined && !SAFE_TOOLS.has(node.tool)) throw new Error(`Tool node ${node.id}: retry is only allowed for read-only tools (${[...SAFE_TOOLS].join(", ")}); ${node.tool} may mutate state.`);
     }
   }
   const done = new Set<string>();
@@ -149,6 +197,17 @@ export function validateDefinition(value: unknown, registry: ToolRegistry): Work
     ancestors.set(id, set);
     return set;
   };
+  for (const node of definition.nodes) {
+    if (node.when !== undefined) {
+      let ast;
+      try { ast = parseExpression(node.when); }
+      catch (error) { throw new Error(`Node ${node.id}: invalid when: ${error instanceof Error ? error.message : String(error)}`); }
+      for (const target of referencedNodes(ast)) {
+        if (!ids.has(target)) throw new Error(`Node ${node.id} when references unknown node "${target}".`);
+        if (!ancestorsOf(node.id).has(target)) throw new Error(`Node ${node.id} when references node "${target}" which is not one of its dependencies; add it to dependsOn.`);
+      }
+    }
+  }
   for (const node of definition.nodes) {
     const templated = node.type === "tool" ? node.input : node.type === "agent" ? node.task : node.type === "prompt" ? node.prompt : undefined;
     if (templated === undefined) continue;

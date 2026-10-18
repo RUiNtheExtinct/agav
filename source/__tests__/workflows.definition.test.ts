@@ -24,7 +24,7 @@ describe("validateDefinition", () => {
     ["duplicate node", base([{ id: "a", type: "approval", prompt: "p" }, { id: "a", type: "approval", prompt: "p" }]), /Duplicate node/],
     ["job command interpolation", base([{ id: "j", type: "job", command: "echo ${inputs.x}" }]), /Shell interpolation is not supported/],
     ["run_command interpolation", base([{ id: "t", type: "tool", tool: "run_command", input: { command: "echo ${inputs.x}" } }]), /Shell interpolation is not supported/],
-    ["job timeout", base([{ id: "j", type: "job", command: "echo hi", timeoutSeconds: 5 }]), /do not support timeoutSeconds/],
+    ["approval timeout (approvals wait until decided)", base([{ id: "a", type: "approval", prompt: "p", timeoutSeconds: 5 }]), /do not support timeoutSeconds/],
     ["unknown node type", base([{ id: "j", type: "agent" }]), /Invalid workflow/],
     ["path-like id", base([{ id: "../x", type: "approval", prompt: "p" }]), /Invalid workflow/],
     ["unsupported tool", base([{ id: "t", type: "tool", tool: "run_background_job", input: {} }]), /Unsupported workflow tool/],

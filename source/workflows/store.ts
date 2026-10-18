@@ -19,7 +19,7 @@ export interface JobNodeMetadata { requestId: string; jobId?: string; state?: st
 export interface ArtifactRef { $artifact: string; bytes: number }
 /** `decisionId` links a `waiting_approval` node to its inbox decision; `decision` is the applied result. */
 /** Agent/prompt nodes also record the invoker's `usage` (opaque provider data), resolved `model` and `durationMs`. */
-export interface NodeCheckpoint { id: string; status: NodeStatus; output?: unknown; error?: string; startedAt?: string; endedAt?: string; job?: JobNodeMetadata; decisionId?: string; decision?: DecidedRecord; usage?: unknown; model?: string; durationMs?: number }
+export interface NodeCheckpoint { id: string; status: NodeStatus; output?: unknown; error?: string; startedAt?: string; endedAt?: string; job?: JobNodeMetadata; decisionId?: string; decision?: DecidedRecord; usage?: unknown; model?: string; durationMs?: number; /** 1-based attempt of a node with `retry` (job requestIds end in `-<attempt>`). */ attempt?: number }
 /** Serialized outputs above this size are written to `<root>/<runId>/artifacts/<nodeId>.json`. */
 export const MAX_INLINE_OUTPUT_BYTES = 64 * 1024;
 export function artifactRelativePath(nodeId: string): string { return `artifacts/${nodeId}.json`; }
@@ -64,6 +64,8 @@ export interface WorkflowRun {
   consent?: WorkflowConsent;
   /** Linkage to the supervised runner job (`requestId = wf-run-<runId>-<attempt>`). */
   runner?: RunnerLink;
+  /** Absolute run deadline from `policies.maxRuntimeSeconds`, fixed at the first execution so resume honors it. */
+  deadlineAt?: string;
 }
 export interface RunnerLink { attempt: number; requestId: string; jobId?: string; relaunches: number }
 /** Deterministic, idempotent request id for a run's runner job attempt. */
@@ -141,15 +143,19 @@ export class WorkflowStore {
     validateDefinition(run.definition, registry);
     // Consent must be bound to this exact definition and cwd; a mismatched record never authorizes anything.
     if ((run.consent !== undefined && (!isWorkflowConsent(run.consent) || run.consent.definitionHash !== run.workflowHash || run.consent.cwd !== run.cwd)) ||
-        (run.runner !== undefined && !validRunner(run.runner, run.id))) throw new Error("Invalid workflow checkpoint.");
+        (run.runner !== undefined && !validRunner(run.runner, run.id)) ||
+        (run.deadlineAt !== undefined && (typeof run.deadlineAt !== "string" || Number.isNaN(Date.parse(run.deadlineAt)) || run.definition.policies?.maxRuntimeSeconds === undefined))) throw new Error("Invalid workflow checkpoint.");
     if (run.workflowHash !== definitionHash(run.definition) || !RUN_STATUSES.has(run.status) || !Array.isArray(run.nodes) || run.nodes.length !== run.definition.nodes.length || run.nodes.some((node, i) => !node || node.id !== run.definition.nodes[i]!.id || !NODE_STATUSES.has(node.status) || (isArtifactRef(node.output) && !validArtifactRef(node.output, node.id)))) throw new Error("Corrupt workflow checkpoint; refusing execution.");
     const checkpoints = new Map(run.nodes.map(node => [node.id, node]));
     for (const [i, node] of run.definition.nodes.entries()) {
       const cp = run.nodes[i]!;
       const deps = (node.dependsOn ?? []).map(dep => checkpoints.get(dep)!.status);
-      // Every dispatched/decided node requires passed dependencies, including
+      // Every dispatched/decided node requires passed dependencies (or skipped ones with allowSkipped), including
       // approvals. Check all nodes so a forged passed ancestor cannot unblock work.
-      // A skipped node only requires settled (passed/skipped) dependencies.
+      // A skipped node only requires settled dependencies (failed/timed_out ones only under stopOnFailure:false).
+      const stopOnFailure = run.definition.policies?.stopOnFailure !== false;
+      const skipSettled = (status: NodeStatus): boolean => status === "passed" || status === "skipped" || (!stopOnFailure && (status === "failed" || status === "timed_out" || status === "cancelled"));
+      const satisfied = (status: NodeStatus): boolean => status === "passed" || (status === "skipped" && node.allowSkipped === true);
       // A tool node may wait on an inbox decision (tool consent / uncertain outcome), never without one.
       const agentNode = node.type === "agent" || node.type === "prompt";
       if (((node.type === "tool" || agentNode) && cp.status === "waiting_approval" && cp.decisionId === undefined) ||
@@ -162,8 +168,11 @@ export class WorkflowStore {
           (cp.job !== undefined && (node.type !== "job" || !validJobMetadata(cp.job, run.id, node.id))) ||
           // A running or passed job must carry its durable identity; fail closed otherwise.
           (node.type === "job" && (cp.status === "running" || cp.status === "passed") && cp.job === undefined) ||
-          (cp.status === "skipped" && !deps.every(status => status === "passed" || status === "skipped")) ||
-          (cp.status !== "pending" && cp.status !== "skipped" && !deps.every(status => status === "passed"))) {
+          (cp.attempt !== undefined && (node.retry === undefined || typeof cp.attempt !== "number" || !Number.isInteger(cp.attempt) || cp.attempt < 1 || cp.attempt > node.retry.max + 1)) ||
+          // A job's requestId must belong to its recorded attempt, so an old attempt's job is never reattached.
+          (cp.job !== undefined && cp.attempt !== undefined && jobAttempt(cp.job.requestId, run.id, node.id) !== cp.attempt) ||
+          (cp.status === "skipped" && !deps.every(skipSettled)) ||
+          (cp.status !== "pending" && cp.status !== "skipped" && !deps.every(satisfied))) {
         throw new Error("Corrupt workflow checkpoint; invalid node state or dependencies.");
       }
     }

@@ -96,12 +96,39 @@ export const toolExecutor: NodeExecutor = {
   },
 };
 
-/** Job nodes start once per attempt via an idempotent requestId and reattach on resume. */
+/**
+ * Job nodes start once per attempt via an idempotent requestId and reattach on resume.
+ * `timeoutSeconds` is enforced here (measured from the checkpoint's startedAt, so a resumed node keeps its
+ * budget): when it fires the observation is aborted, which explicitly stops the job (stopJobNode) and the
+ * node becomes `timed_out` once the stop is confirmed.
+ */
 export const jobExecutor: NodeExecutor = {
   type: "job",
   resumable: true,
   async execute({ store, run, node, checkpoint: cp, signal, jobDeps, resuming }) {
-    await runJobCheckpoint(store, run, cp, node.command!, jobDeps, signal, resuming);
+    const child = new AbortController();
+    const abortChild = (): void => { child.abort(); };
+    signal.addEventListener("abort", abortChild, { once: true });
+    if (signal.aborted) abortChild();
+    let timedOut = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    if (node.timeoutSeconds !== undefined) {
+      const started = resuming && cp.startedAt ? Date.parse(cp.startedAt) : Date.now();
+      const remaining = (Number.isNaN(started) ? Date.now() : started) + node.timeoutSeconds * 1000 - Date.now();
+      const fire = (): void => { if (!signal.aborted) { timedOut = true; child.abort(); } };
+      if (remaining <= 0) fire(); else timeout = setTimeout(fire, remaining);
+    }
+    try {
+      await runJobCheckpoint(store, run, cp, node.command!, jobDeps, child.signal, resuming);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+      signal.removeEventListener("abort", abortChild);
+    }
+    if (timedOut && cp.status === "cancelled") {
+      cp.status = "timed_out";
+      cp.error = `Timed out after ${node.timeoutSeconds}s; the job was stopped.${cp.error ? ` ${cp.error}` : ""}`;
+      await store.save(run);
+    }
     // Cancellation could not be confirmed: the job may still be live. Keep the run non-terminal
     // (node stays running with its job linkage) so a later resume/cancel can retry the stop.
     if (cp.status === "running") throw new JobCancellationIncompleteError(cp.id, cp.error ?? "the job's termination was not confirmed");
@@ -124,7 +151,8 @@ export function getNodeExecutor(type: string): NodeExecutor {
 /** Executes one job node; the requestId is durable before any start and the jobId right after admission. */
 async function runJobCheckpoint(store: WorkflowStore, run: WorkflowRun, cp: NodeCheckpoint, command: string, deps: JobNodeDeps | undefined, signal: AbortSignal, resuming: boolean): Promise<void> {
   // A resumed node reattaches with the attempt id it persisted (old checkpoints carry `-1`).
-  const requestId = resuming && cp.job?.requestId ? cp.job.requestId : jobRequestId(run.id, cp.id);
+  // A fresh attempt of a retried node gets its own requestId (`-<attempt>`), so it starts a NEW job.
+  const requestId = resuming && cp.job?.requestId ? cp.job.requestId : jobRequestId(run.id, cp.id, cp.attempt ?? 1);
   if (!resuming) {
     if (!deps) {
       cp.status = "failed"; cp.error = "Job nodes unavailable: this execution context supplies no background-job support; no job was launched.";

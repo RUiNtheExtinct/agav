@@ -112,9 +112,13 @@ export function runLine(run: WorkflowRun): string {
 }
 
 export function runSummary(run: WorkflowRun): string {
-  return [`Workflow run ${run.id} (${run.definition.name}): ${run.status}`, ...run.nodes.flatMap(cp => {
-    const line = `  ${cp.id}: ${cp.status}${cp.error ? ` — ${cp.error}` : ""}`;
-    const type = run.definition.nodes.find(node => node.id === cp.id)?.type;
+  const deadline = run.deadlineAt && !isTerminalRunStatus(run.status) ? ` (deadline ${run.deadlineAt})` : "";
+  return [`Workflow run ${run.id} (${run.definition.name}): ${run.status}${deadline}`, ...run.nodes.flatMap(cp => {
+    const definitionNode = run.definition.nodes.find(node => node.id === cp.id);
+    // attempt n/max counts total attempts (the first run plus retry.max retries).
+    const attempt = definitionNode?.retry && cp.attempt !== undefined && (cp.attempt > 1 || cp.status !== "passed") ? ` (attempt ${cp.attempt}/${definitionNode.retry.max + 1})` : "";
+    const line = `  ${cp.id}: ${cp.status}${attempt}${cp.error ? ` — ${cp.error}` : ""}`;
+    const type = definitionNode?.type;
     if ((type !== "agent" && type !== "prompt") || cp.status !== "passed" || cp.output === undefined) return [line];
     const meta = [cp.model, cp.durationMs !== undefined ? `${(cp.durationMs / 1000).toFixed(1)}s` : undefined].filter(Boolean).join(", ");
     return [`${line}${meta ? ` (${meta})` : ""}`, `    → ${summarizeOutput(cp.output)}`];
