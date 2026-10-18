@@ -17,12 +17,14 @@ async function writeRaw(run: WorkflowRun): Promise<void> { await writeFile(runPa
 const config = testConfig();
 
 describe("NodeExecutor registry", () => {
-  it("registers tool, approval and job; only job is resumable", () => {
+  it("registers tool, approval, job, agent and prompt; only job is resumable", () => {
     expect(getNodeExecutor("tool").type).toBe("tool");
     expect(getNodeExecutor("approval").type).toBe("approval");
     expect(getNodeExecutor("job").resumable).toBe(true);
     expect(getNodeExecutor("tool").resumable).toBeUndefined();
-    expect(() => getNodeExecutor("agent")).toThrow(/No executor/);
+    expect(getNodeExecutor("agent").resumable).toBeUndefined();
+    expect(getNodeExecutor("prompt").type).toBe("prompt");
+    expect(() => getNodeExecutor("loop")).toThrow(/No executor/);
   });
 });
 

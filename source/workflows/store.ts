@@ -18,7 +18,8 @@ export interface JobNodeMetadata { requestId: string; jobId?: string; state?: st
 /** Checkpoint placeholder for an output that exceeded MAX_INLINE_OUTPUT_BYTES; the path is relative to `<root>/<runId>/`. */
 export interface ArtifactRef { $artifact: string; bytes: number }
 /** `decisionId` links a `waiting_approval` node to its inbox decision; `decision` is the applied result. */
-export interface NodeCheckpoint { id: string; status: NodeStatus; output?: unknown; error?: string; startedAt?: string; endedAt?: string; job?: JobNodeMetadata; decisionId?: string; decision?: DecidedRecord }
+/** Agent/prompt nodes also record the invoker's `usage` (opaque provider data), resolved `model` and `durationMs`. */
+export interface NodeCheckpoint { id: string; status: NodeStatus; output?: unknown; error?: string; startedAt?: string; endedAt?: string; job?: JobNodeMetadata; decisionId?: string; decision?: DecidedRecord; usage?: unknown; model?: string; durationMs?: number }
 /** Serialized outputs above this size are written to `<root>/<runId>/artifacts/<nodeId>.json`. */
 export const MAX_INLINE_OUTPUT_BYTES = 64 * 1024;
 export function artifactRelativePath(nodeId: string): string { return `artifacts/${nodeId}.json`; }
@@ -150,7 +151,11 @@ export class WorkflowStore {
       // approvals. Check all nodes so a forged passed ancestor cannot unblock work.
       // A skipped node only requires settled (passed/skipped) dependencies.
       // A tool node may wait on an inbox decision (tool consent / uncertain outcome), never without one.
-      if ((node.type === "tool" && cp.status === "waiting_approval" && cp.decisionId === undefined) ||
+      const agentNode = node.type === "agent" || node.type === "prompt";
+      if (((node.type === "tool" || agentNode) && cp.status === "waiting_approval" && cp.decisionId === undefined) ||
+          (cp.model !== undefined && (!agentNode || typeof cp.model !== "string")) ||
+          (cp.durationMs !== undefined && (!agentNode || typeof cp.durationMs !== "number" || !Number.isFinite(cp.durationMs) || cp.durationMs < 0)) ||
+          (cp.usage !== undefined && !agentNode) ||
           (cp.decisionId !== undefined && (typeof cp.decisionId !== "string" || !isDecisionId(cp.decisionId))) ||
           (node.type === "approval" && !["pending", "waiting_approval", "passed", "failed"].includes(cp.status)) ||
           (node.type === "job" && cp.status === "waiting_approval") ||

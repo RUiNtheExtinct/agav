@@ -11,7 +11,7 @@ import { reconcileRun, reconcileRuns } from "./reconcile.js";
 import type { ConsentRequest } from "./consent-prompt.js";
 import { createRun } from "./runtime.js";
 import { listPendingDecisions } from "./decisions.js";
-import type { WorkflowRun, WorkflowStore } from "./store.js";
+import { isArtifactRef, type WorkflowRun, type WorkflowStore } from "./store.js";
 
 export const TERMINAL_RUN_STATUSES = ["passed", "failed", "cancelled", "timed_out"] as const;
 export function isTerminalRunStatus(status: string): boolean { return (TERMINAL_RUN_STATUSES as readonly string[]).includes(status); }
@@ -112,5 +112,18 @@ export function runLine(run: WorkflowRun): string {
 }
 
 export function runSummary(run: WorkflowRun): string {
-  return [`Workflow run ${run.id} (${run.definition.name}): ${run.status}`, ...run.nodes.map(cp => `  ${cp.id}: ${cp.status}${cp.error ? ` — ${cp.error}` : ""}`)].join("\n");
+  return [`Workflow run ${run.id} (${run.definition.name}): ${run.status}`, ...run.nodes.flatMap(cp => {
+    const line = `  ${cp.id}: ${cp.status}${cp.error ? ` — ${cp.error}` : ""}`;
+    const type = run.definition.nodes.find(node => node.id === cp.id)?.type;
+    if ((type !== "agent" && type !== "prompt") || cp.status !== "passed" || cp.output === undefined) return [line];
+    const meta = [cp.model, cp.durationMs !== undefined ? `${(cp.durationMs / 1000).toFixed(1)}s` : undefined].filter(Boolean).join(", ");
+    return [`${line}${meta ? ` (${meta})` : ""}`, `    → ${summarizeOutput(cp.output)}`];
+  })].join("\n");
+}
+
+/** One short line for an agent/prompt node's output: collapsed whitespace, truncated text or compact JSON. */
+export function summarizeOutput(output: unknown, max = 160): string {
+  if (isArtifactRef(output)) return `(stored in ${output.$artifact}, ${output.bytes} bytes)`;
+  const text = (typeof output === "string" ? output : JSON.stringify(output) ?? String(output)).replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }

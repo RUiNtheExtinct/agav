@@ -10,7 +10,8 @@ export interface BackgroundHostInbox { store: WorkflowStore; runId: string }
 /**
  * Host for the detached runner: no user is attached. Calls covered by the run's consent are approved; any
  * other call is keyed by (tool, node, sha256 of the canonical resolved input) and reuses a decided record with
- * that key (approve proceeds, deny refuses), or files a pending `tool_consent` decision and parks the node.
+ * that key (approve proceeds, deny refuses), or files a pending `tool_consent` (or, for agent sub-tools,
+ * `agent_tool_consent`) decision and throws `DecisionPendingError`.
  */
 export function createBackgroundHost(consent: WorkflowConsent, inbox?: BackgroundHostInbox): WorkflowExecutionHost {
   return {
@@ -18,11 +19,12 @@ export function createBackgroundHost(consent: WorkflowConsent, inbox?: Backgroun
       if (signal.aborted) return false;
       if (consentCoversTool(consent, name)) return true;
       if (!inbox || !context) return false;
+      const kind = context.kind ?? "tool_consent";
       const resolved = resolvedInput(name, input);
-      const existing = await readDecision(inbox.store, inbox.runId, decisionIdFor("tool_consent", context.nodeId, resolved));
+      const existing = await readDecision(inbox.store, inbox.runId, decisionIdFor(kind, context.nodeId, resolved));
       if (existing?.decided) return existing.decided.decision === "approve" && existing.pending.resolved?.inputHash === resolved.inputHash;
       const decision = await createPendingDecision(inbox.store, inbox.runId, {
-        kind: "tool_consent", nodeId: context.nodeId, resolved,
+        kind, nodeId: context.nodeId, resolved,
         ...(context.iteration ? { iteration: context.iteration } : {}),
         summary: `Allow ${name} in node ${context.nodeId}?`,
       });

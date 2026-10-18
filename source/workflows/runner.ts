@@ -10,6 +10,9 @@ import { createBackgroundHost } from "./hosts.js";
 import type { JobCoordinatorLike, JobNodeDeps } from "./job-node.js";
 import { postRunNotification } from "./notify.js";
 import { executeRun } from "./runtime.js";
+import { createProvider } from "../providers/registry.js";
+import { createDefaultAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
+import type { AgentNodeDeps } from "./agent-node.js";
 import { WorkflowStore, type WorkflowRun } from "./store.js";
 
 /** SIGTERM must checkpoint within this window, under the supervisor's 5 s SIGKILL grace. */
@@ -53,7 +56,15 @@ export interface RunnerContext {
   getCoordinator: () => Promise<JobCoordinatorLike>;
   sandboxRequired?: boolean;
   jobDepsOverrides?: Partial<JobNodeDeps>;
+  /** Agent/prompt node deps; defaults to `defaultAgentNodeDeps()` (provider from the effective config). */
+  agentDeps?: AgentNodeDeps;
   graceMs?: number;
+}
+
+/** Real agent deps: the invoker (and its provider, via the app's `createProvider`) is built on first use from the run's effective config. */
+export function defaultAgentNodeDeps(): AgentNodeDeps {
+  let invoker: AgentInvoker | undefined;
+  return { getInvoker: config => (invoker ??= createDefaultAgentInvoker({ provider: createProvider(config), config })) };
 }
 export interface RunnerHandle {
   done: Promise<WorkflowRun>;
@@ -72,7 +83,7 @@ export function startRunner(runId: string, ctx: RunnerContext): RunnerHandle {
     const config: AgavConfig = { ...ctx.config, permissionMode: consent.permissionMode };
     const jobDeps = runnerJobDeps(consent, ctx.getCoordinator, ctx.sandboxRequired ?? false, ctx.jobDepsOverrides);
     // Parks (waiting_approval) or finishes, then the runner exits; deciding a parked run relaunches it.
-    const settled = await executeRun(ctx.store, runId, ctx.registry, config, controller.signal, createBackgroundHost(consent, { store: ctx.store, runId }), jobDeps);
+    const settled = await executeRun(ctx.store, runId, ctx.registry, config, controller.signal, createBackgroundHost(consent, { store: ctx.store, runId }), jobDeps, ctx.agentDeps ?? defaultAgentNodeDeps());
     await postRunNotification(ctx.store, settled);
     return settled;
   })();

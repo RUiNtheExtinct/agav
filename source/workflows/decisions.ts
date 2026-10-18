@@ -238,3 +238,20 @@ export class DecisionPendingError extends Error {
     this.name = "DecisionPendingError";
   }
 }
+
+/**
+ * Polls until `decisionId` is decided (true = approve) or `signal` aborts (false). Used by agent nodes, whose
+ * sub-tool consent cannot park the node mid-conversation: the agent waits in-process for the inbox decision.
+ */
+export async function waitForDecision(store: WorkflowStore, runId: string, decisionId: string, signal: AbortSignal, intervalMs = 200): Promise<boolean> {
+  for (;;) {
+    if (signal.aborted) return false;
+    const state = await readDecision(store, runId, decisionId);
+    if (state?.decided) return state.decided.decision === "approve";
+    await new Promise<void>(resolve => {
+      const done = (): void => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
+      const timer = setTimeout(done, intervalMs);
+      signal.addEventListener("abort", done, { once: true });
+    });
+  }
+}

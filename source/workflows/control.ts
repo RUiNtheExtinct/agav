@@ -5,6 +5,7 @@ import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, ty
 import { decide, defaultDecider, isDecisionId, listPendingDecisions, readDecision, type DecidedRecord, type DecisionKind, type PendingDecision } from "./decisions.js";
 import { findRunnerJob, launchRun, type LaunchDeps, type LaunchResult } from "./launch.js";
 import { postRunNotification } from "./notify.js";
+import { retriesOnResume } from "./executors.js";
 
 export interface DecideOptions {
   registry: ToolRegistry;
@@ -115,7 +116,10 @@ export async function cancelRun(store: WorkflowStore, id: string, registry: Tool
         const run = await store.read(id, registry);
         for (const cp of run.nodes) {
           if (cp.status !== "running") continue;
-          const isJob = run.definition.nodes.find(node => node.id === cp.id)?.type === "job";
+          const definitionNode = run.definition.nodes.find(node => node.id === cp.id);
+          const isJob = definitionNode?.type === "job";
+          // A retry-safe agent/prompt node ran inside the (now dead: we hold the lock) runner process, so it has stopped.
+          if (definitionNode && retriesOnResume(definitionNode)) { cp.status = "cancelled"; cp.endedAt = new Date().toISOString(); continue; }
           // Tool nodes are never replayed or assumed stopped.
           if (!isJob) throw new Error("Cancellation requested, but interrupted work has an uncertain outcome; not claiming it stopped.");
           // Stop the attempt the checkpoint recorded (old checkpoints carry `-1`).

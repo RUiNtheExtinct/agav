@@ -2,7 +2,7 @@ import { isLiveLifecycle, isTerminalLifecycle, BackgroundJobError } from "../bac
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
 import { appendEvent } from "./events.js";
-import { getNodeExecutor } from "./executors.js";
+import { getNodeExecutor, retriesOnResume } from "./executors.js";
 import { findRunnerJob, launchRun, liveRunnerCount, updateRun, DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS, type LaunchDeps } from "./launch.js";
 import { runnerRequestId, type WorkflowRun, type WorkflowStore } from "./store.js";
 import { hasUnappliedDecision, parkUncertainNodes } from "./decisions.js";
@@ -23,9 +23,14 @@ export type ReconcileAction =
 
 export interface ReconcileResult { runId: string; action: ReconcileAction; reason?: string }
 
-/** A running non-resumable (tool) node has an uncertain outcome; the engine refuses to replay it. */
+/** A running node that can neither be reattached (job) nor safely re-run (retry-safe agent/prompt) has an uncertain outcome. */
+function isUncertain(run: WorkflowRun, cp: WorkflowRun["nodes"][number]): boolean {
+  const node = run.definition.nodes.find(item => item.id === cp.id)!;
+  return cp.status === "running" && getNodeExecutor(node.type).resumable !== true && !retriesOnResume(node);
+}
+/** The engine refuses to replay an uncertain node. */
 function hasUncertainNode(run: WorkflowRun): boolean {
-  return run.nodes.some(cp => cp.status === "running" && getNodeExecutor(run.definition.nodes.find(node => node.id === cp.id)!.type).resumable !== true);
+  return run.nodes.some(cp => isUncertain(run, cp));
 }
 
 function isLockHeld(error: unknown): boolean { return error instanceof BackgroundJobError && error.code === "lock-held"; }
@@ -52,7 +57,7 @@ async function parkUncertain(store: WorkflowStore, deps: LaunchDeps, runId: stri
   const run = await store.lock(runId, async () => {
     const current = await store.read(runId, deps.registry!);
     if (current.runner?.requestId !== requestId || !["running", "queued"].includes(current.status)) return undefined;
-    if ((await parkUncertainNodes(store, current, cp => getNodeExecutor(current.definition.nodes.find(node => node.id === cp.id)!.type).resumable !== true)).length === 0) return undefined;
+    if ((await parkUncertainNodes(store, current, cp => isUncertain(current, cp))).length === 0) return undefined;
     current.status = "waiting_approval";
     await store.save(current);
     return current;

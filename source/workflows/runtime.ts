@@ -6,7 +6,8 @@ import type { WorkflowExecutionHost } from "./gated-tools.js";
 import { definitionHash, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
 import type { JobNodeDeps } from "./job-node.js";
 import type { WorkflowDefinition } from "./definition.js";
-import { getNodeExecutor } from "./executors.js";
+import { getNodeExecutor, retriesOnResume } from "./executors.js";
+import type { AgentNodeDeps } from "./agent-node.js";
 import { resolveInputs } from "./inputs.js";
 import { appendEvent } from "./events.js";
 import { applyDecisions, hasUnappliedDecision, parkUncertainNodes } from "./decisions.js";
@@ -20,7 +21,7 @@ export async function createRun(store: WorkflowStore, definition: WorkflowDefini
   return run;
 }
 /** Sequential DAG execution; the exclusive run lock spans work and shutdown settlement. */
-export async function executeRun(store: WorkflowStore, id: string, registry: ToolRegistry, config: AgavConfig, signal?: AbortSignal, host?: WorkflowExecutionHost, jobDeps?: JobNodeDeps): Promise<WorkflowRun> {
+export async function executeRun(store: WorkflowStore, id: string, registry: ToolRegistry, config: AgavConfig, signal?: AbortSignal, host?: WorkflowExecutionHost, jobDeps?: JobNodeDeps, agentDeps?: AgentNodeDeps): Promise<WorkflowRun> {
   return store.lock(id, async () => {
     const run = await store.read(id, registry);
     if (await realpath(process.cwd()) !== run.cwd) throw new Error(`Resume must use the original working directory: ${run.cwd}`);
@@ -28,8 +29,16 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
     await store.hydrateOutputs(run); // Executors interpolate real outputs, never artifact references.
     // Tool nodes are never replayed. A running job node is instead reattached below via its durable requestId.
     const resumedJob = run.nodes.find(cp => cp.status === "running" && getNodeExecutor(run.definition.nodes.find(node => node.id === cp.id)!.type).resumable === true);
-    // An interrupted tool becomes an `uncertain_tool` inbox decision (approve retries, deny fails); never auto-replayed.
-    let dirty = (await parkUncertainNodes(store, run, cp => cp !== resumedJob)).length > 0;
+    // A retry-safe agent/prompt node (retrySafe !== false) is simply dispatched again from scratch.
+    let dirty = false;
+    for (const cp of run.nodes) {
+      if (cp.status !== "running" || cp === resumedJob || !retriesOnResume(run.definition.nodes.find(node => node.id === cp.id)!)) continue;
+      cp.status = "pending";
+      for (const key of ["output", "error", "startedAt", "endedAt", "usage", "model", "durationMs"] as const) delete cp[key];
+      dirty = true;
+    }
+    // An interrupted tool (or retrySafe:false agent) becomes an `uncertain_tool` inbox decision (approve retries, deny fails); never auto-replayed.
+    if ((await parkUncertainNodes(store, run, cp => cp !== resumedJob)).length > 0) dirty = true;
     // Decisions recorded while no runner was live (the decider never writes run.json).
     if (await applyDecisions(store, run)) dirty = true;
     if (dirty) await store.save(run);
@@ -79,7 +88,7 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
           resume = undefined;
           const executor = getNodeExecutor(node.type);
           if (!resuming) await appendEvent(store, id, { type: "node_started", nodeId: node.id });
-          const result = await executor.execute({ store, run, node, checkpoint: cp, registry, config, signal: controller.signal, host, jobDeps, resuming });
+          const result = await executor.execute({ store, run, node, checkpoint: cp, registry, config, signal: controller.signal, host, jobDeps, agentDeps, resuming });
           if (!["pending", "running", "waiting_approval"].includes(cp.status)) await appendEvent(store, id, { type: "node_completed", nodeId: node.id, status: cp.status, ...(cp.error ? { error: cp.error } : {}) });
           if (result.next === "stop") break;
         }

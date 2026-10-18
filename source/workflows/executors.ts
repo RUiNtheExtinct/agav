@@ -6,7 +6,8 @@ import { applyJobOutcome, JobCancellationIncompleteError, runJobNode, type JobNo
 import { jobRequestId, type NodeCheckpoint, type WorkflowRun, type WorkflowStore } from "./store.js";
 import { createPendingDecision, DecisionPendingError, parkCheckpoint } from "./decisions.js";
 import { appendEvent } from "./events.js";
-import { resolveTemplate } from "./interpolate.js";
+import { resolveTemplate, type TemplateContext } from "./interpolate.js";
+import { agentExecutor, promptExecutor, type AgentNodeDeps } from "./agent-node.js";
 
 /** Everything a node executor may use; trusted host callbacks never come from the definition. */
 export interface NodeExecutionContext {
@@ -21,6 +22,11 @@ export interface NodeExecutionContext {
   signal: AbortSignal;
   host?: WorkflowExecutionHost;
   jobDeps?: JobNodeDeps;
+  /** Invoker (and agent loader) for agent/prompt nodes. */
+  agentDeps?: AgentNodeDeps;
+  /** Enclosing loop context for interpolation, and the iteration path used to key decisions (loop nodes). */
+  loop?: TemplateContext["loop"];
+  iteration?: number[];
   /** True when a running checkpoint is being reattached instead of freshly dispatched. */
   resuming: boolean;
 }
@@ -30,6 +36,8 @@ export interface NodeExecutor {
   type: WorkflowNode["type"];
   /** Only executors that can reattach out-of-process work may be resumed from a running checkpoint. */
   resumable?: boolean;
+  /** Non-resumable executors whose interrupted (running) node may be re-dispatched from scratch on resume. */
+  retryOnResume?: (node: WorkflowNode) => boolean;
   execute(ctx: NodeExecutionContext): Promise<NodeResult>;
 }
 
@@ -101,7 +109,11 @@ export const jobExecutor: NodeExecutor = {
   },
 };
 
-const EXECUTORS = new Map<string, NodeExecutor>([toolExecutor, approvalExecutor, jobExecutor].map(executor => [executor.type, executor]));
+const EXECUTORS = new Map<string, NodeExecutor>([toolExecutor, approvalExecutor, jobExecutor, agentExecutor, promptExecutor].map(executor => [executor.type, executor]));
+/** True when an interrupted (running) node of this definition node is re-dispatched instead of parked as uncertain. */
+export function retriesOnResume(node: WorkflowNode): boolean {
+  return getNodeExecutor(node.type).retryOnResume?.(node) === true;
+}
 /** Registry lookup; an unknown node type is a programming error (validation rejects it first). */
 export function getNodeExecutor(type: string): NodeExecutor {
   const executor = EXECUTORS.get(type);

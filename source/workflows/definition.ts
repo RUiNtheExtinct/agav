@@ -3,18 +3,35 @@ import { readFile } from "node:fs/promises";
 import { extname } from "node:path";
 import { parse as parseYAML } from "yaml";
 import type { ToolRegistry } from "../tools/registry.js";
+import { EFFORT_LEVELS } from "../config/config.js";
+import { extractReferences } from "./interpolate.js";
 
 export interface WorkflowNode {
   id: string;
-  type: "tool" | "approval" | "job";
+  type: "tool" | "approval" | "job" | "agent" | "prompt";
   dependsOn?: string[];
   tool?: string;
   /** Literal shell text for `job` nodes; no interpolation. */
   command?: string;
   input?: Record<string, unknown>;
+  /** Approval gate text, or the (interpolated) task of a `prompt` node. */
   prompt?: string;
   timeoutSeconds?: number;
+  /** `agent` nodes: installed agent name (resolved via loadAgents) and the interpolated task. */
+  agent?: string;
+  task?: string;
+  model?: string;
+  effort?: string;
+  maxIterations?: number;
+  /** Re-run an interrupted agent/prompt node on resume (default true); false parks it on an uncertain decision. */
+  retrySafe?: boolean;
+  output?: "text" | "json";
+  outputSchema?: Record<string, unknown>;
+  /** `prompt` nodes: built-in tools the synthetic agent may use (subset of WORKFLOW_TOOLS). */
+  allowedTools?: string[];
 }
+/** Fields only agent/prompt nodes may carry (besides `agent`/`task`/`allowedTools`, checked per type). */
+const AGENT_FIELDS = ["model", "effort", "maxIterations", "retrySafe", "output", "outputSchema"] as const;
 export type WorkflowInputType = "string" | "number" | "boolean" | "object" | "array";
 /** Typed run input; `default` must match `type`, and a required input cannot declare a default. */
 export interface WorkflowInputSpec {
@@ -59,10 +76,15 @@ const validate = ajv.compile({
       type: "object", additionalProperties: false, required: ["id", "type"],
       properties: {
         id: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
-        type: { enum: ["tool", "approval", "job"] },
+        type: { enum: ["tool", "approval", "job", "agent", "prompt"] },
         dependsOn: { type: "array", uniqueItems: true, items: { type: "string" } },
         tool: { type: "string" }, input: { type: "object" }, command: { type: "string", minLength: 1 }, prompt: { type: "string", minLength: 1 },
         timeoutSeconds: { type: "number", exclusiveMinimum: 0, maximum: 86400 },
+        agent: { type: "string", minLength: 1 }, task: { type: "string", minLength: 1 },
+        model: { type: "string", minLength: 1 }, effort: { enum: EFFORT_LEVELS },
+        maxIterations: { type: "integer", minimum: 1, maximum: 200 }, retrySafe: { type: "boolean" },
+        output: { enum: ["text", "json"] }, outputSchema: { type: "object" },
+        allowedTools: { type: "array", uniqueItems: true, items: { type: "string" } },
       },
     } },
   },
@@ -72,7 +94,7 @@ const validate = ajv.compile({
 export const WORKFLOW_TOOLS = ["read_file", "write_file", "edit_file", "run_command", "grep_search", "find_files", "list_directory", "overview"] as const;
 
 export function validateDefinition(value: unknown, registry: ToolRegistry): WorkflowDefinition {
-  if (!validate(value)) throw new Error(`Invalid workflow (supported nodes: tool, approval, job): ${ajv.errorsText(validate.errors)}`);
+  if (!validate(value)) throw new Error(`Invalid workflow (supported nodes: tool, approval, job, agent, prompt): ${ajv.errorsText(validate.errors)}`);
   const definition = value as WorkflowDefinition;
   for (const [name, spec] of Object.entries(definition.inputs ?? {})) {
     if (spec.default !== undefined && !matchesInputType(spec.default, spec.type)) throw new Error(`Input ${name}: default must be of type ${spec.type}.`);
@@ -82,7 +104,14 @@ export function validateDefinition(value: unknown, registry: ToolRegistry): Work
   for (const node of definition.nodes) {
     if (ids.has(node.id)) throw new Error(`Duplicate node: ${node.id}`);
     ids.add(node.id);
-    if (node.type === "approval") {
+    const has = (field: keyof WorkflowNode): boolean => node[field] !== undefined;
+    if (node.type !== "agent" && node.type !== "prompt") {
+      const extra = [...AGENT_FIELDS, "agent", "task", "allowedTools"].find(field => has(field as keyof WorkflowNode));
+      if (extra) throw new Error(`Invalid ${node.type} node ${node.id}: ${extra} is only allowed on agent/prompt nodes.`);
+    }
+    if (node.type === "agent" || node.type === "prompt") {
+      validateAgentNode(node, has);
+    } else if (node.type === "approval") {
       if (!node.prompt || node.tool !== undefined || node.input !== undefined || node.command !== undefined || node.timeoutSeconds !== undefined) throw new Error(`Invalid approval node: ${node.id}`);
     } else if (node.type === "job") {
       // Literal command only; the supervisor has no runtime-timeout support, so timeoutSeconds is refused.
@@ -110,7 +139,46 @@ export function validateDefinition(value: unknown, registry: ToolRegistry): Work
     visiting.delete(id); done.add(id);
   };
   for (const id of ids) visit(id);
+  // `${nodes.X...}` must name a (transitive) dependency, so X has settled before the reference resolves.
+  const ancestors = new Map<string, Set<string>>();
+  const ancestorsOf = (id: string): Set<string> => {
+    let set = ancestors.get(id);
+    if (set) return set;
+    set = new Set<string>();
+    for (const dep of byId.get(id)!.dependsOn ?? []) { set.add(dep); for (const a of ancestorsOf(dep)) set.add(a); }
+    ancestors.set(id, set);
+    return set;
+  };
+  for (const node of definition.nodes) {
+    const templated = node.type === "tool" ? node.input : node.type === "agent" ? node.task : node.type === "prompt" ? node.prompt : undefined;
+    if (templated === undefined) continue;
+    for (const ref of extractReferences(templated)) {
+      if (ref.root !== "nodes") continue;
+      const target = ref.path[0]!;
+      if (!ids.has(target)) throw new Error(`Node ${node.id} references unknown node "${target}" (${ref.raw}).`);
+      if (!ancestorsOf(node.id).has(target)) throw new Error(`Node ${node.id} references node "${target}" (${ref.raw}) which is not one of its dependencies; add it to dependsOn.`);
+    }
+  }
   return definition;
+}
+function validateAgentNode(node: WorkflowNode, has: (field: keyof WorkflowNode) => boolean): void {
+  for (const field of ["tool", "input", "command"] as const) if (has(field)) throw new Error(`Invalid workflow ${node.type} node ${node.id}: ${field} is not allowed.`);
+  if (node.type === "agent") {
+    if (!node.agent || !node.task) throw new Error(`Invalid workflow agent node ${node.id}: agent and task are required.`);
+    if (has("prompt") || has("allowedTools")) throw new Error(`Invalid workflow agent node ${node.id}: use task (not prompt) and the agent's own tools (allowedTools is for prompt nodes).`);
+  } else {
+    if (!node.prompt) throw new Error(`Invalid workflow prompt node ${node.id}: prompt is required.`);
+    if (has("agent") || has("task")) throw new Error(`Invalid workflow prompt node ${node.id}: agent and task are not allowed (use an agent node).`);
+    for (const tool of node.allowedTools ?? []) {
+      if (!WORKFLOW_TOOLS.includes(tool as typeof WORKFLOW_TOOLS[number])) throw new Error(`Prompt node ${node.id}: allowedTools entry "${tool}" is not a workflow tool (allowed: ${WORKFLOW_TOOLS.join(", ")}).`);
+    }
+  }
+  if (node.outputSchema !== undefined) {
+    if (node.output !== "json") throw new Error(`Node ${node.id}: outputSchema requires output: "json".`);
+    // Fresh instance: definitions are re-validated on every read, and a schema with `$id` may only be added once per Ajv.
+    try { new Ajv({ allErrors: true, strict: false }).compile(node.outputSchema); }
+    catch (error) { throw new Error(`Node ${node.id}: invalid outputSchema: ${error instanceof Error ? error.message : String(error)}`); }
+  }
 }
 export function validateToolInput(registry: ToolRegistry, name: string, input: Record<string, unknown>): void {
   const check = ajv.compile(registry.get(name)!.schema.inputSchema);
