@@ -136,7 +136,18 @@ export const jobExecutor: NodeExecutor = {
   },
 };
 
-const EXECUTORS = new Map<string, NodeExecutor>([toolExecutor, approvalExecutor, jobExecutor, agentExecutor, promptExecutor].map(executor => [executor.type, executor]));
+/** Placeholder until loop execution lands: a dispatched loop node fails without running its body. */
+export const loopExecutor: NodeExecutor = {
+  type: "loop",
+  async execute({ store, run, checkpoint: cp }) {
+    cp.status = "failed"; cp.error = "loop execution not implemented";
+    cp.startedAt = new Date().toISOString(); cp.endedAt = cp.startedAt;
+    await store.save(run);
+    return { next: "stop" };
+  },
+};
+
+const EXECUTORS = new Map<string, NodeExecutor>([toolExecutor, approvalExecutor, jobExecutor, agentExecutor, promptExecutor, loopExecutor].map(executor => [executor.type, executor]));
 /** True when an interrupted (running) node of this definition node is re-dispatched instead of parked as uncertain. */
 export function retriesOnResume(node: WorkflowNode): boolean {
   return getNodeExecutor(node.type).retryOnResume?.(node) === true;

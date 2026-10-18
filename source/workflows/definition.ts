@@ -5,13 +5,13 @@ import { parse as parseYAML } from "yaml";
 import type { ToolRegistry } from "../tools/registry.js";
 import { EFFORT_LEVELS } from "../config/config.js";
 import { extractReferences } from "./interpolate.js";
-import { parseExpression, referencedNodes } from "./expr.js";
+import { parseExpression, referencedNodes, type ExprNode } from "./expr.js";
 import { SAFE_TOOLS } from "./gated-tools.js";
 import type { PermissionMode } from "../config/config.js";
 
 export interface WorkflowNode {
   id: string;
-  type: "tool" | "approval" | "job" | "agent" | "prompt";
+  type: "tool" | "approval" | "job" | "agent" | "prompt" | "loop";
   dependsOn?: string[];
   tool?: string;
   /** Literal shell text for `job` nodes; no interpolation. */
@@ -38,6 +38,35 @@ export interface WorkflowNode {
   allowSkipped?: boolean;
   /** Automatic retries after a failed/timed-out attempt: `max` extra attempts (total attempts = max + 1). */
   retry?: RetryPolicy;
+  /** `loop` nodes: the body sub-DAG run once per iteration (ids are globally unique; dependsOn stays within the body). */
+  body?: WorkflowNode[];
+  /** `loop` nodes: stop (passed) once this expression is true after an iteration; may reference body nodes and `loop.*`. */
+  until?: string;
+  /** `loop` nodes: stop once body node `node` ends an iteration with `status`. */
+  stopWhen?: LoopStopWhen;
+  /** `loop` nodes: outcome when maxIterations is reached without a stop condition (default "fail"). */
+  onExhausted?: "fail" | "continue";
+  /** `loop` nodes: how many previous iteration outputs `loop.history` keeps. */
+  historyLimit?: number;
+}
+export interface LoopStopWhen { node: string; status: "pending" | "running" | "waiting_approval" | "passed" | "failed" | "cancelled" | "timed_out" | "skipped" }
+/** Hard limits for loop nodes. */
+export const MAX_LOOP_ITERATIONS = 50;
+export const MAX_LOOP_DEPTH = 2;
+/** Fields only `loop` nodes may carry. */
+const LOOP_FIELDS = ["body", "until", "stopWhen", "onExhausted", "historyLimit"] as const;
+/**
+ * Visits every node depth-first in definition order, including loop bodies. `path` holds the ids of the
+ * enclosing loop nodes (outermost first; empty for top-level nodes).
+ */
+export function walkNodes(definition: { nodes: WorkflowNode[] }, visit: (node: WorkflowNode, path: string[]) => void): void {
+  const walk = (nodes: WorkflowNode[], path: string[]): void => {
+    for (const node of nodes) {
+      visit(node, path);
+      if (node.type === "loop" && Array.isArray(node.body)) walk(node.body, [...path, node.id]);
+    }
+  };
+  walk(definition.nodes, []);
 }
 export interface RetryPolicy { max: number; backoffSeconds?: number }
 /** Run-level policies (R3). `maxConcurrency` is stored only (scheduling is sequential until S1). */
@@ -111,11 +140,14 @@ const validate = ajv.compile({
         permissionMode: { enum: ["ask", "auto-accept", "deny-writes"] },
       },
     },
-    nodes: { type: "array", minItems: 1, maxItems: 1000, items: {
+    nodes: { type: "array", minItems: 1, maxItems: 1000, items: { $ref: "#/definitions/node" } },
+  },
+  definitions: {
+    node: {
       type: "object", additionalProperties: false, required: ["id", "type"],
       properties: {
         id: { type: "string", pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
-        type: { enum: ["tool", "approval", "job", "agent", "prompt"] },
+        type: { enum: ["tool", "approval", "job", "agent", "prompt", "loop"] },
         dependsOn: { type: "array", uniqueItems: true, items: { type: "string" } },
         tool: { type: "string" }, input: { type: "object" }, command: { type: "string", minLength: 1 }, prompt: { type: "string", minLength: 1 },
         timeoutSeconds: { type: "number", exclusiveMinimum: 0, maximum: 86400 },
@@ -129,8 +161,16 @@ const validate = ajv.compile({
           type: "object", additionalProperties: false, required: ["max"],
           properties: { max: { type: "integer", minimum: 1, maximum: 10 }, backoffSeconds: { type: "number", minimum: 0, maximum: 3600 } },
         },
+        body: { type: "array", minItems: 1, maxItems: 1000, items: { $ref: "#/definitions/node" } },
+        until: { type: "string", minLength: 1, maxLength: 2000 },
+        stopWhen: {
+          type: "object", additionalProperties: false, required: ["node", "status"],
+          properties: { node: { type: "string", minLength: 1 }, status: { enum: ["pending", "running", "waiting_approval", "passed", "failed", "cancelled", "timed_out", "skipped"] } },
+        },
+        onExhausted: { enum: ["fail", "continue"] },
+        historyLimit: { type: "integer", minimum: 1, maximum: 20 },
       },
-    } },
+    },
   },
 });
 
@@ -138,22 +178,29 @@ const validate = ajv.compile({
 export const WORKFLOW_TOOLS = ["read_file", "write_file", "edit_file", "run_command", "grep_search", "find_files", "list_directory", "overview"] as const;
 
 export function validateDefinition(value: unknown, registry: ToolRegistry): WorkflowDefinition {
-  if (!validate(value)) throw new Error(`Invalid workflow (supported nodes: tool, approval, job, agent, prompt): ${ajv.errorsText(validate.errors)}`);
+  if (!validate(value)) throw new Error(`Invalid workflow (supported nodes: tool, approval, job, agent, prompt, loop): ${ajv.errorsText(validate.errors)}`);
   const definition = value as WorkflowDefinition;
   for (const [name, spec] of Object.entries(definition.inputs ?? {})) {
     if (spec.default !== undefined && !matchesInputType(spec.default, spec.type)) throw new Error(`Input ${name}: default must be of type ${spec.type}.`);
     if (spec.required === true && spec.default !== undefined) throw new Error(`Input ${name}: a required input cannot have a default.`);
   }
+  // Ids are unique across the whole definition, including loop bodies.
   const ids = new Set<string>();
-  for (const node of definition.nodes) {
+  walkNodes(definition, (node, path) => {
     if (ids.has(node.id)) throw new Error(`Duplicate node: ${node.id}`);
     ids.add(node.id);
     const has = (field: keyof WorkflowNode): boolean => node[field] !== undefined;
+    if (node.type !== "loop") {
+      const extra = LOOP_FIELDS.find(field => has(field));
+      if (extra) throw new Error(`Invalid ${node.type} node ${node.id}: ${extra} is only allowed on loop nodes.`);
+    }
     if (node.type !== "agent" && node.type !== "prompt") {
-      const extra = [...AGENT_FIELDS, "agent", "task", "allowedTools"].find(field => has(field as keyof WorkflowNode));
+      const extra = [...AGENT_FIELDS, "agent", "task", "allowedTools"].find(field => has(field as keyof WorkflowNode) && !(node.type === "loop" && field === "maxIterations"));
       if (extra) throw new Error(`Invalid ${node.type} node ${node.id}: ${extra} is only allowed on agent/prompt nodes.`);
     }
-    if (node.type === "agent" || node.type === "prompt") {
+    if (node.type === "loop") {
+      validateLoopNode(node, path);
+    } else if (node.type === "agent" || node.type === "prompt") {
       validateAgentNode(node, has);
     } else if (node.type === "approval") {
       // Approvals wait for a human indefinitely: no timeout and no automatic retry.
@@ -174,51 +221,102 @@ export function validateDefinition(value: unknown, registry: ToolRegistry): Work
       // Mutating tools are never re-run automatically.
       if (node.retry !== undefined && !SAFE_TOOLS.has(node.tool)) throw new Error(`Tool node ${node.id}: retry is only allowed for read-only tools (${[...SAFE_TOOLS].join(", ")}); ${node.tool} may mutate state.`);
     }
-  }
+  });
+  validateScope(definition.nodes, ids, new Set(), undefined);
+  return definition;
+}
+function validateLoopNode(node: WorkflowNode, path: string[]): void {
+  if (path.length >= MAX_LOOP_DEPTH) throw new Error(`Loop node ${node.id}: loops may be nested at most ${MAX_LOOP_DEPTH} levels deep.`);
+  if (node.retry !== undefined) throw new Error(`Loop nodes do not support retry: ${node.id}`);
+  if (node.maxIterations === undefined || node.maxIterations > MAX_LOOP_ITERATIONS) throw new Error(`Loop node ${node.id}: maxIterations (1..${MAX_LOOP_ITERATIONS}) is required.`);
+  if (!Array.isArray(node.body) || node.body.length === 0) throw new Error(`Loop node ${node.id}: body must contain at least one node.`);
+  const extra = (["tool", "input", "command", "prompt"] as const).find(field => node[field] !== undefined);
+  if (extra) throw new Error(`Invalid loop node ${node.id}: ${extra} is not allowed.`);
+}
+/** Node ids and `loop.*` usage referenced by an expression or a template value. */
+function expressionRefs(source: string, label: string): { nodes: string[]; loop: boolean } {
+  let ast: ExprNode;
+  try { ast = parseExpression(source); }
+  catch (error) { throw new Error(`${label}: ${error instanceof Error ? error.message : String(error)}`); }
+  let loop = false;
+  const walk = (node: ExprNode): void => {
+    if (node.kind === "ref") { if (node.root === "loop") loop = true; }
+    else if (node.kind === "unary") walk(node.operand);
+    else if (node.kind === "binary") { walk(node.left); walk(node.right); }
+  };
+  walk(ast);
+  return { nodes: referencedNodes(ast), loop };
+}
+/**
+ * Validates one sibling scope (the top level or a loop body): dependencies stay inside the scope and are
+ * acyclic; references (`when`, templates, loop `until`/`stopWhen`) name a transitive dependency or a node in
+ * `outer` (what the enclosing loop itself transitively depends on). `loop` is the enclosing loop id, if any.
+ */
+function validateScope(nodes: WorkflowNode[], allIds: Set<string>, outer: Set<string>, loop: string | undefined): void {
+  const byId = new Map(nodes.map(node => [node.id, node]));
   const done = new Set<string>();
   const visiting = new Set<string>();
-  const byId = new Map(definition.nodes.map(node => [node.id, node]));
   const visit = (id: string): void => {
-    if (!ids.has(id)) throw new Error(`Unknown dependency: ${id}`);
+    if (!byId.has(id)) {
+      if (loop !== undefined && allIds.has(id)) throw new Error(`Loop ${loop} body: dependency ${id} is outside the body (body nodes may only depend on body siblings).`);
+      throw new Error(`Unknown dependency: ${id}`);
+    }
     if (visiting.has(id)) throw new Error(`Dependency cycle at ${id}`);
     if (done.has(id)) return;
     visiting.add(id);
     for (const dep of byId.get(id)!.dependsOn ?? []) visit(dep);
     visiting.delete(id); done.add(id);
   };
-  for (const id of ids) visit(id);
+  for (const id of byId.keys()) visit(id);
   // `${nodes.X...}` must name a (transitive) dependency, so X has settled before the reference resolves.
   const ancestors = new Map<string, Set<string>>();
   const ancestorsOf = (id: string): Set<string> => {
     let set = ancestors.get(id);
     if (set) return set;
-    set = new Set<string>();
+    set = new Set<string>(outer);
     for (const dep of byId.get(id)!.dependsOn ?? []) { set.add(dep); for (const a of ancestorsOf(dep)) set.add(a); }
     ancestors.set(id, set);
     return set;
   };
-  for (const node of definition.nodes) {
+  const loopRefError = (node: WorkflowNode, what: string): Error => new Error(`Node ${node.id} ${what} uses loop.* outside a loop body.`);
+  for (const node of nodes) {
     if (node.when !== undefined) {
-      let ast;
-      try { ast = parseExpression(node.when); }
-      catch (error) { throw new Error(`Node ${node.id}: invalid when: ${error instanceof Error ? error.message : String(error)}`); }
-      for (const target of referencedNodes(ast)) {
-        if (!ids.has(target)) throw new Error(`Node ${node.id} when references unknown node "${target}".`);
+      const refs = expressionRefs(node.when, `Node ${node.id}: invalid when`);
+      if (refs.loop && loop === undefined) throw loopRefError(node, "when");
+      for (const target of refs.nodes) {
+        if (!allIds.has(target)) throw new Error(`Node ${node.id} when references unknown node "${target}".`);
         if (!ancestorsOf(node.id).has(target)) throw new Error(`Node ${node.id} when references node "${target}" which is not one of its dependencies; add it to dependsOn.`);
       }
     }
-  }
-  for (const node of definition.nodes) {
     const templated = node.type === "tool" ? node.input : node.type === "agent" ? node.task : node.type === "prompt" ? node.prompt : undefined;
-    if (templated === undefined) continue;
-    for (const ref of extractReferences(templated)) {
-      if (ref.root !== "nodes") continue;
-      const target = ref.path[0]!;
-      if (!ids.has(target)) throw new Error(`Node ${node.id} references unknown node "${target}" (${ref.raw}).`);
-      if (!ancestorsOf(node.id).has(target)) throw new Error(`Node ${node.id} references node "${target}" (${ref.raw}) which is not one of its dependencies; add it to dependsOn.`);
+    if (templated !== undefined) {
+      for (const ref of extractReferences(templated)) {
+        if (ref.root === "loop" && loop === undefined) throw loopRefError(node, `(${ref.raw})`);
+        if (ref.root !== "nodes") continue;
+        const target = ref.path[0]!;
+        if (!allIds.has(target)) throw new Error(`Node ${node.id} references unknown node "${target}" (${ref.raw}).`);
+        if (!ancestorsOf(node.id).has(target)) throw new Error(`Node ${node.id} references node "${target}" (${ref.raw}) which is not one of its dependencies; add it to dependsOn.`);
+      }
+    }
+    if (node.type === "loop") {
+      const body = node.body!;
+      // until/stopWhen are evaluated after an iteration: body nodes and the loop's own (transitive) dependencies are visible.
+      const visible = new Set([...ancestorsOf(node.id), ...body.map(child => child.id)]);
+      if (node.until !== undefined) {
+        const refs = expressionRefs(node.until, `Loop ${node.id}: invalid until`);
+        for (const target of refs.nodes) {
+          if (!allIds.has(target)) throw new Error(`Loop ${node.id} until references unknown node "${target}".`);
+          if (!visible.has(target)) throw new Error(`Loop ${node.id} until references node "${target}" which is neither a body node nor a dependency of the loop.`);
+        }
+      }
+      if (node.stopWhen !== undefined) {
+        const target = node.stopWhen.node;
+        if (!allIds.has(target)) throw new Error(`Loop ${node.id} stopWhen references unknown node "${target}".`);
+        if (!visible.has(target)) throw new Error(`Loop ${node.id} stopWhen references node "${target}" which is neither a body node nor a dependency of the loop.`);
+      }
+      validateScope(body, allIds, ancestorsOf(node.id), node.id);
     }
   }
-  return definition;
 }
 function validateAgentNode(node: WorkflowNode, has: (field: keyof WorkflowNode) => boolean): void {
   for (const field of ["tool", "input", "command"] as const) if (has(field)) throw new Error(`Invalid workflow ${node.type} node ${node.id}: ${field} is not allowed.`);

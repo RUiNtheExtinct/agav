@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { getAgavDir } from "../config/config.js";
 import { writeAtomic } from "../background-jobs/storage/atomic-file.js";
 import { withJobLock } from "../background-jobs/storage/single-writer-lock.js";
-import { validateDefinition, type WorkflowDefinition } from "./definition.js";
+import { validateDefinition, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { isWorkflowConsent, type WorkflowConsent } from "./grant.js";
 import { isDecisionId, type DecidedRecord } from "./decisions.js";
@@ -20,6 +20,10 @@ export interface ArtifactRef { $artifact: string; bytes: number }
 /** `decisionId` links a `waiting_approval` node to its inbox decision; `decision` is the applied result. */
 /** Agent/prompt nodes also record the invoker's `usage` (opaque provider data), resolved `model` and `durationMs`. */
 export interface NodeCheckpoint { id: string; status: NodeStatus; output?: unknown; error?: string; startedAt?: string; endedAt?: string; job?: JobNodeMetadata; decisionId?: string; decision?: DecidedRecord; usage?: unknown; model?: string; durationMs?: number; /** 1-based attempt of a node with `retry` (job requestIds end in `-<attempt>`). */ attempt?: number }
+/** One loop iteration: the body checkpoints keyed by body node id. */
+export interface LoopIterationCheckpoint { index: number; status: NodeStatus; nodes: Record<string, NodeCheckpoint>; startedAt?: string; endedAt?: string }
+/** Checkpoint of a `loop` node: `iteration` is the current (0-based) iteration; only the last iteration may be non-terminal. */
+export type LoopNodeCheckpoint = NodeCheckpoint & { iteration?: number; iterations?: LoopIterationCheckpoint[] };
 /** Serialized outputs above this size are written to `<root>/<runId>/artifacts/<nodeId>.json`. */
 export const MAX_INLINE_OUTPUT_BYTES = 64 * 1024;
 export function artifactRelativePath(nodeId: string): string { return `artifacts/${nodeId}.json`; }
@@ -31,14 +35,26 @@ function validArtifactRef(value: unknown, nodeId: string): boolean {
   const { $artifact, bytes, ...extra } = value as unknown as Record<string, unknown>;
   return Object.keys(extra).length === 0 && $artifact === artifactRelativePath(nodeId) && typeof bytes === "number" && Number.isInteger(bytes) && bytes > 0;
 }
-/** Deterministic, idempotent request id for a job node attempt (`-1` for the first attempt, as in older checkpoints). */
-export function jobRequestId(runId: string, nodeId: string, attempt = 1): string {
-  if (!Number.isInteger(attempt) || attempt < 1) throw new Error(`Invalid job attempt: ${attempt}`);
-  return `wf-${runId}-${nodeId}-${attempt}`;
+/** Position of a body node: the enclosing loops (outermost first) and their iteration indexes. */
+export interface JobScope { loopPath: Array<{ loopId: string; iteration: number }> }
+/** `<loopId>.<i>.` per enclosing loop (node ids never contain dots, so scoped ids cannot collide with top-level ones). */
+function scopePrefix(scope: JobScope | undefined): string {
+  return (scope?.loopPath ?? []).map(({ loopId, iteration }) => {
+    if (!Number.isInteger(iteration) || iteration < 0) throw new Error(`Invalid loop iteration: ${iteration}`);
+    return `${loopId}.${iteration}.`;
+  }).join("");
 }
-/** The attempt encoded in a job node's requestId, or undefined when it does not belong to this run/node. */
-export function jobAttempt(requestId: unknown, runId: string, nodeId: string): number | undefined {
-  const prefix = `wf-${runId}-${nodeId}-`;
+/**
+ * Deterministic, idempotent request id for a job node attempt (`-1` for the first attempt, as in older checkpoints).
+ * Body nodes of loops are scoped: `wf-<runId>-<loopId>.<i>.<nodeId>-<attempt>` (nested loops joined with dots).
+ */
+export function jobRequestId(runId: string, nodeId: string, attempt = 1, scope?: JobScope): string {
+  if (!Number.isInteger(attempt) || attempt < 1) throw new Error(`Invalid job attempt: ${attempt}`);
+  return `wf-${runId}-${scopePrefix(scope)}${nodeId}-${attempt}`;
+}
+/** The attempt encoded in a job node's requestId, or undefined when it does not belong to this run/node (and scope). */
+export function jobAttempt(requestId: unknown, runId: string, nodeId: string, scope?: JobScope): number | undefined {
+  const prefix = `wf-${runId}-${scopePrefix(scope)}${nodeId}-`;
   if (typeof requestId !== "string" || !requestId.startsWith(prefix)) return undefined;
   const suffix = requestId.slice(prefix.length);
   if (!/^[1-9][0-9]{0,5}$/.test(suffix)) return undefined;
@@ -47,10 +63,10 @@ export function jobAttempt(requestId: unknown, runId: string, nodeId: string): n
 const JOB_STATES = new Set(["accepted", "starting", "running", "completed", "failed", "interrupted", "unknown", "recovery-required"]);
 /** True for lifecycle states `read` accepts; persisting anything else would make the whole run unreadable. */
 export function isPersistableJobState(state: unknown): state is string { return typeof state === "string" && JOB_STATES.has(state); }
-function validJobMetadata(job: unknown, runId: string, nodeId: string): boolean {
+function validJobMetadata(job: unknown, runId: string, nodeId: string, scope?: JobScope): boolean {
   if (!job || typeof job !== "object" || Array.isArray(job)) return false;
   const { requestId, jobId, state, exitCode, outputTruncated, ...extra } = job as Record<string, unknown>;
-  return Object.keys(extra).length === 0 && jobAttempt(requestId, runId, nodeId) !== undefined &&
+  return Object.keys(extra).length === 0 && jobAttempt(requestId, runId, nodeId, scope) !== undefined &&
     (jobId === undefined || (typeof jobId === "string" && jobId.length > 0)) &&
     (state === undefined || (typeof state === "string" && JOB_STATES.has(state))) &&
     (exitCode === undefined || exitCode === null || (typeof exitCode === "number" && Number.isInteger(exitCode))) &&
@@ -66,6 +82,8 @@ export interface WorkflowRun {
   runner?: RunnerLink;
   /** Absolute run deadline from `policies.maxRuntimeSeconds`, fixed at the first execution so resume honors it. */
   deadlineAt?: string;
+  /** Number of executions (initial run plus resumes) of this run. */
+  executionCount?: number;
 }
 export interface RunnerLink { attempt: number; requestId: string; jobId?: string; relaunches: number }
 /** Deterministic, idempotent request id for a run's runner job attempt. */
@@ -88,6 +106,77 @@ const RUN_STATUSES = new Set<string>(["pending", "queued", "running", "passed", 
 async function syncDir(path: string): Promise<void> {
   const dir = await fs.open(path, "r").catch(() => undefined);
   try { await dir?.sync().catch(() => {}); } finally { await dir?.close(); }
+}
+const TERMINAL_STATUSES = new Set<string>(["passed", "failed", "cancelled", "timed_out", "skipped"]);
+const CORRUPT_NODE = "Corrupt workflow checkpoint; invalid node state or dependencies.";
+/**
+ * Validates the checkpoints of one sibling scope (top level or one loop iteration's body) against its definition
+ * nodes, recursing into loop iterations. `cps` is aligned with `nodes`. Returns how many leaf (non-loop) nodes are
+ * running, including inside loop bodies; a loop node itself is a container and is not counted.
+ */
+function validateScopeCheckpoints(run: WorkflowRun, nodes: WorkflowNode[], cps: NodeCheckpoint[], loopPath: JobScope["loopPath"]): number {
+  const scope: JobScope | undefined = loopPath.length > 0 ? { loopPath } : undefined;
+  const checkpoints = new Map(cps.map(node => [node.id, node]));
+  let running = 0;
+  for (const [i, node] of nodes.entries()) {
+    const cp = cps[i] as LoopNodeCheckpoint;
+    const deps = (node.dependsOn ?? []).map(dep => checkpoints.get(dep)!.status);
+    // Every dispatched/decided node requires passed dependencies (or skipped ones with allowSkipped), including
+    // approvals. Check all nodes so a forged passed ancestor cannot unblock work.
+    // A skipped node only requires settled dependencies (failed/timed_out ones only under stopOnFailure:false).
+    const stopOnFailure = run.definition.policies?.stopOnFailure !== false;
+    const skipSettled = (status: NodeStatus): boolean => status === "passed" || status === "skipped" || (!stopOnFailure && (status === "failed" || status === "timed_out" || status === "cancelled"));
+    const satisfied = (status: NodeStatus): boolean => status === "passed" || (status === "skipped" && node.allowSkipped === true);
+    // A tool node may wait on an inbox decision (tool consent / uncertain outcome), never without one.
+    const agentNode = node.type === "agent" || node.type === "prompt";
+    if (((node.type === "tool" || agentNode) && cp.status === "waiting_approval" && cp.decisionId === undefined) ||
+        (cp.model !== undefined && (!agentNode || typeof cp.model !== "string")) ||
+        (cp.durationMs !== undefined && (!agentNode || typeof cp.durationMs !== "number" || !Number.isFinite(cp.durationMs) || cp.durationMs < 0)) ||
+        (cp.usage !== undefined && !agentNode) ||
+        (cp.decisionId !== undefined && (typeof cp.decisionId !== "string" || !isDecisionId(cp.decisionId))) ||
+        (node.type === "approval" && !["pending", "waiting_approval", "passed", "failed"].includes(cp.status)) ||
+        (node.type === "job" && cp.status === "waiting_approval") ||
+        (cp.job !== undefined && (node.type !== "job" || !validJobMetadata(cp.job, run.id, node.id, scope))) ||
+        // A running or passed job must carry its durable identity; fail closed otherwise.
+        (node.type === "job" && (cp.status === "running" || cp.status === "passed") && cp.job === undefined) ||
+        (cp.attempt !== undefined && (node.retry === undefined || typeof cp.attempt !== "number" || !Number.isInteger(cp.attempt) || cp.attempt < 1 || cp.attempt > node.retry.max + 1)) ||
+        // A job's requestId must belong to its recorded attempt, so an old attempt's job is never reattached.
+        (cp.job !== undefined && cp.attempt !== undefined && jobAttempt(cp.job.requestId, run.id, node.id, scope) !== cp.attempt) ||
+        ((cp.iteration !== undefined || cp.iterations !== undefined) && node.type !== "loop") ||
+        (cp.status === "skipped" && !deps.every(skipSettled)) ||
+        (cp.status !== "pending" && cp.status !== "skipped" && !deps.every(satisfied))) {
+      throw new Error(CORRUPT_NODE);
+    }
+    if (node.type === "loop") running += validateLoopCheckpoint(run, node, cp, loopPath);
+    else if (cp.status === "running") running++;
+  }
+  return running;
+}
+/** Loop iterations: indexes 0..n-1 in order, n <= maxIterations, only the last may be non-terminal; bodies recurse. */
+function validateLoopCheckpoint(run: WorkflowRun, node: WorkflowNode, cp: LoopNodeCheckpoint, loopPath: JobScope["loopPath"]): number {
+  const max = node.maxIterations!;
+  const body = node.body!;
+  if (cp.iteration !== undefined && (typeof cp.iteration !== "number" || !Number.isInteger(cp.iteration) || cp.iteration < 0 || cp.iteration >= max)) throw new Error(CORRUPT_NODE);
+  if (cp.iterations === undefined) return 0;
+  const iterations = cp.iterations;
+  if (!Array.isArray(iterations) || iterations.length > max || (cp.status === "pending" && iterations.length > 0)) throw new Error(CORRUPT_NODE);
+  let running = 0;
+  for (const [index, iteration] of iterations.entries()) {
+    if (!iteration || typeof iteration !== "object" || Array.isArray(iteration) || iteration.index !== index || !NODE_STATUSES.has(iteration.status) ||
+        // Only the last iteration may still be in progress, and never once the loop itself has settled.
+        (!TERMINAL_STATUSES.has(iteration.status) && (index !== iterations.length - 1 || TERMINAL_STATUSES.has(cp.status))) ||
+        (iteration.startedAt !== undefined && typeof iteration.startedAt !== "string") || (iteration.endedAt !== undefined && typeof iteration.endedAt !== "string") ||
+        !iteration.nodes || typeof iteration.nodes !== "object" || Array.isArray(iteration.nodes)) throw new Error(CORRUPT_NODE);
+    // Every body node has exactly one checkpoint per iteration, keyed by its id.
+    const keys = Object.keys(iteration.nodes);
+    if (keys.length !== body.length || body.some(child => !Object.hasOwn(iteration.nodes, child.id))) throw new Error(CORRUPT_NODE);
+    const cps = body.map(child => iteration.nodes[child.id]!);
+    if (cps.some((child, j) => !child || typeof child !== "object" || child.id !== body[j]!.id || !NODE_STATUSES.has(child.status) || (isArtifactRef(child.output) && !validArtifactRef(child.output, child.id))) ||
+        // A settled iteration has no work left in progress.
+        (TERMINAL_STATUSES.has(iteration.status) && cps.some(child => child.status === "running" || child.status === "waiting_approval"))) throw new Error(CORRUPT_NODE);
+    running += validateScopeCheckpoints(run, body, cps, [...loopPath, { loopId: node.id, iteration: index }]);
+  }
+  return running;
 }
 export class WorkflowStore {
   /** Last output value spilled per `<runId>/<nodeId>`, so unchanged artifacts are not rewritten on every save. */
@@ -146,39 +235,11 @@ export class WorkflowStore {
         (run.runner !== undefined && !validRunner(run.runner, run.id)) ||
         (run.deadlineAt !== undefined && (typeof run.deadlineAt !== "string" || Number.isNaN(Date.parse(run.deadlineAt)) || run.definition.policies?.maxRuntimeSeconds === undefined))) throw new Error("Invalid workflow checkpoint.");
     if (run.workflowHash !== definitionHash(run.definition) || !RUN_STATUSES.has(run.status) || !Array.isArray(run.nodes) || run.nodes.length !== run.definition.nodes.length || run.nodes.some((node, i) => !node || node.id !== run.definition.nodes[i]!.id || !NODE_STATUSES.has(node.status) || (isArtifactRef(node.output) && !validArtifactRef(node.output, node.id)))) throw new Error("Corrupt workflow checkpoint; refusing execution.");
-    const checkpoints = new Map(run.nodes.map(node => [node.id, node]));
-    for (const [i, node] of run.definition.nodes.entries()) {
-      const cp = run.nodes[i]!;
-      const deps = (node.dependsOn ?? []).map(dep => checkpoints.get(dep)!.status);
-      // Every dispatched/decided node requires passed dependencies (or skipped ones with allowSkipped), including
-      // approvals. Check all nodes so a forged passed ancestor cannot unblock work.
-      // A skipped node only requires settled dependencies (failed/timed_out ones only under stopOnFailure:false).
-      const stopOnFailure = run.definition.policies?.stopOnFailure !== false;
-      const skipSettled = (status: NodeStatus): boolean => status === "passed" || status === "skipped" || (!stopOnFailure && (status === "failed" || status === "timed_out" || status === "cancelled"));
-      const satisfied = (status: NodeStatus): boolean => status === "passed" || (status === "skipped" && node.allowSkipped === true);
-      // A tool node may wait on an inbox decision (tool consent / uncertain outcome), never without one.
-      const agentNode = node.type === "agent" || node.type === "prompt";
-      if (((node.type === "tool" || agentNode) && cp.status === "waiting_approval" && cp.decisionId === undefined) ||
-          (cp.model !== undefined && (!agentNode || typeof cp.model !== "string")) ||
-          (cp.durationMs !== undefined && (!agentNode || typeof cp.durationMs !== "number" || !Number.isFinite(cp.durationMs) || cp.durationMs < 0)) ||
-          (cp.usage !== undefined && !agentNode) ||
-          (cp.decisionId !== undefined && (typeof cp.decisionId !== "string" || !isDecisionId(cp.decisionId))) ||
-          (node.type === "approval" && !["pending", "waiting_approval", "passed", "failed"].includes(cp.status)) ||
-          (node.type === "job" && cp.status === "waiting_approval") ||
-          (cp.job !== undefined && (node.type !== "job" || !validJobMetadata(cp.job, run.id, node.id))) ||
-          // A running or passed job must carry its durable identity; fail closed otherwise.
-          (node.type === "job" && (cp.status === "running" || cp.status === "passed") && cp.job === undefined) ||
-          (cp.attempt !== undefined && (node.retry === undefined || typeof cp.attempt !== "number" || !Number.isInteger(cp.attempt) || cp.attempt < 1 || cp.attempt > node.retry.max + 1)) ||
-          // A job's requestId must belong to its recorded attempt, so an old attempt's job is never reattached.
-          (cp.job !== undefined && cp.attempt !== undefined && jobAttempt(cp.job.requestId, run.id, node.id) !== cp.attempt) ||
-          (cp.status === "skipped" && !deps.every(skipSettled)) ||
-          (cp.status !== "pending" && cp.status !== "skipped" && !deps.every(satisfied))) {
-        throw new Error("Corrupt workflow checkpoint; invalid node state or dependencies.");
-      }
-    }
+    if (run.executionCount !== undefined && (typeof run.executionCount !== "number" || !Number.isInteger(run.executionCount) || run.executionCount < 0)) throw new Error("Invalid workflow checkpoint.");
+    const running = validateScopeCheckpoints(run, run.definition.nodes, run.nodes, []);
     // Keep node-before-run crash snapshots valid (e.g. a decided approval while
     // the run still says waiting_approval), but reject impossible settled states.
-    if (run.nodes.filter(node => node.status === "running").length > 1 ||
+    if (running > 1 ||
         (run.status === "pending" && run.nodes.some(node => node.status !== "pending")) ||
         (run.status === "passed" && run.nodes.some(node => node.status !== "passed" && node.status !== "skipped"))) {
       throw new Error("Corrupt workflow checkpoint; invalid run state.");
