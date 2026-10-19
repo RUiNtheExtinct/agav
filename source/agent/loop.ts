@@ -68,6 +68,12 @@ interface LoopParams {
   /** Host is non-interactive (print/run mode); background actions then need an explicit headless grant. */
   headless?: boolean;
   allowedTools?: string[];
+  /**
+   * Strict gate for embedded callers (workflow agent nodes): `allowedTools` then only restricts which tools may
+   * run and never pre-approves, and every call to a tool outside `safeTools` goes through `confirmTool`
+   * (auto-accept still skips confirmation for non-destructive calls).
+   */
+  toolGate?: { safeTools: ReadonlySet<string> };
   hooks?: import("../config/config.js").AgavHooks;
   /**
    * Drains /steer directives queued mid-turn. The main conversation drains
@@ -499,16 +505,21 @@ export async function* runAgentLoop(
         isDestructive = call.name === "run_command" && isDestructiveCommand(String(input.command ?? ""));
       }
 
+      const gate = params.toolGate;
+      // Under a strict gate the allowlist only restricts (checked above); it never pre-approves a call.
+      const approvalRules = gate ? undefined : params.allowedTools;
       const destructiveApproved = isDestructive
-        && isAllowed(call.name, input, params.allowedTools, { requirePattern: true });
+        && isAllowed(call.name, input, approvalRules, { requirePattern: true });
       const denyWrites = permissionMode === "deny-writes";
       const trustedSafe = toolDestructiveFlag === false && SAFE_TOOLS.has(call.name);
-      const backgroundManaged = call.name === "run_background_job";
+      const backgroundManaged = !gate && call.name === "run_background_job";
       const needsConfirm = !backgroundManaged && ((isDestructive && !destructiveApproved)
-        || (!SAFE_TOOLS.has(call.name)
-          && !trustedSafe
-          && permissionMode !== "auto-accept"
-          && !isAllowed(call.name, input, params.allowedTools)));
+        || (gate
+          ? !gate.safeTools.has(call.name) && permissionMode !== "auto-accept"
+          : !SAFE_TOOLS.has(call.name)
+            && !trustedSafe
+            && permissionMode !== "auto-accept"
+            && !isAllowed(call.name, input, params.allowedTools)));
       if ((denyWrites && (isDestructive || WRITE_TOOLS.has(call.name))) || (needsConfirm && (denyWrites || !confirmTool))) {
         const reason = denyWrites
           ? "Write operations are denied (--deny-writes mode)."

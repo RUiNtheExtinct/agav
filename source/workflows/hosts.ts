@@ -8,7 +8,7 @@ import type { WorkflowStore } from "./store.js";
 export interface BackgroundHostInbox { store: WorkflowStore; runId: string }
 
 /**
- * Host for the detached runner: no user is attached. Calls covered by the run's consent are approved; any
+ * Host for the detached runner: no user is attached. Tool-node calls covered by the run's consent are approved; any
  * other call is keyed by (tool, node, sha256 of the canonical resolved input) and reuses a decided record with
  * that key (approve proceeds, deny refuses), or files a pending `tool_consent` (or, for agent sub-tools,
  * `agent_tool_consent`) decision and throws `DecisionPendingError`.
@@ -17,7 +17,8 @@ export function createBackgroundHost(consent: WorkflowConsent, inbox?: Backgroun
   return {
     confirmTool: async (name, input, signal, context) => {
       if (signal.aborted) return false;
-      if (consentCoversTool(consent, name)) return true;
+      // Tool-node consent is by tool name only, so it never covers agent sub-tool calls (arbitrary agent input).
+      if (context?.kind !== "agent_tool_consent" && consentCoversTool(consent, name)) return true;
       if (!inbox || !context) return false;
       const kind = context.kind ?? "tool_consent";
       const resolved = resolvedInput(name, input);

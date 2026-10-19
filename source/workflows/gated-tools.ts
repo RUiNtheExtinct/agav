@@ -44,18 +44,19 @@ export async function gatedToolExecute(registry: ToolRegistry, name: string, inp
 }
 
 /**
- * Decides one sub-tool call made by an agent/prompt node's agent. Read-only SAFE tools and calls covered by
- * the run's consent are approved; deny-writes and the config's allowedTools restriction refuse mutating
- * calls as for tool nodes; auto-accept approves; anything else asks the host (keyed as `agent_tool_consent`).
+ * Decides one sub-tool call made by an agent/prompt node's agent. Read-only SAFE tools are approved; destructive
+ * commands, deny-writes and the config's allowedTools restriction refuse as for tool nodes; auto-accept
+ * approves; anything else asks the host (keyed as `agent_tool_consent`, deduped per node and resolved input).
+ * Consent for tool nodes never covers agent sub-tools: a consented tool name says nothing about agent input.
  * Returns false (the agent sees a denied call and continues) rather than failing the node.
  * A host may throw `DecisionPendingError`; the caller decides how to wait for it.
  */
-export async function confirmAgentTool(name: string, input: Record<string, unknown>, config: AgavConfig, signal: AbortSignal, host: WorkflowExecutionHost | undefined, callContext: ToolCallContext, consentCovers: (name: string) => boolean): Promise<boolean> {
+export async function confirmAgentTool(name: string, input: Record<string, unknown>, config: AgavConfig, signal: AbortSignal, host: WorkflowExecutionHost | undefined, callContext: ToolCallContext): Promise<boolean> {
   if (signal.aborted) return false;
   if (SAFE_TOOLS.has(name)) return true;
+  if (name === "run_command" && isDestructiveCommand(String(input.command ?? ""))) return false;
   if (config.permissionMode === "deny-writes") return false;
   if (config.allowedTools?.length && !allowed(name, input, config.allowedTools)) return false;
-  if (consentCovers(name)) return true;
   if (config.permissionMode === "auto-accept" || allowed(name, input, config.allowedTools)) return true;
   if (!host) return false;
   return host.confirmTool(name, input, signal, { ...callContext, kind: "agent_tool_consent" });

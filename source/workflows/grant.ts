@@ -1,6 +1,6 @@
 import type { PermissionMode } from "../config/config.js";
 import type { GrantAction, SessionPolicySnapshot } from "../background-jobs/types.js";
-import type { WorkflowDefinition } from "./definition.js";
+import { walkNodes, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { definitionHash } from "./store.js";
 
 /**
@@ -24,13 +24,16 @@ function uniqueSorted(values: string[]): string[] { return [...new Set(values)].
 /** Builds the consent record for one launch; rejects anything that is not a plain env var name (never a value). */
 export function buildConsent(definition: WorkflowDefinition, cwd: string, permissionMode: PermissionMode, envNames: string[]): WorkflowConsent {
   for (const name of envNames) if (typeof name !== "string" || !ENV_NAME_PATTERN.test(name)) throw new Error(`Invalid environment variable name for workflow consent: ${JSON.stringify(name)}`);
+  // Loop bodies included: their tools and job commands run under the same consent.
+  const nodes: WorkflowNode[] = [];
+  walkNodes(definition, node => { nodes.push(node); });
   return {
     definitionHash: definitionHash(definition),
     cwd,
     permissionMode,
     capabilities: {
-      tools: uniqueSorted(definition.nodes.filter(node => node.type === "tool" && node.tool).map(node => node.tool!)),
-      jobCommands: uniqueSorted(definition.nodes.filter(node => node.type === "job" && node.command !== undefined).map(node => node.command!)),
+      tools: uniqueSorted(nodes.filter(node => node.type === "tool" && node.tool).map(node => node.tool!)),
+      jobCommands: uniqueSorted(nodes.filter(node => node.type === "job" && node.command !== undefined).map(node => node.command!)),
     },
     envNames: uniqueSorted(envNames),
     grantedAt: new Date().toISOString(),

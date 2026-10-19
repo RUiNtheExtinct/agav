@@ -6,7 +6,6 @@ import type { AgentInvoker, AgentInvokeRequest } from "./agent-invoker.js";
 import type { WorkflowNode } from "./definition.js";
 import { DecisionPendingError, waitForDecision } from "./decisions.js";
 import { confirmAgentTool } from "./gated-tools.js";
-import { consentCoversTool } from "./grant.js";
 import { resolveTemplate, type TemplateContext } from "./interpolate.js";
 import { parseNodeOutput } from "./structured-output.js";
 import type { NodeCheckpoint, WorkflowRun, WorkflowStore } from "./store.js";
@@ -79,14 +78,14 @@ async function executeAgentNode(ctx: NodeExecutionContext): Promise<NodeResult> 
     const confirmTool: AgentInvokeRequest["confirmTool"] = async (toolName, input) => {
       const args = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {};
       try {
-        return await confirmAgentTool(toolName, args, config, child.signal, host, { nodeId: node.id, ...(ctx.iteration ? { iteration: ctx.iteration } : {}) }, name => !!run.consent && consentCoversTool(run.consent, name));
+        return await confirmAgentTool(toolName, args, config, child.signal, host, { nodeId: node.id, ...(ctx.iteration ? { iteration: ctx.iteration } : {}) });
       } catch (error) {
         if (!(error instanceof DecisionPendingError)) throw error;
         return waitForDecision(store, run.id, error.decision.decisionId, child.signal, agentDeps.decisionPollMs);
       }
     };
     const request: AgentInvokeRequest = {
-      task, signal: child.signal, confirmTool, cwd: run.cwd,
+      task, signal: child.signal, confirmTool, permissionMode: config.permissionMode, cwd: run.cwd,
       ...(agent ? { agent } : { systemPrompt: PROMPT_NODE_SYSTEM_PROMPT, allowedTools: [...(node.allowedTools ?? [])] }),
       ...(node.model !== undefined ? { model: node.model } : {}),
       ...(node.effort !== undefined ? { effort: node.effort } : {}),

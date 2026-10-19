@@ -1,8 +1,11 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
-import { readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentDefinition } from "../agents/types.js";
-import type { AgentInvokeRequest, AgentInvokeResult, AgentInvoker } from "../workflows/agent-invoker.js";
+import { createDefaultAgentInvoker, type AgentInvokeRequest, type AgentInvokeResult, type AgentInvoker } from "../workflows/agent-invoker.js";
+import type { LLMProvider, StreamEvent, StreamParams } from "../providers/types.js";
 import type { AgentNodeDeps } from "../workflows/agent-node.js";
 import { runSummary } from "../workflows/background.js";
 import { decide, listPendingDecisions } from "../workflows/decisions.js";
@@ -155,28 +158,37 @@ describe("agent and prompt node execution", () => {
     expect(invoker.requests[1]!.effort).toBeUndefined();
   });
 
-  it("confirmTool: SAFE approved without a decision, consented approved, non-consented mutating tool files agent_tool_consent", async () => {
+  it("confirmTool: SAFE approved without a decision; tool-node consent does not cover agent sub-tools (agent_tool_consent)", async () => {
     const seen: Array<[string, boolean]> = [];
     const invoker = mockInvoker(async req => {
       seen.push(["read_file", await req.confirmTool("read_file", { path: "x" })]);
-      seen.push(["edit_file", await req.confirmTool("edit_file", { path: "x", old_string: "a", new_string: "b" })]);
       expect(await listPendingDecisions(store, run.id)).toHaveLength(0);
-      const pendingWrite = req.confirmTool("write_file", { path: "o", content: "c" });
+      const pendingEdit = req.confirmTool("edit_file", { path: "x", old_string: "a", new_string: "b" });
       let pending = await listPendingDecisions(store, run.id);
       for (let i = 0; pending.length === 0 && i < 100; i++) { await new Promise(resolve => setTimeout(resolve, 10)); pending = await listPendingDecisions(store, run.id); }
       expect(pending).toHaveLength(1);
-      expect(pending[0]).toMatchObject({ kind: "agent_tool_consent", nodeId: "a", resolved: { toolName: "write_file", input: { path: "o", content: "c" } } });
+      expect(pending[0]).toMatchObject({ kind: "agent_tool_consent", nodeId: "a", resolved: { toolName: "edit_file", input: { path: "x", old_string: "a", new_string: "b" } } });
       await decide(store, run.id, pending[0]!.decisionId, false, "u@h");
-      seen.push(["write_file", await pendingWrite]);
+      seen.push(["edit_file", await pendingEdit]);
       return "finished";
     });
-    // The consent covers edit_file (e.g. used by a tool node) but not write_file.
+    // The consent covers edit_file (e.g. used by a tool node); that must not approve an agent's edit_file call.
     const run = await backgroundRun(def([{ id: "a", type: "agent", agent: "coder", task: "t" }]), {}, ["edit_file"]);
     const done = await execute(run, invoker);
-    expect(seen).toEqual([["read_file", true], ["edit_file", true], ["write_file", false]]);
+    expect(seen).toEqual([["read_file", true], ["edit_file", false]]);
     // A denied sub-tool call only refuses that call; the agent continues and the node passes.
     expect(done.status).toBe("passed");
     expect(done.nodes[0]!.output).toBe("finished");
+  });
+
+  it("refuses a destructive agent run_command without filing a decision, even when run_command is consented", async () => {
+    let result: boolean | undefined;
+    const destructive = ["rm", "-rf", "/"].join(" ");
+    const invoker = mockInvoker(async req => { result = await req.confirmTool("run_command", { command: destructive }); return "done"; });
+    const run = await backgroundRun(def([{ id: "a", type: "agent", agent: "coder", task: "t" }]), {}, ["run_command"]);
+    await executeRun(store, run.id, registry, testConfig({ permissionMode: "auto-accept" }), undefined, createBackgroundHost(run.consent!, { store, runId: run.id }), undefined, deps(invoker));
+    expect(result).toBe(false);
+    expect(await listPendingDecisions(store, run.id)).toHaveLength(0);
   });
 
   it("timeoutSeconds aborts the invocation and records timed_out", async () => {

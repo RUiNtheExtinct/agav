@@ -1,10 +1,11 @@
 import { join } from "node:path";
-import type { AgavConfig } from "../config/config.js";
+import type { AgavConfig, PermissionMode } from "../config/config.js";
 import { getAgavDir, isEffortLevel } from "../config/config.js";
 import type { LLMProvider } from "../providers/types.js";
 import type { ConfirmResult } from "../agent/loop.js";
 import type { AgentDefinition } from "../agents/types.js";
 import { executeA2AAgent, executeNativeAgent } from "../agents/executor.js";
+import { SAFE_TOOLS } from "./gated-tools.js";
 
 /** One isolated agent call from a workflow node. `task` is the whole user message: no conversation history. */
 export interface AgentInvokeRequest {
@@ -19,6 +20,8 @@ export interface AgentInvokeRequest {
   allowedTools?: string[];
   signal: AbortSignal;
   confirmTool: (toolName: string, input: unknown) => Promise<boolean>;
+  /** The run's (narrowed) permission mode; defaults to the invoker config's. */
+  permissionMode?: PermissionMode;
   cwd: string;
 }
 export interface AgentInvokeResult { text: string; usage?: unknown; model?: string; durationMs: number }
@@ -93,7 +96,9 @@ export function createDefaultAgentInvoker(deps: { provider: LLMProvider; config:
         config: deps.config,
         signal: req.signal,
         confirmTool: adaptConfirmTool(req.confirmTool),
-        permissionMode: "ask",
+        permissionMode: req.permissionMode ?? deps.config.permissionMode ?? "ask",
+        // Tool lists only restrict; every non-SAFE sub-tool call goes through confirmTool.
+        toolGate: { safeTools: SAFE_TOOLS },
         iterationsBudget: { remaining: budget, total: budget },
       });
       return { text, model: agent.manifest.model ?? deps.config.model, durationMs: Date.now() - started };

@@ -39,6 +39,18 @@ describe("buildConsent", () => {
     expect(consentCoversJob(consent, "echo")).toBe(false);
   });
 
+  it("includes tools and job commands inside loop bodies", () => {
+    const looped = def([
+      { id: "top", type: "tool", tool: "list_directory", input: { path: "." } },
+      { id: "l", type: "loop", maxIterations: 2, dependsOn: ["top"], body: [
+        { id: "w", type: "tool", tool: "write_file", input: { path: "x", content: "y" } },
+        { id: "j", type: "job", command: "make test", dependsOn: ["w"] },
+      ] },
+    ]);
+    const consent = buildConsent(looped, "/work", "ask", []);
+    expect(consent.capabilities).toEqual({ tools: ["list_directory", "write_file"], jobCommands: ["make test"] });
+  });
+
   it("rejects anything that is not a plain env var name (no values)", () => {
     expect(() => buildConsent(definition, "/work", "ask", ["API_KEY=secret"])).toThrow(/Invalid environment variable name/);
   });

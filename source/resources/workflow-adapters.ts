@@ -387,7 +387,7 @@ export function decisionDetailLines(decision: PendingDecision, run?: WorkflowRun
   if (decision.resolved) {
     lines.push("", `Tool: ${decision.resolved.toolName}  (input #${decision.resolved.inputHash.slice(0, 12)})`, ...(JSON.stringify(decision.resolved.input, null, 2) ?? "undefined").split("\n"));
   }
-  lines.push("", decision.kind === "approval" ? "Approval grants no tool permissions." : "Approving allows exactly this resolved input once.");
+  lines.push("", decision.kind === "approval" ? "Approval grants no tool permissions." : "Approving allows identical calls (same tool and resolved input) of this node for the rest of the run.");
   return lines;
 }
 
