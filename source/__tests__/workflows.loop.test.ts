@@ -7,6 +7,7 @@ import { cancelRun } from "../workflows/control.js";
 import { decide, listPendingDecisions } from "../workflows/decisions.js";
 import { createRun, executeRun } from "../workflows/runtime.js";
 import { readFile } from "node:fs/promises";
+import { specPath } from "../background-jobs/storage/paths.js";
 import { join } from "node:path";
 import { jobRequestId, MAX_INLINE_OUTPUT_BYTES, type LoopNodeCheckpoint, type WorkflowRun, type WorkflowStore } from "../workflows/store.js";
 import { def, fakeHost, FakeCoordinator, jobDeps, registry, summary, tempStore, testConfig } from "./helpers/workflow-fixtures.js";
@@ -135,8 +136,8 @@ describe("loop execution", () => {
     expect(done.status).toBe("passed");
     const ids = coordinator.starts.map(s => s.requestId);
     expect(ids).toHaveLength(2);
-    expect(ids[0]).toContain("fix.0.build");
-    expect(ids[1]).toContain("fix.1.build");
+    expect(ids[0]).toMatch(/build-1_i0$/);
+    expect(ids[1]).toMatch(/build-1_i1$/);
     expect(loopCp(done).iterations![1]!.nodes.build!.job!.requestId).toBe(ids[1]);
   });
 
@@ -177,6 +178,38 @@ describe("loop execution", () => {
     const done = await execute(run.id, { inv });
     expect(done.status).toBe("passed");
     expect(inv.requests.map(r => r.task)).toEqual(["A0", "A1"]);
+  });
+
+  it("denying an approval with a dependent in the loop body leaves a readable failed run", async () => {
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 2, onExhausted: "continue", body: [
+      { id: "gate", type: "approval", prompt: "go?" },
+      { id: "a", type: "prompt", prompt: "A", dependsOn: ["gate"] },
+    ] }]));
+    const inv = mockInvoker("x");
+    await execute(run.id, { inv });
+    const [pending] = await listPendingDecisions(store, run.id);
+    await decide(store, run.id, pending!.decisionId, false, "tester");
+    const done = await execute(run.id, { inv });
+    expect(done.status).toBe("failed");
+    const read = await store.read(run.id, registry);
+    expect(read.status).toBe("failed");
+    const cp = loopCp(read);
+    expect(cp.status).toBe("failed");
+    expect(cp.iterations![0]!.nodes.gate!.status).toBe("failed");
+    expect(cp.iterations![0]!.nodes.a!.status).toBe("pending");
+    expect(inv.requests).toHaveLength(0);
+    await expect(store.listIds()).resolves.toEqual([run.id]);
+  });
+
+  it("runs a job node in a loop body with a validator-faithful request id", async () => {
+    const coordinator = new FakeCoordinator();
+    const start = coordinator.start.bind(coordinator);
+    coordinator.start = async request => { specPath("/x", request.requestId); return start(request); };
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 2, onExhausted: "continue", body: [{ id: "build", type: "job", command: "make" }] }]));
+    const done = await execute(run.id, { coordinator });
+    expect(done.status).toBe("passed");
+    expect(coordinator.starts.map(s => s.requestId)).toEqual([jobRequestId(run.id, "build", 1, { loopPath: [{ loopId: "fix", iteration: 0 }] }), jobRequestId(run.id, "build", 1, { loopPath: [{ loopId: "fix", iteration: 1 }] })]);
+    expect(coordinator.starts[0]!.requestId).toBe(`wf-${run.id}-build-1_i0`);
   });
 
   it("times out the loop and aborts its body", async () => {

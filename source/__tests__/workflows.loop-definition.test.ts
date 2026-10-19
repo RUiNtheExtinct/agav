@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadDefinition, validateDefinition, walkNodes, type WorkflowDefinition } from "../workflows/definition.js";
 import { createRun } from "../workflows/runtime.js";
-import { jobRequestId, WorkflowStore, type LoopNodeCheckpoint, type WorkflowRun } from "../workflows/store.js";
+import { specPath } from "../background-jobs/storage/paths.js";
+import { jobAttempt, jobRequestId, WorkflowStore, type LoopNodeCheckpoint, type WorkflowRun } from "../workflows/store.js";
 import { getNodeExecutor } from "../workflows/executors.js";
 import { registry, tempStore } from "./helpers/workflow-fixtures.js";
 
@@ -152,10 +153,29 @@ describe("loop checkpoints", () => {
     await expect(store.read(run.id, registry)).rejects.toThrow(/invalid run state/);
   });
 
+  it("scoped requestIds pass the real background-jobs validator, stay unambiguous and are short", () => {
+    const runId = "12345678-1234-4234-8234-123456789abc", nodeId = "n".repeat(64);
+    const scopes = [undefined, { loopPath: [{ loopId: "l", iteration: 199 }] }, { loopPath: [{ loopId: "a", iteration: 0 }, { loopId: "b", iteration: 199 }] }];
+    const ids = new Set<string>();
+    for (const scope of scopes) for (const attempt of [1, 12]) {
+      const id = jobRequestId(runId, nodeId, attempt, scope);
+      expect(() => specPath("/x", id)).not.toThrow();
+      expect(id.length).toBeLessThan(120);
+      expect(jobAttempt(id, runId, nodeId, scope)).toBe(attempt);
+      ids.add(id);
+    }
+    expect(ids.size).toBe(6);
+    // Another scope or node never claims the id.
+    expect(jobAttempt(jobRequestId(runId, "n", 1, scopes[1]), runId, "n", scopes[2])).toBeUndefined();
+    expect(jobAttempt(jobRequestId(runId, "n", 1, scopes[1]), runId, "n")).toBeUndefined();
+    expect(jobAttempt(jobRequestId(runId, "n", 1), runId, "n", scopes[1])).toBeUndefined();
+    expect(jobAttempt(jobRequestId(runId, "n", 1, { loopPath: [{ loopId: "l", iteration: 1 }] }), runId, "n", { loopPath: [{ loopId: "l", iteration: 11 }] })).toBeUndefined();
+  });
+
   it("formats scoped job requestIds and keeps the top-level format", () => {
     expect(jobRequestId("r", "n")).toBe("wf-r-n-1");
-    expect(jobRequestId("r", "n", 2, { loopPath: [{ loopId: "l", iteration: 3 }] })).toBe("wf-r-l.3.n-2");
-    expect(jobRequestId("r", "n", 1, { loopPath: [{ loopId: "a", iteration: 0 }, { loopId: "b", iteration: 1 }] })).toBe("wf-r-a.0.b.1.n-1");
+    expect(jobRequestId("r", "n", 2, { loopPath: [{ loopId: "l", iteration: 3 }] })).toBe("wf-r-n-2_i3");
+    expect(jobRequestId("r", "n", 1, { loopPath: [{ loopId: "a", iteration: 0 }, { loopId: "b", iteration: 1 }] })).toBe("wf-r-n-1_i0_i1");
   });
 
   it("reads a valid nested checkpoint with scoped job requestIds", async () => {
@@ -165,7 +185,7 @@ describe("loop checkpoints", () => {
     await writeRaw(raw);
     const read = await store.read(run.id, registry);
     const cp = read.nodes[0] as LoopNodeCheckpoint;
-    expect(cp.iterations![1]!.nodes.j!.job!.requestId).toBe(`wf-${run.id}-outer.1.j-1`);
+    expect(cp.iterations![1]!.nodes.j!.job!.requestId).toBe(`wf-${run.id}-j-1_i1`);
     expect(read.executionCount).toBe(2);
   });
 

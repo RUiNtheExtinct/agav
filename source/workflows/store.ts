@@ -72,7 +72,7 @@ export function visitJobScope(visit: CheckpointVisit): JobScope | undefined {
 }
 /** Position of a body node: the enclosing loops (outermost first) and their iteration indexes. */
 export interface JobScope { loopPath: Array<{ loopId: string; iteration: number }> }
-/** `<loopId>.<i>.` per enclosing loop (node ids never contain dots, so scoped ids cannot collide with top-level ones). */
+/** `<loopId>.<i>.` per enclosing loop; artifact file names only (node ids never contain dots). Not valid in job request ids. */
 function scopePrefix(scope: JobScope | undefined): string {
   return (scope?.loopPath ?? []).map(({ loopId, iteration }) => {
     if (!Number.isInteger(iteration) || iteration < 0) throw new Error(`Invalid loop iteration: ${iteration}`);
@@ -80,20 +80,36 @@ function scopePrefix(scope: JobScope | undefined): string {
   }).join("");
 }
 /**
+ * `_i<iteration>` per enclosing loop, outermost first. Request ids only allow `[A-Za-z0-9_-]` (background-jobs
+ * storage), so no separator character is spare; the loop ids are omitted (node ids are unique across the whole
+ * definition, so the node id already determines its loops).
+ */
+function scopeSuffix(scope: JobScope | undefined): string {
+  return (scope?.loopPath ?? []).map(({ iteration }) => {
+    if (!Number.isInteger(iteration) || iteration < 0) throw new Error(`Invalid loop iteration: ${iteration}`);
+    return `_i${iteration}`;
+  }).join("");
+}
+/**
  * Deterministic, idempotent request id for a job node attempt (`-1` for the first attempt, as in older checkpoints).
- * Body nodes of loops are scoped: `wf-<runId>-<loopId>.<i>.<nodeId>-<attempt>` (nested loops joined with dots).
+ * Body nodes of loops append the iteration index of each enclosing loop: `wf-<runId>-<nodeId>-<attempt>_i<i>[_i<j>]`
+ * (e.g. `wf-<uuid>-build-1_i2`). Unambiguous: top-level ids end in `-<digits>`, scoped ones in `_i<digits>`, and the
+ * attempt/iterations are parsed from the end (the suffix contains no `-`).
  */
 export function jobRequestId(runId: string, nodeId: string, attempt = 1, scope?: JobScope): string {
   if (!Number.isInteger(attempt) || attempt < 1) throw new Error(`Invalid job attempt: ${attempt}`);
-  return `wf-${runId}-${scopePrefix(scope)}${nodeId}-${attempt}`;
+  return `wf-${runId}-${nodeId}-${attempt}${scopeSuffix(scope)}`;
 }
 /** The attempt encoded in a job node's requestId, or undefined when it does not belong to this run/node (and scope). */
 export function jobAttempt(requestId: unknown, runId: string, nodeId: string, scope?: JobScope): number | undefined {
-  const prefix = `wf-${runId}-${scopePrefix(scope)}${nodeId}-`;
+  const prefix = `wf-${runId}-${nodeId}-`;
   if (typeof requestId !== "string" || !requestId.startsWith(prefix)) return undefined;
-  const suffix = requestId.slice(prefix.length);
-  if (!/^[1-9][0-9]{0,5}$/.test(suffix)) return undefined;
-  return Number(suffix);
+  const suffix = scopeSuffix(scope);
+  const rest = requestId.slice(prefix.length);
+  if (!rest.endsWith(suffix)) return undefined;
+  const attempt = rest.slice(0, rest.length - suffix.length);
+  if (!/^[1-9][0-9]{0,5}$/.test(attempt)) return undefined;
+  return Number(attempt);
 }
 const JOB_STATES = new Set(["accepted", "starting", "running", "completed", "failed", "interrupted", "unknown", "recovery-required"]);
 /** True for lifecycle states `read` accepts; persisting anything else would make the whole run unreadable. */

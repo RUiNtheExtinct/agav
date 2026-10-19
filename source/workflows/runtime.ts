@@ -145,6 +145,9 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
   while (env.resume !== undefined || !signal.aborted) {
     if (env.resume === undefined && env.betweenNodes && await env.betweenNodes()) break;
     const resumeCp = env.resume;
+    // A failure already durable in this scope (e.g. a denied approval applied on resume) stops scheduling under stopOnFailure:
+    // dependents stay pending, never skipped (a skipped node with a failed dependency is unreadable under stopOnFailure).
+    if (resumeCp === undefined && stopOnFailure && spec.nodes.some(candidate => ["failed", "timed_out", "cancelled"].includes(cps[candidate.id]!.status) && !toleratedFailure(candidate, cps[candidate.id]!))) break;
     const node = resumeCp !== undefined
       ? spec.nodes.find(candidate => candidate.id === resumeCp.id)
       // A running loop (re-armed by a decision inside its body, or interrupted) is re-entered to continue its iteration.
