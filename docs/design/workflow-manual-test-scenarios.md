@@ -18,6 +18,7 @@ Not repeated below as manual steps.
 - A `prompt` node without credentials fails cleanly.
 - The secret env value is not written to disk.
 - The TUI renders its 3 tabs at 80x24.
+- Run, cancel and runner `kill -9` with reattach also verified with the compiled standalone binary (`dist/agav`) at e9ec5a97.
 
 ## Known issues found during smoke testing
 
@@ -26,10 +27,21 @@ Not repeated below as manual steps.
 
 ## Setup
 
+- [ ] Which `agav` to run. The `agav` in this doc means any build of this branch at commit e9ec5a97 or later.
+  - Compiled binary: rebuild first, then run `~/cli/agav/dist/agav`:
+
+    ```sh
+    cd ~/cli/agav && git pull && pnpm run build:binary   # runs `node scripts/build-binary.mjs native`; needs bun
+    ```
+
+  - Node build: `pnpm build`, then `node ~/cli/agav/build/cli.js`.
+  - So the doc's commands work verbatim, add `alias agav=~/cli/agav/dist/agav` (or a shell function) in every terminal you use.
+  - Binaries built before e9ec5a97 fail every background run with `unknown flag --internal-workflow-runner`.
+  - Sanity check: `agav workflows run <any simple workflow> --wait` should pass. While a run is going, `pgrep -af internal-workflow-runner` shows `.../agav --internal-workflow-runner <uuid>`.
 - [ ] Isolate the data dir. It is `~/.agav`, and `HOME` is the only isolation knob:
 
   ```sh
-  export HOME=/tmp/wf-manual/home
+  export HOME=/tmp/wf-testing/home
   mkdir -p $HOME/.agav
   cat > $HOME/.agav/config.json <<'EOF'
   {"backgroundJobsEnabled":true,"workflowsEnabled":true,"permissionMode":"ask"}
@@ -40,27 +52,28 @@ Not repeated below as manual steps.
 - [ ] Use a workflow cwd that is **not** under `/tmp`. The sandbox mounts a tmpfs on `/tmp`, which fails with `bwrap: Can't chdir`:
 
   ```sh
-  mkdir -p /var/tmp/wf-manual/.agav/workflows && cd /var/tmp/wf-manual
+  mkdir -p /var/tmp/wf-testing/.agav/workflows && cd /var/tmp/wf-testing
   ```
 
-  All workflow files below go into `/var/tmp/wf-manual/.agav/workflows/`. Run `agav` from `/var/tmp/wf-manual`.
+  All workflow files below go into `/var/tmp/wf-testing/.agav/workflows/`. Run `agav` from `/var/tmp/wf-testing`.
+- [ ] Two different `.agav` directories are involved. Config, runs and jobs live under `$HOME/.agav` (`HOME=/tmp/wf-testing/home`), so `config.json` with the two gates (`backgroundJobsEnabled`, `workflowsEnabled`) must be in `$HOME/.agav/`. Workflow files are discovered from `./.agav/workflows` of the current directory (`/var/tmp/wf-testing`), so a `.agav` directory inside `/var/tmp/wf-testing` is right for those. Export `HOME` in every terminal you use, including terminals 2 and 3 in M4.
 - [ ] Run everything in a real terminal. `agav workflows run` and the TUI consent need a TTY (`workflow run requires interactive consent` otherwise).
 - [ ] Supervisors idle for about 5 minutes after their jobs finish. To list the ones belonging to this test HOME:
 
   ```sh
-  pgrep -af supervisor/entry | grep /tmp/wf-manual
+  pgrep -af supervisor/entry | grep /tmp/wf-testing
   ```
 
   To stop only those:
 
   ```sh
-  pgrep -af supervisor/entry | grep /tmp/wf-manual | awk '{print $1}' | xargs -r kill
+  pgrep -af supervisor/entry | grep /tmp/wf-testing | awk '{print $1}' | xargs -r kill
   ```
 
   Do not use a bare `pkill -f supervisor/entry`. It would also kill supervisors of your real HOME.
 - [ ] Check the baseline: `agav workflows list` prints `No workflow runs.`
 
-Each scenario has a Cleanup step that deletes its runs from the TUI (`d` on a finished run). To wipe everything instead: `rm -rf /tmp/wf-manual/home/.agav/workflow-runs`.
+Each scenario has a Cleanup step that deletes its runs from the TUI (`d` on a finished run). To wipe everything instead: `rm -rf /tmp/wf-testing/home/.agav/workflow-runs`.
 
 ## M1. TUI run flow
 
@@ -91,15 +104,15 @@ Also export a few env vars so the checklist has entries: `export WF_SECRET_A=aaa
 
 **Steps:**
 
-1. - [ ] Start `agav` in `/var/tmp/wf-manual`, type `/workflows`, Enter. The tab bar reads `Workflows │ Runs │ Inbox`; `m1-inputs  [project]` is listed.
+1. - [ ] Start `agav` in `/var/tmp/wf-testing`, type `/workflows`, Enter. The tab bar reads `Workflows │ Runs │ Inbox`; `m1-inputs  [project]` is listed.
 2. - [ ] Select `m1-inputs`, press `R`. The `Run m1-inputs · Inputs` form shows `who` (hint `string · required · Who to greet`) and `times` (hint `number · default 2`).
 3. - [ ] Press Enter with `who` empty. The form stays and shows `who is required.`
 4. - [ ] Type `bob`. Press Tab to go to `times`, type `abc`, press Enter. It shows `times must be a number.` Clear it (Backspace) so it is empty (the default applies).
-5. - [ ] Press Enter. The consent screen shows: `Run workflow "m1-inputs" in the background?`, `Directory: /var/tmp/wf-manual`, `Permission mode: ask`, `Tools: write_file`, `$ echo "hello"; sleep 4`, and the env checklist `(0/N selected; names only, values are never stored)`.
+5. - [ ] Press Enter. The consent screen shows: `Run workflow "m1-inputs" in the background?`, `Directory: /var/tmp/wf-testing`, `Permission mode: ask`, `Tools: write_file`, `$ echo "hello"; sleep 4`, and the env checklist `(0/N selected; names only, values are never stored)`.
 6. - [ ] Checklist keys: `↓` moves the `❯` cursor; Space toggles `[x]` on `WF_SECRET_A` only (`1/N`); `a` selects all (`N/N`); `x` deselects all (`0/N`); Space on `WF_SECRET_B` only gives `1/N`.
 7. - [ ] Press Enter (or `y`). The view switches to the Runs tab with a notice `Workflow run <uuid> (m1-inputs) started · status: /workflows status <id> · cancel: /workflows cancel <id>`.
 8. - [ ] Watch the new run (top row). The status text updates by itself about once per second: `running · started Ns ago · 0/2 nodes`, then `passed · Ns · 2/2 nodes`. Do not press `r`.
-9. - [ ] In a second shell: `cat /var/tmp/wf-manual/m1-out.txt` prints `hi bob x2`.
+9. - [ ] In a second shell: `cat /var/tmp/wf-testing/m1-out.txt` prints `hi bob x2`.
 10. - [ ] Repeat steps 2-5, then at the consent screen press `n` (or ESC). The Workflows tab shows `Workflow run not approved.` and no new run exists.
 11. - [ ] Verify only the chosen names were stored: `jq .consent.envNames $HOME/.agav/workflow-runs/*.json` lists exactly the names you selected, and `grep -r "aaa\|bbb" $HOME/.agav/workflow-runs` prints nothing.
 
@@ -107,7 +120,11 @@ Also export a few env vars so the checklist has entries: `export WF_SECRET_A=aaa
 
 **Failure signal:** the form accepts an empty required field or a non-number; selection counts differ from the key pressed; the Runs row stays at `running` until you press `r`; secret values appear anywhere under `$HOME/.agav`.
 
-**Cleanup:** on the Runs tab select the finished run, press `d`, then `y`. `rm /var/tmp/wf-manual/m1-out.txt`.
+**Cleanup:** on the Runs tab select the finished run, press `d`, then `y`. `rm /var/tmp/wf-testing/m1-out.txt`.
+
+**Results:** The workflow failed after 4 attempts because the job failed with error - "error: unknown flag --internal-workflow-runner
+
+**Root cause (orchestrator):** the standalone binary re-executed itself with a virtual entry path; not a setup problem. Fixed in e9ec5a97. Rebuild the binary (command in Setup) and re-run M1 from step 1; delete the failed run first (Runs tab, d).
 
 ## M2. TUI cancel, deny and the status bar badge
 
@@ -217,9 +234,9 @@ nodes:
 
 **Steps:**
 
-1. - [ ] Terminal 1: `cd /var/tmp/wf-manual && agav`, `/workflows`, `R` on `m4-wait`, Enter. Confirm it is `running` on Runs.
+1. - [ ] Terminal 1: `cd /var/tmp/wf-testing && agav`, `/workflows`, `R` on `m4-wait`, Enter. Confirm it is `running` on Runs.
 2. - [ ] Terminal 1: ESC, then `/exit` (or Ctrl+C twice). Close terminal 1 entirely.
-3. - [ ] Terminal 2 (new window): `cd /var/tmp/wf-manual && agav workflows list`. The run is listed as `● <id8>  m4-wait  running …`.
+3. - [ ] Terminal 2 (new window): `cd /var/tmp/wf-testing && agav workflows list`. The run is listed as `● <id8>  m4-wait  running …`.
 4. - [ ] Terminal 2: start `agav`, `/workflows`, Tab to Runs. The run is there and updates by itself.
 5. - [ ] Stay in the app's main prompt (not the TUI) until the run finishes (about 40 s after start). Within about 5 s of the end, the status line shows exactly `Run <id8> passed` once.
 6. - [ ] Exit `agav`, start it again (terminal 2 or a third terminal). Wait at least 15 s. The `Run <id8> passed` message does **not** appear again.
@@ -318,7 +335,7 @@ nodes:
       Do exactly these steps with your tools, in order, and report what happened for each:
       1. Use write_file to create m6-a.txt in the current directory with the content "alpha".
       2. Use write_file to create m6-b.txt in the current directory with the content "beta".
-      3. Use run_command to run exactly: rm -rf /var/tmp/wf-manual-does-not-exist
+      3. Use run_command to run exactly: rm -rf /var/tmp/wf-testing-does-not-exist
       Say "refused" for any call that was refused or denied and "ok" for any that worked.
 ```
 
@@ -344,7 +361,7 @@ nodes:
 2. - [ ] Inspect in the TUI: `/workflows` → Inbox. The detail shows `agent tool consent on worker`, `Tool: write_file`, and the full input JSON with `"path": "m6-a.txt"`.
 3. - [ ] Approve. Press `a`, then `y` (or `agav workflows approve <id8> <decisionId>`). `m6-a.txt` appears (`cat m6-a.txt` prints `alpha`), the run stays `running`, and a new decision for `m6-b.txt` appears.
 4. - [ ] Deny. Deny the `m6-b.txt` decision (`D`, `y`; or `agav workflows deny <id8> <decisionId>`). `m6-b.txt` is **not** created, the run does **not** fail, and the agent continues.
-5. - [ ] Destructive command. Step 3 of the prompt (`rm -rf /var/tmp/wf-manual-does-not-exist`) is refused outright: no inbox decision is ever filed for it (check `agav workflows inbox` while the agent is on that step).
+5. - [ ] Destructive command. Step 3 of the prompt (`rm -rf /var/tmp/wf-testing-does-not-exist`) is refused outright: no inbox decision is ever filed for it (check `agav workflows inbox` while the agent is on that step).
 6. - [ ] Final state. The run ends `passed`. `agav workflows status <id8>` shows `worker` output mentioning one `ok` (m6-a) and `refused` for the denied/destructive calls. `ls m6-*.txt` lists only `m6-a.txt`.
 7. - [ ] Identical calls share one decision. Re-run `m6-tools`, approve the `m6-a.txt` decision, and note the second `write_file` has a different decision id (different input).
 8. - [ ] Deny-writes. `agav workflows run m6-deny-writes --wait` (consent shows `Permission mode: ask`; the policy narrows it to `deny-writes`). The run passes without ever creating an inbox item (`agav workflows inbox` is empty throughout), `ls m6-c.txt` fails, and the agent's reply says the write was refused.
@@ -407,7 +424,7 @@ nodes:
 
 **Goal:** A `loop` with a failing check (`test`) and a `fix` step runs until `until: nodes.test.status == 'passed'` holds. The loop survives closing the TUI and agav during iteration 2 and finishes in the background with the right iteration count. A check that can never pass exhausts `maxIterations` with `loop exhausted after N iterations`.
 
-**Prerequisites:** the check is `grep -q ok m8-target.txt` (it fails while the file is missing or lacks `ok`). The fix script only writes `ok` on its second call, so a green result needs 3 iterations. In `/var/tmp/wf-manual`:
+**Prerequisites:** the check is `grep -q ok m8-target.txt` (it fails while the file is missing or lacks `ok`). The fix script only writes `ok` on its second call, so a green result needs 3 iterations. In `/var/tmp/wf-testing`:
 
 ```sh
 rm -f m8-count m8-target.txt m8-attempt.txt
@@ -506,7 +523,7 @@ The `test` step is a `tool` node here because it is the simplest form and needs 
 2. - [ ] Start from the TUI. `/workflows`, `R` on `m8-fix-until-pass`, Enter at consent (no env). The new run opens in Runs.
 3. - [ ] Watch iteration 1. Open the run (Enter). It shows `loop fix-loop iteration 1/5`, `test` running (20 s), then `test` ✗ failed and `fix` ✓ passed (`m8-count` now holds `1`, `m8-target.txt` holds `bad`).
 4. - [ ] Close during iteration 2. As soon as the detail shows `iteration 2/5` (between about 20 s and 40 s after the start), press ESC out of the TUI and quit agav (`/exit`). Do not cancel the run.
-5. - [ ] Confirm it keeps going. In a plain shell (same HOME and cwd) run `agav workflows status <id8>`. It shows `running` with `iteration 2/5` or `3/5`. `pgrep -af supervisor/entry | grep /tmp/wf-manual` still lists a supervisor.
+5. - [ ] Confirm it keeps going. In a plain shell (same HOME and cwd) run `agav workflows status <id8>`. It shows `running` with `iteration 2/5` or `3/5`. `pgrep -af supervisor/entry | grep /tmp/wf-testing` still lists a supervisor.
 6. - [ ] Finish. After about 70 s in total `agav workflows status <id8>` shows `✓ passed`, `fix-loop: passed (loop fix-loop iteration 3/5)`, `earlier iterations: ✓ ✓`, and in iteration 3 `test` ✓ passed and `fix` ↷ skipped (`when is false: nodes.test.status != 'passed'`). `cat m8-count` prints `2`, `cat m8-target.txt` prints `ok`.
 7. - [ ] Exhaustion. `agav workflows run m8-unfixable --wait` (answer `none`, `y`). The run ends `failed` and `fix-loop` shows `loop exhausted after 3 iterations`. `cat m8-attempt.txt` prints `attempt 2` (the loop ran the fix on iterations 0, 1 and 2). `test` shows `✗ failed` in the last iteration, but the iteration itself is `passed` because of `continueOnError: true`.
 8. - [ ] Agent variant (optional). `rm -f m8-target.txt`, then `agav workflows run m8-fix-agent --wait`. Under `ask`, approve the `write_file` decision of node `fix` (it is an `agent_tool_consent`, see M6). The run ends `passed` after 2 iterations (`iteration 2/4`), and `fix` is skipped in iteration 2.
@@ -732,7 +749,7 @@ Before you start, make sure no stray `sleep` from earlier tests is running: `ps 
 
 **Goal:** A terminal run (`passed`, `failed`, `cancelled`, `timed_out`) that was last updated more than 7 days ago is deleted together with its run directory, `.cancel` marker and mailbox notifications, the next time `workflows list` runs. A non-terminal run (here a parked `waiting_approval` one) and a recent terminal run are kept. The 7 days are built in (the background-jobs `completedLogRetentionDays` default); there is no workflow setting for it.
 
-> **TEST-ONLY HACK.** Real runs cannot be 8 days old on demand, so this scenario edits the timestamps in a checkpoint JSON by hand. Do it **only** on the throwaway `HOME=/tmp/wf-manual/home` from Setup, never on your real `~/.agav`. Close any agav TUI first: it reconciles in the background and could prune early.
+> **TEST-ONLY HACK.** Real runs cannot be 8 days old on demand, so this scenario edits the timestamps in a checkpoint JSON by hand. Do it **only** on the throwaway `HOME=/tmp/wf-testing/home` from Setup, never on your real `~/.agav`. Close any agav TUI first: it reconciles in the background and could prune early.
 
 **What decides pruning** (`source/workflows/reconcile.ts`, `pruneRun`): the run's status is terminal **and** `Date.parse(updatedAt) <= now - 7 days`. `workflows list` (and the app's periodic reconcile) prunes. `workflows status <id>` reconciles that one run only and never prunes. The checkpoint read check in `source/workflows/store.ts` does not compare `updatedAt` with `createdAt`, but the helper below shifts **every** ISO timestamp in the file by the same amount (`createdAt`, `updatedAt`, node `startedAt`/`endedAt`, and so on), so the file stays consistent and schema-valid. Do not change anything else in the file: the definition hash and consent are checked on read.
 
@@ -763,7 +780,7 @@ nodes:
 Shell variables and the helper used below (define them once, in the terminal you use for the whole scenario). The helper rewrites a checkpoint through a temp file and a rename:
 
 ```sh
-export HOME=/tmp/wf-manual/home
+export HOME=/tmp/wf-testing/home
 WR=$HOME/.agav/workflow-runs
 age() {
   python3 - "$1" "$2" <<'PY'
@@ -831,7 +848,7 @@ nodes:
     command: sleep 90
 ```
 
-Then, in the terminal where you launch the run: `export HOME=/tmp/wf-manual/home FAKE_SECRET=s3cr3t-m13`.
+Then, in the terminal where you launch the run: `export HOME=/tmp/wf-testing/home FAKE_SECRET=s3cr3t-m13`.
 
 **Steps:**
 
@@ -917,16 +934,16 @@ Keep a copy of the good config: `cp $HOME/.agav/config.json $HOME/.agav/config.j
 1. - [ ] **`workflowsEnabled: false`.** Write `{"backgroundJobsEnabled":true,"workflowsEnabled":false,"permissionMode":"ask"}` to `$HOME/.agav/config.json`. `agav workflows list` prints `error: Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.` on stderr and exits `1`. Same for `agav workflows run m15-ok` and `agav workflows validate m15-ok` (the gate is checked before anything else). In the TUI/app, `/workflows` answers `Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.` and the status line shows no workflow badge.
 2. - [ ] **`backgroundJobsEnabled: false`.** Write `{"backgroundJobsEnabled":false,"workflowsEnabled":true,"permissionMode":"ask"}`. The same commands print the same message (one message covers both settings and names both).
 3. - [ ] Restore: `cp $HOME/.agav/config.json.good $HOME/.agav/config.json`. `agav workflows list` works again (`No workflow runs.` or your remaining runs).
-4. - [ ] **No TTY, piped stdin.** Record the state: `ls $HOME/.agav/workflow-runs > /tmp/wf-manual/before.txt 2>&1`. Then `echo y | agav workflows run m15-ok; echo "exit=$?"` prints `error: workflow run requires interactive consent` and `exit=1`. No consent summary and no `Approve this background run?` question appear.
+4. - [ ] **No TTY, piped stdin.** Record the state: `ls $HOME/.agav/workflow-runs > /tmp/wf-testing/before.txt 2>&1`. Then `echo y | agav workflows run m15-ok; echo "exit=$?"` prints `error: workflow run requires interactive consent` and `exit=1`. No consent summary and no `Approve this background run?` question appear.
 5. - [ ] **No TTY, piped stdout.** `agav workflows run m15-ok | cat` prints the same error (stdout must be a terminal too) and nothing on stdout.
-6. - [ ] **Nothing was started.** `ls $HOME/.agav/workflow-runs > /tmp/wf-manual/after.txt 2>&1; diff /tmp/wf-manual/before.txt /tmp/wf-manual/after.txt` prints nothing: no `<uuid>.json`, no run directory, no `.cancel`. `agav workflows list` shows no new run and `pgrep -af internal-workflow-runner | grep m15` prints nothing.
+6. - [ ] **Nothing was started.** `ls $HOME/.agav/workflow-runs > /tmp/wf-testing/after.txt 2>&1; diff /tmp/wf-testing/before.txt /tmp/wf-testing/after.txt` prints nothing: no `<uuid>.json`, no run directory, no `.cancel`. `agav workflows list` shows no new run and `pgrep -af internal-workflow-runner | grep m15` prints nothing.
 7. - [ ] **Check order.** A workflow name that does not exist fails the same way (the TTY check comes first): `echo y | agav workflows run x` prints `error: workflow run requires interactive consent`.
 
 **Expected:** gate message `Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.` for either disabled setting; `workflow run requires interactive consent` with exit code 1 for any non-terminal stdin or stdout; the run store is unchanged by the piped invocations.
 
 **Failure signal:** a gate is silently ignored; a piped run asks anything or reads the `y` as consent; a run directory or checkpoint appears after a piped invocation; the exit code is `0`.
 
-**Cleanup:** `rm -f /tmp/wf-manual/before.txt /tmp/wf-manual/after.txt $HOME/.agav/config.json.good`, and make sure `$HOME/.agav/config.json` has both settings `true` again.
+**Cleanup:** `rm -f /tmp/wf-testing/before.txt /tmp/wf-testing/after.txt $HOME/.agav/config.json.good`, and make sure `$HOME/.agav/config.json` has both settings `true` again.
 
 ## Results log
 
@@ -955,16 +972,16 @@ When all scenarios are done:
 - [ ] Stop the supervisors and runners that belong to the test HOME only:
 
   ```sh
-  pgrep -af supervisor/entry | grep /tmp/wf-manual
-  pgrep -af supervisor/entry | grep /tmp/wf-manual | awk '{print $1}' | xargs -r kill
+  pgrep -af supervisor/entry | grep /tmp/wf-testing
+  pgrep -af supervisor/entry | grep /tmp/wf-testing | awk '{print $1}' | xargs -r kill
   ```
 
   Then check that no workflow runner or leftover test `sleep` remains: `pgrep -af internal-workflow-runner` and `ps -eo pid,args | grep '[s]leep 30'` print nothing for the test runs. Do not use a bare `pkill -f supervisor/entry`; it would also stop the supervisors of your real HOME.
 - [ ] Delete the throwaway data and the workflow cwd:
 
   ```sh
-  rm -rf /tmp/wf-manual
-  rm -rf /var/tmp/wf-manual
+  rm -rf /tmp/wf-testing
+  rm -rf /var/tmp/wf-testing
   ```
 
 - [ ] Unset test variables in your shell: `unset WF_SECRET_A WF_SECRET_B FAKE_SECRET`, and open a new terminal so `HOME` points to your real home again.
