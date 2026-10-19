@@ -242,6 +242,10 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
   const [skillsMarketplace, setSkillsMarketplace] = useState(true);
   const [jobsTUIActive, setJobsTUIActive] = useState(false);
   const jobsTUIResolveRef = useRef<(() => void) | null>(null);
+  // Lazily loaded so workflow modules stay out of startup.
+  const [workflowsTUI, setWorkflowsTUI] = useState<typeof import("./components/workflows-tui.js") | null>(null);
+  const workflowsTUIResolveRef = useRef<(() => void) | null>(null);
+  const [workflowBadge, setWorkflowBadge] = useState<string | undefined>(undefined);
   const [resourceAdapter, setResourceAdapter] = useState<ResourceAdapter | null>(null);
   const resourceTUIResolveRef = useRef<(() => void) | null>(null);
   const [customizeTUIActive, setCustomizeTUIActive] = useState(false);
@@ -829,6 +833,25 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
     return () => clearInterval(timer);
   }, [config.backgroundJobsEnabled, config.workflowsEnabled, showStatusLine]);
 
+  // Status bar badge: "workflows: N running · M need approval", polled cheaply while workflows are enabled.
+  useEffect(() => {
+    if (config.backgroundJobsEnabled !== true || config.workflowsEnabled !== true) { setWorkflowBadge(undefined); return; }
+    let polling = false;
+    let active = true;
+    const poll = async (): Promise<void> => {
+      if (polling) return;
+      polling = true;
+      try {
+        const [{ workflowActivity, workflowBadge: badge }, { WorkflowStore }] = await Promise.all([import("./resources/workflow-adapters.js"), import("./workflows/store.js")]);
+        const text = badge(await workflowActivity(new WorkflowStore()));
+        if (active) setWorkflowBadge(text);
+      } catch { /* the badge is best effort */ } finally { polling = false; }
+    };
+    void poll();
+    const timer = setInterval(() => { void poll(); }, 5_000);
+    return () => { active = false; clearInterval(timer); };
+  }, [config.backgroundJobsEnabled, config.workflowsEnabled]);
+
   const hasSubagents = isLoading && subagentStates.length > 0;
 
   // Drop the detail view when the plan it was showing is cleared or finished,
@@ -1322,6 +1345,13 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
               } else if (kind === "jobs") {
                 jobsTUIResolveRef.current = onDone;
                 setJobsTUIActive(true);
+              } else if (kind === "workflows") {
+                workflowsTUIResolveRef.current = onDone;
+                void import("./components/workflows-tui.js").then(setWorkflowsTUI, (error: unknown) => {
+                  workflowsTUIResolveRef.current = null;
+                  showStatusLine(`Workflows TUI failed to load: ${error instanceof Error ? error.message : String(error)}`, true);
+                  onDone();
+                });
               } else {
                 resourceTUIResolveRef.current = onDone;
                 setResourceAdapter(createResourceAdapter(kind));
@@ -1792,6 +1822,20 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
           />
         )}
 
+        {workflowsTUI && (
+          <workflowsTUI.WorkflowsTUI
+            config={config}
+            onExit={() => {
+              setWorkflowsTUI(null);
+              setPickerActive(false);
+              setInput("");
+              const resolve = workflowsTUIResolveRef.current;
+              workflowsTUIResolveRef.current = null;
+              resolve?.();
+            }}
+          />
+        )}
+
         {resourceAdapter && (
           <ResourceManager adapter={resourceAdapter} onExit={() => {
             setResourceAdapter(null);
@@ -1932,6 +1976,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
           psResponse={psResponse}
           psLoading={psLoading}
           loopStatus={(() => { const ls = getLoopStatus(); return ls ? `⟳ Loop: "${ls.prompt}" every ${ls.interval} (tick #${ls.tickCount})` : undefined; })()}
+          workflowStatus={workflowBadge}
           sandboxBackend={`sandbox: ${getSandboxName()}`}
           branchName={sessionName ?? (sessionId ? sessionId.slice(0, 8) : undefined)}
           turnStartTime={turnStartTime}

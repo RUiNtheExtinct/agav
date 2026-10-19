@@ -13,8 +13,9 @@ import {
 import { formatRunSummary, formatRunTree, resolveRunId } from "../workflows/format.js";
 import { getSharedCoordinator } from "../background-jobs-integration.js";
 import { isSandboxRequired } from "../utils/sandbox.js";
+import { openResourceManager } from "./resource-manager.js";
 
-const USAGE = `Usage: /workflows <action>
+const USAGE = `Usage: /workflows [<action>]   (no action opens the Workflows TUI: Workflows · Runs · Inbox)
   validate <name|file>
   run <name|file> [--input-json {"key":"value"}]
   list
@@ -56,7 +57,13 @@ export const workflowsCommand: SlashCommand = {
   async execute(args, context) {
     const message = (text: string) => ({ type: "message" as const, text });
     if (context.config.backgroundJobsEnabled !== true || context.config.workflowsEnabled !== true) return message("Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.");
-    if (!args.trim() || ["help", "--help", "-h"].includes(args.trim())) return message(USAGE);
+    if (!args.trim()) {
+      // Interactive sessions open the Workflows TUI; scripts keep the text usage.
+      const interactive = openResourceManager("workflows", context);
+      if (interactive) return interactive;
+      return message(USAGE);
+    }
+    if (["help", "--help", "-h"].includes(args.trim())) return message(USAGE);
     try {
       const parsed = parseWorkflowsArgs(args);
       if (!parsed) throw new Error(USAGE);
