@@ -1,163 +1,337 @@
-# Foreground workflows (experimental)
+# Workflows (experimental)
 
-Enable `backgroundJobsEnabled: true` **and** `workflowsEnabled: true` in `~/.agav/config.json`. `workflowsEnabled` is global-only and defaults off. No provider credentials are required.
+Enable `backgroundJobsEnabled: true` **and** `workflowsEnabled: true` in `~/.agav/config.json`. `workflowsEnabled` is global-only and defaults off. A workflow is a JSON or YAML file describing a DAG of nodes. Every run executes **in the background** as a supervised runner job on the background-jobs coordinator, so it outlives the terminal or session that started it. Runs that need a human decision park and show up in an inbox that any session (CLI, slash command or TUI) can answer.
 
-```json
-{
-  "version": 1,
-  "name": "review-copy",
-  "nodes": [
-    {"id": "A", "type": "tool", "tool": "read_file", "input": {"path": "README.md"}},
-    {"id": "review", "type": "approval", "dependsOn": ["A"], "prompt": "Copy the reviewed content?"},
-    {"id": "B", "type": "tool", "dependsOn": ["review"], "tool": "write_file", "input": {"path": "reviewed.txt", "content": "${nodes.A.output}"}}
-  ]
-}
+```yaml
+# .agav/workflows/review-copy.yaml
+version: 1
+name: review-copy
+nodes:
+  - id: A
+    type: tool
+    tool: read_file
+    input: { path: README.md }
+  - id: review
+    type: approval
+    dependsOn: [A]
+    prompt: Copy the reviewed content?
+  - id: B
+    type: tool
+    dependsOn: [review]
+    tool: write_file
+    input: { path: reviewed.txt, content: "${nodes.A.output}" }
 ```
 
 ```sh
-agav workflows validate workflow.json
-agav --auto-accept workflows run workflow.json
-agav workflows status <full-run-uuid>
-agav workflows approve <full-run-uuid> review
-agav --auto-accept workflows resume <full-run-uuid>
-# Alternatively:
-agav workflows deny <full-run-uuid> review
-agav workflows cancel <full-run-uuid>
+agav workflows validate review-copy
+agav workflows run review-copy            # consent prompt, then returns; add --wait to follow
+agav workflows inbox                      # pending decisions of every run
+agav workflows approve 3f2a review        # run id prefix + node id (or decision id)
+agav workflows status 3f2a
 ```
 
-Put global flags (`--cwd`, `--auto-accept`, `--deny-writes`, `--sandbox-required`) **before** `workflows`. `run` additionally accepts `--input-json '{"key":"value"}'`. Tool input strings may reference scalar `${inputs.key}` and `${nodes.ID.output}` values. Output is the existing tool's formatted text, not necessarily raw file contents or parsed JSON. `status` prints the full checkpoint, including the approval prompt, outputs, and errors. Run/status/resume/approve return exit 0 for success or waiting approval; failed/cancelled/timed-out states return 1. Denying or cancelling therefore returns 1 after recording the decision.
+Provider credentials are only needed when a run contains `agent` or `prompt` nodes.
 
-## Job nodes
+## Discovery and file formats
 
-A `job` node runs one literal shell command as a background job on the shared background-jobs coordinator and waits for it **in the foreground**: the workflow run does not return until the job is terminal or the run is cancelled. It is not detached.
+A bare workflow name is looked up in `<cwd>/.agav/workflows/` and then `~/.agav/workflows/`. A project workflow shadows a user workflow with the same name. Files are `*.json`, `*.yaml` or `*.yml`. Within one directory `.json` wins over `.yaml`, which wins over `.yml`, for the same name. Names must match `[A-Za-z0-9][A-Za-z0-9_-]*`, and the file name (without extension) is the workflow's name in commands. An operand that contains a path separator or ends in a workflow extension is treated as a path relative to the cwd.
 
-```json
-{
-  "version": 1,
-  "name": "build-then-save",
-  "nodes": [
-    {"id": "build", "type": "job", "command": "npm run build"},
-    {"id": "save", "type": "tool", "dependsOn": ["build"], "tool": "write_file", "input": {"path": "build.log", "content": "${nodes.build.output}"}}
-  ]
-}
-```
+YAML is parsed and then normalized to plain JSON before validation. Equivalent JSON and YAML sources therefore produce the same stored definition and hash. Unknown fields, at the definition or node level, are rejected rather than ignored.
 
-Downstream tool nodes can reference `${nodes.build.output}` because interpolation reads any passed node's stored `output` (read in `runtime.ts`; not separately exercised with a job node).
+## Definition
 
-### Definition rules
+| Field | Meaning |
+| --- | --- |
+| `version` | Always `1`. |
+| `name` | 1–200 characters. |
+| `description` | Optional text. |
+| `inputs` | Typed run inputs (see [Inputs](#inputs)). |
+| `policies` | Run-level policies (see [Policies](#policies)). |
+| `nodes` | 1–1000 nodes. |
 
-A job node accepts only `id`, `type: "job"`, a non-empty `command` string and optional `dependsOn`. `validate` (and every checkpoint read) rejects:
+Every node has an `id` (`[A-Za-z][A-Za-z0-9_-]{0,63}`, unique across the whole definition including loop bodies), a `type`, and optional `dependsOn` (ids of siblings in the same scope; cycles are rejected). Common optional fields:
 
-- a missing or blank `command`;
-- `${` anywhere in `command` (`Shell interpolation is not supported; use a literal command.`), so `${inputs.*}` and `${nodes.*.output}` cannot reach a job command;
-- `tool`, `input` or `prompt` on a job node;
-- `timeoutSeconds` on a job node (`Job nodes do not support timeoutSeconds`). The supervisor has no runtime-timeout support, so **there is no job timeout**;
-- `command` on a tool or approval node.
+| Field | Applies to | Meaning |
+| --- | --- | --- |
+| `when` | all | Condition ([expression](#expressions)). If it is false the node is `skipped`. It may reference only (transitive) dependencies. |
+| `allowSkipped` | all | Treat a `skipped` dependency as satisfied. Without it, a skip cascades to dependents. |
+| `retry` | tool (read-only tools only), job, agent, prompt | `{max: 1..10, backoffSeconds?: 0..3600}` gives up to `max` extra attempts after a `failed` or `timed_out` attempt. |
+| `timeoutSeconds` | tool, job, agent, prompt, loop | Positive, at most 86400. Not allowed on approval nodes. |
 
-Job nodes are not tool nodes. They do not use `WORKFLOW_TOOLS`, `allowedTools` or the workflow tool-consent prompt, and tool nodes still cannot call `run_background_job`.
+### Node types
 
-### Execution
+**`tool`** runs one built-in tool with `input`. Allowed tools: `read_file`, `write_file`, `edit_file`, `run_command`, `grep_search`, `find_files`, `list_directory` and `overview`. `run_background_job`, network tools, agents, skills and registry extensions are not available. `${…}` references are allowed in input strings, except anywhere inside `run_command` input: commands must be literal. `retry` is allowed only for the read-only tools (`read_file`, `grep_search`, `find_files`, `list_directory`, `overview`), because mutating tools are never re-run automatically.
 
-For a fresh node, in order:
+**`approval`** has a `prompt` (the text shown to the decider) and pauses the run until someone approves (the node is `passed`) or denies (the node is `failed`). It supports neither `timeoutSeconds` nor `retry`. An approval is a workflow decision, **not** a tool-permission grant.
 
-1. If the host supplied no job support, the node is saved `failed` with `Job nodes unavailable: … no job was launched.` and nothing is started. Both the headless CLI and the interactive App supply it.
-2. The checkpoint is saved with the node `running` and `job: {requestId}` **before** any start. `requestId` is deterministic: `wf-<runId>-<nodeId>-1`.
-3. If the run is already aborted, the node becomes `cancelled` and nothing starts.
-4. With `sandboxRequired` enabled the start is refused and the node fails (`Job nodes are refused while sandboxRequired is enabled: background jobs run outside the OS sandbox.`).
-5. `coordinator.start` receives a `shell` invocation (`posix-sh`, or `cmd` on win32), the run's original canonical `cwd`, isolation backend `none`, and the host's `headless` flag. Normal coordinator `start` authorization applies (see below).
-6. If `start` throws, the adapter looks the job up by `requestId`. A job found is adopted. A lookup error, or a coordinator with no lookup, gives an `uncertain:` failure. Only a successful lookup that finds nothing gives a plain `Job start failed: …`.
-7. Right after admission the `jobId` and state are saved to `node.job`, then the node is observed.
-
-**Observation** is a cancellation-aware poll loop (default 250 ms), not `coordinator.wait`: `wait` spins on uncertain states and aborting it does not stop a job. Three consecutive poll failures fail the node as `uncertain:` without retry.
+**`job`** runs one literal shell `command` as a background job (`posix-sh`, or `cmd` on win32) in the run's cwd. `${` anywhere in the command is rejected. `tool`, `input` and `prompt` are not allowed. The command must be covered by the run's consent (see [Consent](#launching-and-consent)), and a fresh start is refused while `sandboxRequired` is enabled, because background jobs run outside the OS sandbox. Each attempt has a deterministic request id: `wf-<runId>-<nodeId>-<attempt>`. Inside loops the id is prefixed with `<loopId>.<iteration>.`. The first attempt ends in `-1`, and a retry gets a new id and therefore a new job. Resuming reattaches to the existing job and never starts a second one. Outcomes:
 
 | Job state | Node result |
 | --- | --- |
-| `completed`, exit code 0 | `passed`; `output` is the stdout tail |
-| `completed` with exit code not 0 (or absent), or `failed` | `failed`; `error` holds the state, exit code and stderr tail |
+| `completed`, exit code 0 | `passed`; `output` is the stdout tail (at most the last 64 KiB) |
+| non-zero exit, or `failed` | `failed`; `error` holds the state, exit code and the last 8 KiB of stderr |
 | `interrupted` | `cancelled` |
-| `unknown`, `recovery-required`, or any unrecognised state | `failed`, `uncertain: … outcome unknown, not retried` (fails closed) |
-| job does not belong to the requestId | `failed`, `uncertain:` |
+| `unknown`, `recovery-required`, foreign request id or unreadable state | `failed` with `uncertain: …`, never retried |
 
-Output bounds: stdout is read as at most the last **64 KiB** (65536 bytes) and stored as `output`; `node.job.outputTruncated` records the coordinator's truncation flag. On failure only the last **8 KiB** of stderr is appended to `error`. If logs cannot be read, the job's terminal identity is kept and the node fails (`Output error: … stdout could not be read` or `(stderr unavailable: …)`). A log error never reruns the job.
+`timeoutSeconds` is measured from the node's first start, so a resumed node keeps its budget. When it expires the job is explicitly stopped, and the node becomes `timed_out` once the stop is confirmed.
 
-### Checkpoint metadata and invariants
+**`agent`** runs an installed agent (`agent`, resolved from the installed agents; it must be enabled) on an interpolated `task`. The task is the agent's whole input; there is no conversation history. **`prompt`** runs a synthetic agent on an interpolated `prompt`. That agent can use only the workflow tools listed in `allowedTools` (none by default). Both node types accept:
 
-`node.job` holds `requestId` and, when known, `jobId`, `state`, `exitCode` and `outputTruncated`; `status` prints it. Reading a checkpoint fails closed unless: `job` appears only on job nodes; `requestId` equals `wf-<runId>-<nodeId>-1`; there are no extra keys; `state` is a known lifecycle state; a `running` or `passed` job node has `job`; and a job node is never `waiting_approval`.
+- `model` and `effort`: overrides.
+- `maxIterations`: the agent's turn limit, 1–200.
+- `output`: `text` (the default) or `json`. The reply must be JSON, or contain a `` ```json `` block.
+- `outputSchema`: a JSON Schema that the parsed JSON must match. It requires `output: json`; a mismatch fails the node.
+- `retrySafe`: default `true`. An interrupted node is dispatched again on resume. `false` instead parks it on an `uncertain_tool` decision.
 
-### Resume and reattach
+Usage, model and duration are recorded on the checkpoint. A transcript is written to `<runDir>/artifacts/<nodeId>.txt`.
 
-A `running` job node is the one kind of interrupted node that `resume` accepts; an interrupted tool node is still refused as uncertain. The job is **never started again**: the adapter polls the stored `jobId` (checking its `requestId`), falls back to lookup by `requestId`, and otherwise fails with `uncertain: cannot verify job … refusing to start a second workload.` Resuming with no job support throws and leaves the checkpoint `running`, so a later resume can still reattach. If a cancel marker exists at resume, the job is reattached first and then stopped as below.
+**`loop`** runs a `body` sub-DAG once per iteration, sequentially:
 
-### Cancellation and stop
+- `maxIterations` is required and must be at most **50**.
+- The loop stops (`passed`) after an iteration once `until` (an expression that may reference body nodes, the loop's own dependencies and `loop.*`) is true, or once `stopWhen: {node, status}` matches a body node's status.
+- A body failure fails the loop. A body approval parks the loop, and the iteration continues on resume.
+- `onExhausted` sets the result when `maxIterations` is reached without stopping: `fail` (the default) or `continue` (`passed`, with the last iteration's outputs as `output`).
+- `historyLimit` (1–20, default 5) sets how many finished iterations `loop.history` keeps.
+- `timeoutSeconds` bounds the whole loop.
+- Loops nest at most **2** levels deep. Body nodes may depend only on body siblings. `retry`, `tool`, `input`, `command` and `prompt` are not allowed on the loop itself.
+- A passed loop's `output` maps each body node id to its output from the final iteration.
 
-When the run is aborted (Ctrl+C/Esc, SIGINT/SIGTERM, or a cancel marker) while a job is live, the adapter issues an **explicit authorized `stop`** and reports only what it observes. Aborting the poll alone never stops a job. `/workflows cancel` and `agav workflows cancel` use the same stop for a `running` job node while holding the run lock.
+### References
 
-- The stop call uses a fresh, non-aborted signal (the run's aborted signal would be denied immediately), a 120 s deadline for the call, then up to 15 s of polling for a terminal state.
-- A job that finished before the stop is reported with its real outcome (`completed`/`failed`), not as cancelled.
-- Anything else is **cancellation incomplete**: coordinator unavailable, job not found or not matching the requestId, uncertain or non-live state, stop denied or thrown, deadline exceeded, still live after the settle wait, or poll failure. The node stays `running` with its job linkage and the reason in `error`.
-- `executeRun` and `cancelRun` then throw `JobCancellationIncompleteError`: the run is left `running` (not terminal) and the lock is released, so `resume` or `cancel` can retry. The CLI prints the error and exits 1.
-- When the stop is confirmed, an `interrupted` job makes the node `cancelled`. `cancelRun` marks the run `cancelled` only after every running job node has settled.
-- `cancelRun` with no job support fails (`Cancellation requested, but node … has a running job … not claiming it stopped`) and changes nothing.
+Tool `input` strings, agent `task` and prompt `prompt` may contain:
 
-### Authorization by host
+- `${inputs.<name>}`
+- `${nodes.<id>.output}`, optionally followed by a path such as `.field.0`
+- `${nodes.<id>.status}`
+- Inside a loop body: `${loop.index}`, `${loop.prev.<id>.output…}` (the previous iteration's body nodes), and `${loop.history…}` (a list of `{index, status, outputs}`).
 
-Job start/stop authorization is the background-jobs coordinator's (the same as `/job`). It is never a workflow approval node or a tool confirmation, and there are no workflow-run grants. The adapter passes `headlessApprovedActions: []`. Per `authorization/service.ts` (source-read): an existing exact-spec grant or `auto-accept` allows without a prompt, `deny-writes` blocks `start`, and `ask` mode prompts.
+A string that is exactly one reference resolves to the raw value. Embedded references are stringified, with objects and arrays JSON-encoded. A referenced node must be a (transitive) dependency; this is checked at validation. Only a `passed` node's output is data. Referencing the output of a node that did not pass, a missing field or index, or a missing input fails the node.
 
-- **Headless CLI (`agav workflows run|resume|cancel`)**: jobs are passed `headless: true`, so the coordinator's headless gate **denies a fresh start**, even with `--auto-accept`, and the node fails with `Job start failed: …` carrying the denial reason. In practice job nodes are usable only from the interactive App. The adapter enforces the same gate for `stop`: a live job cannot be stopped from the CLI, so `cancel` reports cancellation incomplete, keeps the run recoverable and exits 1. Reattaching to or observing an existing job needs no grant.
-- **Interactive App (`/workflows …`)**: start and stop each raise the exact-spec `/job` confirmation (`run_background_job`) through the App's confirmation queue. A generic “Always” is downgraded to a single yes, and an “Always” on another prompt does not resolve or auto-accept queued background prompts.
-  - A **start** prompt is withdrawn (denied) when the run aborts, through the abort signal accepted by `ConfirmationQueue.enqueue`.
-  - A **stop** prompt is deliberately not withdrawn when the run aborts, because the stop is the cancellation. It is denied by shutdown (`/exit`, external unmount) and by Esc/Ctrl+C pressed while it is pending, and after shutdown begins any new prompt is denied at once. A denied stop is reported as cancellation incomplete.
-  - Source-read, not exercised against a real keypress: the stop prompt created by the first Esc/Ctrl+C appears after that keypress's denial sweep, so a second Esc/Ctrl+C is needed to deny it.
+### Expressions
 
-## Interactive foreground commands
-
-Inside Agav, use `/workflows` (or `/help workflows`) for usage:
+`when` and loop `until` use a small safe expression language. It is parsed by hand and never uses `eval`:
 
 ```text
-/workflows validate workflow.json
-/workflows run workflow.json --input-json {"key":"value"}
-/workflows status <full-run-uuid>
-/workflows approve <full-run-uuid> review
-/workflows resume <full-run-uuid>
-/workflows cancel <full-run-uuid>
+or:          a || b          and:     a && b
+comparison:  == != < <= > >= in
+unary:       !x   -x         literals: numbers, 'strings' / "strings", true, false, null
+references:  inputs.<name>[.path]  nodes.<id>.status  nodes.<id>.output[.path]
+             loop.index  loop.item|prev|history[.path]
 ```
 
-Double-quote paths containing spaces. Unlike a shell, slash-command input JSON must **not** be wrapped in single quotes. JSON string whitespace is preserved. The same two feature gates are required. These commands use a restricted built-in registry, never loaded extensions, and do not invoke the process CLI.
+- `==` and `!=` compare deeply.
+- Ordering (`<`, `<=`, `>`, `>=`) is defined only between two numbers or two strings; anything else is false.
+- `in` tests array membership or substring.
+- Empty string, `0`, `null`, `undefined` and `false` are falsy; arrays are truthy.
+- A missing reference evaluates to `undefined` and never errors, so `nodes.x.status == 'passed'` is simply false for a skipped `x`.
+- An optional `${…}` wrapper around the whole expression is accepted.
+- Limits: 2000 characters and nesting depth 32. `__proto__`, `constructor` and `prototype` are refused.
 
-Execution stays in the foreground. Normal prompts and unsafe slash commands queue until it settles; `/workflows status`, `/workflows cancel`, `/help` and `/exit` remain reachable. Ctrl+C or Esc aborts active workflow execution, including while tool consent is displayed. `/exit` aborts and waits for the executor to checkpoint settlement before exiting Ink. External unmount aborts and rejects pending consent; React cleanup cannot await settlement. A non-cooperative tool can delay completion/exit; cancellation intent is not proof that its effects stopped.
+### Inputs
 
-In ask mode, mutating tools without an existing matching grant show an App-owned, single-invocation Y/N prompt with the full resolved input in a scrollable viewport. Enter and “always” do not grant consent. This does not change permission mode or create grants for future nodes, workflows, background jobs or schedules. Workflow approval nodes still pause the run: inspect their prompt in status, record approve/deny explicitly, then resume separately. They never approve a tool.
+```yaml
+inputs:
+  target: { type: string, required: true, description: Branch to test }
+  attempts: { type: number, default: 3 }
+```
 
-## Permissions and execution
+Types are `string`, `number`, `boolean`, `object` and `array`. A `default` must match its type, and a required input cannot have a default. At launch, unknown names, missing required inputs and type mismatches are rejected, and defaults fill the gaps. A definition without `inputs` accepts any JSON object.
 
-Supported node types are `tool`, `approval` and `job` (see [Job nodes](#job-nodes)). Tools available to `tool` nodes: `read_file`, `write_file`, `edit_file`, `run_command`, `grep_search`, `find_files`, `list_directory`, `overview`. The `run_background_job` tool, tests, agents, skills, network tools and arbitrary registry extensions are not available to tool nodes. Unknown definition/node fields and unsupported node types are rejected rather than silently ignored.
+### Policies
 
-The CLI is headless: read-only tools run without confirmation; other tools require the existing `auto-accept` permission mode or a matching `allowedTools` grant. An explicit allowlist restricts mutating tools even under auto-accept. `deny-writes` blocks mutating tools. Destructive commands are refused. An approval node is a workflow decision, **not** a tool-permission grant. `run_command` uses Agav's existing shell sandbox and `sandboxRequired` policy; auto-accept is not sandboxing. Read/write tools retain their ordinary filesystem permissions, including absolute paths. Workflow checkpoint identifiers cannot contain paths.
+| Policy | Meaning |
+| --- | --- |
+| `maxRuntimeSeconds` (≤ 604800) | Run deadline, fixed at the first execution and kept across resumes. When it is hit, the running node and the run become `timed_out`. |
+| `stopOnFailure` (default `true`) | With `false`, a failed node only skips its dependents; independent branches continue. |
+| `permissionMode` | Narrows (never widens) the run's permission mode (`deny-writes` < `ask` < `auto-accept`). |
+| `maxConcurrency` (1–64) | Stored and validated but **not used**: execution is sequential. |
 
-Commands must be literal: `${...}` substitution anywhere inside `run_command` input is rejected, avoiding unquoted output-to-shell interpolation. Shell input `timeout_ms` retains its existing maximum of 120 seconds. Tool nodes may additionally specify `timeoutSeconds` (positive, at most 86400). Timeout/cancel aborts the node signal and **awaits tool settlement** before publishing the terminal result. Non-cooperative tools may delay shutdown indefinitely; this is not OS-level confinement or proof that escaped descendants are dead.
+A run is also capped at **500** executor dispatches over its lifetime, counting retries, loop iterations and reattachments. Beyond that the run fails with `execution cap (500) exceeded`.
 
-## Host integration (internal)
+## Example: fix until tests pass
 
-`executeRun(store, id, registry, config, signal?, host?, jobDeps?)` accepts an optional trusted `WorkflowExecutionHost` from `source/workflows/gated-tools.ts`:
+```yaml
+# .agav/workflows/fix-tests.yaml
+version: 1
+name: fix-tests
+description: Run the tests; while they fail, let an agent fix the code (at most 5 rounds).
+policies:
+  maxRuntimeSeconds: 3600
+nodes:
+  - id: fix-loop
+    type: loop
+    maxIterations: 5
+    historyLimit: 3
+    # The test job always exits 0 and reports the real exit code, so a red test run does not fail the iteration.
+    until: "'exit=0' in nodes.test.output"
+    body:
+      - id: test
+        type: job
+        command: npm test 2>&1; echo "exit=$?"
+        timeoutSeconds: 900
+      - id: fix
+        type: prompt
+        dependsOn: [test]
+        when: "!('exit=0' in nodes.test.output)"
+        allowedTools: [read_file, grep_search, find_files, edit_file]
+        maxIterations: 40
+        prompt: |
+          The test suite fails (attempt ${loop.index}). Fix the code, not the tests.
+          Test output:
+          ${nodes.test.output}
+  - id: review
+    type: approval
+    dependsOn: [fix-loop]
+    prompt: Tests pass. Review the diff before committing?
+```
 
-- `confirmTool(name, resolvedInput, signal): Promise<boolean>` supplies single-invocation tool consent after allowlist/deny-writes/destructive checks.
-- Optional `executeTool(registry, name, resolvedInput, context): Promise<ToolResult>` supplies trusted execution after that gate. Without it the restricted registry executes the tool. Neither callback comes from workflow JSON.
-- `CommandContext.runWorkflow(task)` gives the slash handler an App-owned signal/host and holds foreground ownership until `task(signal, host)` settles.
-- Shared `decideApproval(store, id, nodeId, approve, registry)` and `cancelRun(store, id, registry, signal?, jobDeps?)` implement durable decisions/cancellation without process CLI I/O.
+In each iteration the tests run. While they fail, the `fix` node gets the output and edits files; once they pass, `fix` is skipped and `until` ends the loop. After 5 failing rounds the loop fails (`onExhausted` defaults to `fail`). `npm test …` is a literal job command, so it appears in the consent prompt. Unless the run's permission mode is `auto-accept`, each distinct `edit_file` call by the agent becomes an `agent_tool_consent` decision in the inbox.
 
-Job nodes are driven by an optional trusted 7th argument, `jobDeps?: JobNodeDeps` (`source/workflows/job-node.ts`), also accepted by `cancelRun(store, id, registry, signal?, jobDeps?)`; it never comes from workflow JSON. `JobNodeDeps` holds:
+## Launching and consent
 
-- `getCoordinator()` (both hosts pass `getSharedCoordinator`), used for `start`, `poll`, `log`, `stop` and `findByRequestId`;
-- `session`, a `SessionPolicySnapshot` (or a function returning one) with `headlessApprovedActions: []`, plus `confirmBackgroundAction` in the App;
-- `sandboxRequired` and a required boolean `headless` (a start request sends `headless` unless it is explicitly `false`);
-- optional `pollIntervalMs` (250), `stopDeadlineMs` (120000), `stopSettleMs` (15000) and `callDeadlineMs` (30000: a per-call wait bound for stop/observe calls; late results are ignored, but the underlying call is not cancelled).
+Every run asks for consent **per invocation**; consent is never inferred or remembered across runs. The prompt shows:
 
-Without `jobDeps`, a fresh job node fails as unavailable and a `running` job node cannot be reattached or stopped. `CommandContext.runWorkflow(task)` calls `task(signal, host, jobDeps)`; the App builds `jobDeps` per run. Job dispatch does not go through `executeTool` and does not widen the tool allowlist.
+- the workflow name, directory and effective permission mode;
+- the tools and literal job commands the definition uses, loop bodies included;
+- a checklist of environment variable **names** from the current environment.
 
-## Checkpoints and limits
+Only the selected names are passed to the runner. Values are never shown or stored. In the CLI the checklist is answered with numbers or ranges (`1 3,5-7`), `all` or `none` (the default), followed by a final y/N. `agav workflows run` therefore needs an interactive terminal (`workflow run requires interactive consent`). In the App and the TUI it is a checklist (`↑↓` move, Space toggles, `a` selects all, `x` deselects all, Enter/`y` approves, `n`/ESC denies).
 
-Runs execute sequentially in dependency order, even when nodes are listed out of order. Independent branches may execute while another branch awaits approval. A denied/failed node stops the run. Approve records the decision only; invoke resume separately. Completed nodes never rerun. Resume requires the original canonical working directory and uses the stored definition, not a newly edited file. Job nodes follow the same rules but are reattached rather than rerun (see [Resume and reattach](#resume-and-reattach)).
+The consent (definition hash, cwd, permission mode, capabilities, env names) is stored on the run and reused by its relaunches. In the detached runner:
 
-Checkpoints are atomic, fsynced JSON snapshots under `~/.agav/workflow-runs/`. A per-run, identity-aware exclusive lock spans execution and shutdown. Status can read the last complete snapshot while a run is active. Cancel writes a separate durable intent, then waits to obtain the run lock; a live runner polls that intent. SIGINT/SIGTERM abort foreground execution and wait for settlement. Never use SIGKILL expecting a clean checkpoint: a leftover running *tool* node has an **uncertain outcome** and resume refuses to replay it (a running *job* node is reattached instead). After inspecting external effects, start a new run if appropriate. Corrupt checkpoints fail closed. Terminal runs cannot be retried or rewound.
+- Tool-node calls of tools covered by the consent are approved.
+- Literal job commands covered by the consent may start.
+- Anything else becomes an inbox decision.
 
-This is a compatible subset of the planned workflow language (`version`, `name`, `description`, `nodes`, `dependsOn`, tool `input`, approval `prompt`, job `command`, tool-node `timeoutSeconds`). Foreground `job` nodes exist, but these are **not implemented**: detach/detached launcher, schedules, workflow-run grants, job timeouts, `${…}` interpolation in job commands, retries, parallelism/concurrency, and labels or mailbox/notifications for jobs. Also absent: YAML/discovery, input declarations/defaults, policies, conditions, output schemas, evals, metrics, attempt history and retention cleanup. Checkpoint storage is trusted local user state, not a hostile/multi-tenant filesystem boundary.
+Consent for a tool name never covers an agent's sub-tool calls.
+
+The run is created only after consent. Its runner is launched as a supervised background job (`wf-run-<runId>-<attempt>`) that runs `agav --internal-workflow-runner <runId>`. At most `maxConcurrentWorkflowRuns` runners (default 2, separate from the background-job pool) execute at once; further runs wait as `queued` and are admitted first-in, first-out. Hosts without the native process helper (Windows) refuse to launch.
+
+### Run and node states
+
+Run states: `queued`, `running`, `waiting_approval`, `interrupted`, `cancelling`, then terminal `passed`, `failed`, `cancelled` or `timed_out`. Node states: `pending`, `running`, `waiting_approval`, `passed`, `failed`, `cancelled`, `timed_out` and `skipped`. Display glyphs: ✓ passed, ✗ failed, ● running, ◐ waiting, ⊘ cancelled, ⏱ timed out, … pending or queued, ! interrupted, ↷ skipped.
+
+A runner that parks on a decision exits. Deciding the last pending decision relaunches it as a new attempt, and the runner applies the recorded decisions when it starts. A runner still executing other branches picks the decisions up itself.
+
+### Reconcile
+
+`list`, `status`, `--wait` and the TUI reconcile runs against the coordinator:
+
+- A run whose runner job is gone is marked `interrupted` and relaunched, at most **3** times. After that it stays `interrupted`, and `resume` relaunches it manually.
+- A runner in an uncertain state (`unknown`, `recovery-required`) is marked `interrupted` and never relaunched automatically, because it may still be alive.
+- A dead runner that left a tool node `running` parks that node on an `uncertain_tool` decision instead of replaying it.
+- Queued runs are admitted while the pool has room.
+
+On resume:
+
+- A running job node or loop is reattached or re-entered.
+- A retry-safe agent or prompt node is dispatched again.
+- An interrupted tool node (or a `retrySafe: false` agent) is **never** replayed: approving its `uncertain_tool` decision retries it, and denying fails it.
+
+Completed nodes never rerun. Resume uses the stored definition, not the edited file, and requires the original working directory.
+
+## Inbox decisions
+
+| Kind | Raised by | Approve | Deny |
+| --- | --- | --- | --- |
+| `approval` | an approval node | node `passed` | node `failed` |
+| `tool_consent` | a tool-node call not covered by the consent | the call runs | node `failed` |
+| `agent_tool_consent` | an agent/prompt sub-tool call that needs confirmation | the call runs | only that call is refused; the agent continues |
+| `uncertain_tool` | an interrupted tool node | node retried | node `failed` |
+
+Decision ids are deterministic: they are derived from the kind, the node, the tool and a SHA-256 hash of the canonical resolved input. **Identical calls share one approval**, and a changed input gets a new decision. Approvals inside loops are keyed per iteration, so one iteration's answer never decides the next.
+
+Decisions are files under `<runDir>/decisions/`. A decider creates `<id>.decided.json` exclusively, so exactly one session wins. A losing `approve` or `deny` exits 1. Deciders never write `run.json`; the runner remains its only writer. `--note <text>` records a note alongside the decision.
+
+Agent sub-tool calls are confirmed as follows:
+
+- Read-only tools are approved.
+- Destructive commands, `deny-writes` and an `allowedTools` restriction refuse the call.
+- `auto-accept` approves the call.
+- Otherwise an `agent_tool_consent` decision is filed and awaited **in-process**, because the agent's conversation cannot be parked.
+
+## Commands
+
+### CLI
+
+```text
+agav workflows validate <name|file>
+agav workflows run <name|file> [--input '{"key":"value"}'] [--wait] [--json]
+agav workflows list [--json]
+agav workflows status <run-id> [--json]
+agav workflows inbox [<run-id>] [--json]
+agav workflows approve|deny <run-id> <node-id|decision-id> [--note <text>]
+agav workflows resume|cancel <run-id>
+```
+
+- `<run-id>` is the full UUID or any unique prefix of at least 4 characters. Lists show 8. An ambiguous prefix lists the candidates.
+- `--input-json` is accepted as an alias of `--input`.
+- `--json` prints machine-readable output:
+  - `status`: the full checkpoint.
+  - `list`: `[{id, status, workflow, createdAt, updatedAt}]`.
+  - `inbox`: pending decisions.
+  - `run`: `{status, run}`.
+- `--wait` follows the run and prints node and run status changes. It exits 0 when the run passed or is waiting for approval, and 1 when it failed, was cancelled, timed out or stays interrupted. Ctrl+C only detaches; the run keeps going.
+- Without `--wait`, `run` exits 0 once the run is started or queued, and 1 if consent is denied.
+- `approve`/`deny` name a node id (when it has exactly one pending decision) or a decision id.
+- `cancel` writes a durable cancel marker and asks the supervisor to stop the runner. The runner checkpoints `cancelled` within its 4 s shutdown grace. The run's own consent covers stopping its runner and its job nodes.
+- `resume` relaunches the runner of an interrupted, waiting or queued run under its original consent.
+- Global flags (`--cwd`, `--auto-accept`, `--deny-writes`, `--sandbox-required`) go **before** `workflows`. The permission mode in effect at launch is recorded in the consent.
+
+### Slash command
+
+Inside Agav, `/workflows` with no arguments opens the [Workflows TUI](#workflows-tui). The text actions are:
+
+```text
+/workflows validate <name|file>
+/workflows run <name|file> [--input-json {"key":"value"}]
+/workflows list
+/workflows status <run-id>
+/workflows inbox [<run-id>]
+/workflows approve|deny <run-id> <node-id|decision-id> [--note <text>]
+/workflows resume|cancel <run-id>
+```
+
+They behave like the CLI, including short ids, but have no `--json` or `--wait`. `run` returns immediately after the consent checklist. Double-quote paths that contain spaces. Input JSON is the remainder after `--input-json`, so do **not** wrap it in shell quotes. The status bar shows `workflows: N running · M need approval`. Run notifications (waiting for approval, passed, failed and so on) are shown once, in one session.
+
+### Workflows TUI
+
+The TUI has three tabs (Workflows │ Runs │ Inbox). `Tab` switches to the next tab, and the Inbox label shows the pending count. All tabs share the resource-manager keys: `↑↓` navigate, `←→` page, Enter/`i` inspect, `s` search, `r` refresh, ESC clears the search or exits.
+
+| Tab | Keys |
+| --- | --- |
+| Workflows (discovered, with origin and last run) | `R` run (typed-input form, then the consent checklist; the new run opens in Runs), `v` validate, `e` edit name/description/inputs |
+| Runs (newest first, refreshed every second) | Enter live detail (tree, inputs, pending decisions, last events), `x` cancel (confirms first), `a`/`D` approve/deny the first pending decision, `l` logs (events and every node output), `R` re-run with the same inputs, `u` resume, `d` delete a finished run |
+| Inbox (pending decisions of all runs) | `a`/`D` approve/deny; each shows the full resolved tool input and asks `y`/`n` first |
+
+## Storage
+
+Runs live under `~/.agav/workflow-runs/<runId>/`:
+
+- `run.json`: atomic, fsynced checkpoints.
+- `events.jsonl`: a display-only trace.
+- `decisions/`
+- `artifacts/`: outputs over 64 KiB are stored here and referenced from the checkpoint; agent transcripts are written here too.
+
+A per-run exclusive lock spans execution. Corrupt checkpoints fail closed. Checkpoint storage is trusted local user state, not a hostile or multi-tenant filesystem boundary.
+
+## Permissions
+
+The runner uses the consent's permission mode, narrowed by `policies.permissionMode`:
+
+- Read-only tools never need confirmation.
+- `deny-writes` blocks mutating tools and job starts.
+- An `allowedTools` allowlist restricts mutating tools even under `auto-accept`.
+- Destructive commands are refused.
+- `run_command` uses Agav's shell sandbox and the `sandboxRequired` policy. `auto-accept` is not sandboxing.
+- File tools keep their ordinary filesystem permissions, including absolute paths.
+- Timeouts and cancellation abort a node and wait for the tool to settle. A non-cooperative tool can delay this; cancellation is not proof that escaped child processes are dead.
+
+## Known limitations
+
+- Approval nodes and inbox decisions wait forever: there is no decision timeout or expiry. `maxRuntimeSeconds` still applies while the runner is live.
+- An agent sub-tool consent is awaited in-process by the live runner. The agent's conversation is not checkpointed while it waits.
+- `policies.maxConcurrency` is stored but ignored: nodes execute one at a time in dependency order.
+- Background runs are unsupported on Windows (no native process helper), so launches are refused there.
+- Interrupted tool nodes are never replayed automatically. Decide their `uncertain_tool` decision after you have inspected any external effects.
+- Terminal runs cannot be resumed or rewound. Use re-run (TUI `R`) or a new `run`.
