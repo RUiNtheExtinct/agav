@@ -199,8 +199,8 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
     const decisionOf = (item: ResourceItem) => item.values?.decisionId;
     actions.push(
       { key: "x", label: "Cancel", inDetail: true, confirm: "The run's runner and jobs are stopped.", when: (item) => item.stoppable === true, run: async (item: Target) => item ? cancelWorkflowRun(deps, item.id) : undefined },
-      { key: "a", label: "Approve", inDetail: true, when: (item) => Boolean(decisionOf(item)), run: async (item: Target) => item ? decideWithConfirm(item.id, decisionOf(item)!, true) : undefined },
-      { key: "D", label: "Deny", inDetail: true, when: (item) => Boolean(decisionOf(item)), run: async (item: Target) => item ? decideWithConfirm(item.id, decisionOf(item)!, false) : undefined },
+      { key: "a", label: "Approve", hint: "a/D: Approve/Deny", inDetail: true, when: (item) => Boolean(decisionOf(item)), run: async (item: Target) => item ? decideWithConfirm(item.id, decisionOf(item)!, true) : undefined },
+      { key: "D", label: "Deny", hint: "", inDetail: true, when: (item) => Boolean(decisionOf(item)), run: async (item: Target) => item ? decideWithConfirm(item.id, decisionOf(item)!, false) : undefined },
       { key: "l", label: "Logs", run: async (item: Target) => item ? { detail: await formatRunLogs(deps.store, deps.registry, item.id) } : undefined },
       { key: "R", label: "Re-run", run: async (item: Target) => {
         if (!item) return;
@@ -211,8 +211,8 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
     );
   }
   if (tab === "inbox") actions.push(
-    { key: "a", label: "Approve", inDetail: true, run: async (item: Target) => item ? decideWithConfirm(item.values!.runId!, item.values!.decisionId!, true) : undefined },
-    { key: "D", label: "Deny", inDetail: true, run: async (item: Target) => item ? decideWithConfirm(item.values!.runId!, item.values!.decisionId!, false) : undefined },
+    { key: "a", label: "Approve", hint: "a/D: Approve/Deny", inDetail: true, run: async (item: Target) => item ? decideWithConfirm(item.values!.runId!, item.values!.decisionId!, true) : undefined },
+    { key: "D", label: "Deny", hint: "", inDetail: true, run: async (item: Target) => item ? decideWithConfirm(item.values!.runId!, item.values!.decisionId!, false) : undefined },
   );
 
   if (stage?.kind === "inputs") return <InputForm stage={stage} onChange={setStage} onSubmit={submitInputs} onCancel={() => { setStage(null); setNotice("Run cancelled."); }} />;
@@ -230,6 +230,7 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
       actions={actions}
       height={height}
       refreshIntervalMs={tab === "workflows" ? undefined : RUN_REFRESH_MS}
+      emptyText={tab === "inbox" ? "No pending decisions." : undefined}
       prompt={pending?.prompt}
       promptDetails={pending ? { lines: pending.lines, controls: CONFIRM_CONTROLS } : undefined}
     />

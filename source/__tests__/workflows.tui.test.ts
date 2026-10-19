@@ -20,11 +20,11 @@ beforeEach(async () => {
 });
 afterEach(async () => { await cleanup(); });
 
-async function mount() {
+async function mount(size: { columns: number; rows: number } = { columns: 140, rows: 30 }) {
   const onExit = vi.fn();
   let output = "";
   const stdout = new EventEmitter() as NodeJS.WriteStream;
-  Object.assign(stdout, { isTTY: true, columns: 140, rows: 30, write: (text: string) => { output += text; return true; } });
+  Object.assign(stdout, { isTTY: true, ...size, write: (text: string) => { output += text; return true; } });
   const stdin = new EventEmitter() as NodeJS.ReadStream;
   Object.assign(stdin, { isTTY: true, setRawMode: () => stdin, resume: () => stdin, pause: () => stdin, read: () => null });
   const instance = render(h(WorkflowsTUI, { onExit, config: testConfig(), deps }), { stdout, stdin, patchConsole: false, exitOnCtrlC: false });
@@ -52,7 +52,7 @@ describe("WorkflowsTUI", () => {
       await ui.key("\t");
       expect(ui.frame()).toContain("Workflow runs · List");
       expect(ui.frame()).toContain(`◐ ${run.id.slice(0, 8)} deployer`);
-      expect(ui.frame()).toContain("a: Approve");
+      expect(ui.frame()).toContain("a/D: Approve/Deny");
       await ui.key("\t");
       expect(ui.frame()).toContain("Workflow inbox · List");
       expect(ui.frame()).toContain(`◐ gate · deployer ${run.id.slice(0, 8)}`);
@@ -123,6 +123,36 @@ describe("WorkflowsTUI", () => {
       expect(ui.frame()).toContain("Workflow run not approved.");
       expect(coordinator.starts).toHaveLength(0);
       expect(await store.listIds()).toEqual([]);
+    } finally { ui.instance.unmount(); }
+  });
+});
+
+describe("WorkflowsTUI layout", () => {
+  it("fits the Runs tab, wrapped hints included, in an 80×24 terminal", async () => {
+    for (let i = 0; i < 12; i++) {
+      const run = await createRun(store, def([{ id: "gate", type: "approval", prompt: "deploy?" }], { name: `deployer-${i}` }), {});
+      await executeRun(store, run.id, registry, testConfig(), undefined, fakeHost());
+    }
+    const ui = await mount({ columns: 80, rows: 24 });
+    try {
+      await ui.key("\t");
+      // The captured output holds every repaint; measure only the last full frame.
+      const frame = ui.frame().slice(ui.frame().lastIndexOf("Workflows │ Runs"));
+      expect(frame).toContain("Workflow runs · List");
+      expect(frame).toContain("a/D: Approve/Deny");
+      expect(frame.replaceAll("\n", "")).toContain("ESC: Exit/clear");
+      expect(frame).toContain("→ ◐");
+      expect(frame.replace(/\n$/, "").split("\n").length).toBeLessThanOrEqual(24);
+    } finally { ui.instance.unmount(); }
+  });
+
+  it("says the Inbox has no pending decisions when it is empty", async () => {
+    const ui = await mount();
+    try {
+      await ui.key("\t"); await ui.key("\t");
+      expect(ui.frame()).toContain("Workflow inbox · List");
+      expect(ui.frame()).toContain("No pending decisions.");
+      expect(ui.frame()).not.toContain("No resources found.");
     } finally { ui.instance.unmount(); }
   });
 });
