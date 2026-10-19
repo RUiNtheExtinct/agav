@@ -146,6 +146,15 @@ describe("agent and prompt node execution", () => {
     expect(done.nodes[0]!.output).toBeUndefined();
   });
 
+  it("an a2a agent node with model/effort/maxIterations fails clearly instead of silently ignoring them", async () => {
+    const invoker = mockInvoker("x");
+    const run = await backgroundRun(def([{ id: "a", type: "agent", agent: "remote", task: "t", model: "claude-x", maxIterations: 3 }]));
+    const done = await execute(run, invoker);
+    expect(done.status).toBe("failed");
+    expect(done.nodes[0]!.error).toMatch(/"remote" is an a2a agent; model, maxIterations cannot be applied/);
+    expect(invoker.requests).toHaveLength(0);
+  });
+
   it("passes model, effort, maxIterations and prompt allowedTools", async () => {
     const invoker = mockInvoker("ok");
     const run = await backgroundRun(def([

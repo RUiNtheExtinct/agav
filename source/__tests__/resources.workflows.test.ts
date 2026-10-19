@@ -137,7 +137,7 @@ describe("RunsAdapter and InboxAdapter", () => {
     const detail = (await createInboxAdapter(deps).get(item.id))!.detail;
     expect(detail).toContain("Tool: write_file");
     expect(detail).toContain('"content": "line1\\nline2"');
-    expect(detail).toContain("Approving allows exactly this resolved input once.");
+    expect(detail).toContain("Approving allows identical calls (same tool and resolved input) of this node for the rest of the run.");
   });
 
   it("deletes only settled runs, removing the checkpoint and run directory", async () => {

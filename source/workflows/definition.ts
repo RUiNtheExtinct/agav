@@ -38,6 +38,11 @@ export interface WorkflowNode {
   allowSkipped?: boolean;
   /** Automatic retries after a failed/timed-out attempt: `max` extra attempts (total attempts = max + 1). */
   retry?: RetryPolicy;
+  /**
+   * A failed or timed-out outcome (after retries) does not fail the enclosing scope (run or loop iteration); dependents
+   * still run and see the status (branch with `when`). Never applies to uncertain or cancelled outcomes.
+   */
+  continueOnError?: boolean;
   /** `loop` nodes: the body sub-DAG run once per iteration (ids are globally unique; dependsOn stays within the body). */
   body?: WorkflowNode[];
   /** `loop` nodes: stop (passed) once this expression is true after an iteration; may reference body nodes and `loop.*`. */
@@ -156,7 +161,7 @@ const validate = ajv.compile({
         maxIterations: { type: "integer", minimum: 1, maximum: 200 }, retrySafe: { type: "boolean" },
         output: { enum: ["text", "json"] }, outputSchema: { type: "object" },
         allowedTools: { type: "array", uniqueItems: true, items: { type: "string" } },
-        when: { type: "string", minLength: 1, maxLength: 2000 }, allowSkipped: { type: "boolean" },
+        when: { type: "string", minLength: 1, maxLength: 2000 }, allowSkipped: { type: "boolean" }, continueOnError: { type: "boolean" },
         retry: {
           type: "object", additionalProperties: false, required: ["max"],
           properties: { max: { type: "integer", minimum: 1, maximum: 10 }, backoffSeconds: { type: "number", minimum: 0, maximum: 3600 } },
@@ -198,6 +203,8 @@ export function validateDefinition(value: unknown, registry: ToolRegistry): Work
       const extra = [...AGENT_FIELDS, "agent", "task", "allowedTools"].find(field => has(field as keyof WorkflowNode) && !(node.type === "loop" && field === "maxIterations"));
       if (extra) throw new Error(`Invalid ${node.type} node ${node.id}: ${extra} is only allowed on agent/prompt nodes.`);
     }
+    // A loop's outcome is a container outcome (use onExhausted), and an approval denial is a human decision.
+    if (node.continueOnError !== undefined && (node.type === "loop" || node.type === "approval")) throw new Error(`Invalid ${node.type} node ${node.id}: continueOnError is not supported on ${node.type} nodes.`);
     if (node.type === "loop") {
       validateLoopNode(node, path);
     } else if (node.type === "agent" || node.type === "prompt") {

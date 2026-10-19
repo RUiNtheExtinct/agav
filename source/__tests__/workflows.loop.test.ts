@@ -6,7 +6,9 @@ import { readEvents } from "../workflows/events.js";
 import { cancelRun } from "../workflows/control.js";
 import { decide, listPendingDecisions } from "../workflows/decisions.js";
 import { createRun, executeRun } from "../workflows/runtime.js";
-import { jobRequestId, type LoopNodeCheckpoint, type WorkflowRun, type WorkflowStore } from "../workflows/store.js";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
+import { jobRequestId, MAX_INLINE_OUTPUT_BYTES, type LoopNodeCheckpoint, type WorkflowRun, type WorkflowStore } from "../workflows/store.js";
 import { def, fakeHost, FakeCoordinator, jobDeps, registry, summary, tempStore, testConfig } from "./helpers/workflow-fixtures.js";
 
 let store: WorkflowStore, cleanup: () => Promise<void>;
@@ -209,5 +211,94 @@ describe("loop execution", () => {
     expect(cp.status).toBe("cancelled");
     expect(cp.iterations![1]).toMatchObject({ status: "cancelled", nodes: { build: { status: "cancelled" } } });
     await expect(store.read(run.id, registry)).resolves.toBeTruthy();
+  });
+
+  it("continueOnError: run tests, fix while failing, repeat until tests pass", async () => {
+    const coordinator = new FakeCoordinator();
+    // One poll per job: iterations 1-2 fail (exit 1), iteration 3 passes.
+    coordinator.pollStates = ["failed", "failed", "completed"];
+    const inv = mockInvoker("fixed");
+    const run = await create(def([{ id: "loop", type: "loop", maxIterations: 5, until: "nodes.test.status == 'passed'", body: [
+      { id: "test", type: "job", command: "npm test", continueOnError: true },
+      { id: "fix", type: "prompt", prompt: "fix the failing tests (iteration ${loop.index})", dependsOn: ["test"], when: "nodes.test.status == 'failed'" },
+    ] }]));
+    const done = await execute(run.id, { inv, coordinator });
+    expect(done.status).toBe("passed");
+    const cp = loopCp(done, "loop");
+    expect(cp.status).toBe("passed");
+    expect(cp.iterations).toHaveLength(3);
+    expect(cp.iterations!.map(it => it.status)).toEqual(["passed", "passed", "passed"]);
+    expect(cp.iterations!.map(it => it.nodes.test!.status)).toEqual(["failed", "failed", "passed"]);
+    expect(cp.iterations!.map(it => it.nodes.fix!.status)).toEqual(["passed", "passed", "skipped"]);
+    expect(coordinator.starts).toHaveLength(3);
+    expect(inv.requests.map(r => r.task)).toEqual(["fix the failing tests (iteration 0)", "fix the failing tests (iteration 1)"]);
+  });
+
+  it("continueOnError: stopWhen can match a failed status; without it the failure fails the loop", async () => {
+    const coordinator = new FakeCoordinator();
+    coordinator.pollStates = ["failed"];
+    const stop = await create(def([{ id: "loop", type: "loop", maxIterations: 3, stopWhen: { node: "test", status: "failed" }, body: [{ id: "test", type: "job", command: "npm test", continueOnError: true }] }]));
+    const stopped = await execute(stop.id, { coordinator });
+    expect(stopped.status).toBe("passed");
+    expect(loopCp(stopped, "loop").iterations).toHaveLength(1);
+
+    const strict = await create(def([{ id: "loop", type: "loop", maxIterations: 3, until: "nodes.test.status == 'passed'", body: [{ id: "test", type: "job", command: "npm test" }] }]));
+    const failed = await execute(strict.id, { coordinator: Object.assign(new FakeCoordinator(), { pollStates: ["failed"] }) });
+    expect(failed.status).toBe("failed");
+    expect(loopCp(failed, "loop").error).toMatch(/^iteration 0 failed: test/);
+  });
+
+  it("continueOnError does not tolerate an uncertain outcome", async () => {
+    const coordinator = new FakeCoordinator();
+    coordinator.pollStates = ["unknown"];
+    const run = await create(def([{ id: "loop", type: "loop", maxIterations: 3, onExhausted: "continue", body: [{ id: "test", type: "job", command: "npm test", continueOnError: true }] }]));
+    const done = await execute(run.id, { coordinator });
+    expect(done.status).toBe("failed");
+    expect(loopCp(done, "loop").iterations![0]!.nodes.test!.error).toMatch(/^uncertain/);
+  });
+
+  it("spills large body outputs to scoped artifacts and caps loop.history", async () => {
+    const big = "x".repeat(MAX_INLINE_OUTPUT_BYTES + 1000);
+    const inv = mockInvoker((req: AgentInvokeRequest) => req.task.startsWith("make") ? big : `len=${req.task.length}`);
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 2, onExhausted: "continue", body: [
+      { id: "big", type: "prompt", prompt: "make big" },
+      { id: "use", type: "prompt", prompt: "prev ${loop.history.0.outputs.big}", when: "loop.index > 0", dependsOn: ["big"] },
+    ] }]));
+    const done = await execute(run.id, { inv });
+    expect(done.status).toBe("passed");
+    // In memory the run keeps full values.
+    expect(loopCp(done).iterations![0]!.nodes.big!.output).toBe(big);
+    const raw = JSON.parse(await readFile(join(store.root, `${run.id}.json`), "utf8")) as WorkflowRun;
+    const persisted = raw.nodes[0] as LoopNodeCheckpoint;
+    expect(persisted.iterations![0]!.nodes.big!.output).toEqual({ $artifact: "artifacts/fix.0.big.json", bytes: big.length + 2 });
+    expect(persisted.iterations![1]!.nodes.big!.output).toEqual({ $artifact: "artifacts/fix.1.big.json", bytes: big.length + 2 });
+    expect(JSON.parse(await readFile(join(store.runDir(run.id), "artifacts/fix.1.big.json"), "utf8"))).toBe(big);
+    expect(Buffer.byteLength(await readFile(join(store.root, `${run.id}.json`), "utf8"))).toBeLessThan(MAX_INLINE_OUTPUT_BYTES);
+    // loop.history outputs are capped (a truncated summary), not the full value.
+    const useTask = inv.requests.find(r => r.task.startsWith("prev "))!.task;
+    expect(useTask.length).toBeLessThan(MAX_INLINE_OUTPUT_BYTES + 200);
+    expect(useTask).toMatch(/… \(truncated; \d+ bytes\)$/);
+    // The scoped references validate and hydrate again on read.
+    const read = await store.read(run.id, registry);
+    await store.hydrateOutputs(read);
+    expect((read.nodes[0] as LoopNodeCheckpoint).iterations![0]!.nodes.big!.output).toBe(big);
+  });
+
+  it("cancelRun settles an approval parked inside a loop iteration and the loop to cancelled", async () => {
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 2, onExhausted: "continue", body: [
+      { id: "ok", type: "approval", prompt: "go?" },
+      { id: "a", type: "prompt", prompt: "A", dependsOn: ["ok"] },
+    ] }]));
+    const parked = await execute(run.id, { inv: mockInvoker("x") });
+    expect(parked.status).toBe("waiting_approval");
+    const cancelled = await cancelRun(store, run.id, registry);
+    expect(cancelled.status).toBe("cancelled");
+    const cp = loopCp(cancelled);
+    expect(cp.status).toBe("cancelled");
+    expect(cp.iterations![0]!.status).toBe("cancelled");
+    expect(cp.iterations![0]!.nodes.ok!.status).toBe("cancelled");
+    expect(cp.iterations![0]!.nodes.a!.status).toBe("pending");
+    const read = await store.read(run.id, registry);
+    expect((read.nodes[0] as LoopNodeCheckpoint).iterations![0]!.nodes.ok!.status).toBe("cancelled");
   });
 });

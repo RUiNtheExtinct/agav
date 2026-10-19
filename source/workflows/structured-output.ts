@@ -3,7 +3,6 @@ import { Ajv } from "ajv";
 export type NodeOutputMode = "text" | "json";
 export type ParsedNodeOutput = { ok: true; value: unknown } | { ok: false; error: string };
 
-const ajv = new Ajv({ allErrors: true, strict: false });
 const FENCED_JSON = /```json[^\S\n]*\n([\s\S]*?)\n?```/i;
 
 /**
@@ -22,6 +21,8 @@ export function parseNodeOutput(text: string, mode: NodeOutputMode, schema?: Rec
     catch (error) { return { ok: false, error: `Invalid JSON in \`\`\`json block: ${error instanceof Error ? error.message : String(error)}` }; }
   }
   if (schema) {
+    // Fresh instance per call: a shared Ajv rejects a second schema with the same `$id` ("already exists").
+    const ajv = new Ajv({ allErrors: true, strict: false });
     let check;
     try { check = ajv.compile(schema); }
     catch (error) { return { ok: false, error: `Invalid output schema: ${error instanceof Error ? error.message : String(error)}` }; }

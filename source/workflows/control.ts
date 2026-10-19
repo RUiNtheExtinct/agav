@@ -133,11 +133,17 @@ export async function cancelRun(store: WorkflowStore, id: string, registry: Tool
           await store.save(run); // Real outcome (or the kept linkage/reason) is durable before anything else.
           if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
         }
-        // Settle running loops (innermost first) whose current iteration has no work left in progress.
+        // Body nodes parked on a decision (approvals, tool consent) can never be decided once the run is cancelled.
         const now = new Date().toISOString();
+        for (const visit of visits) {
+          if (visit.loops.length === 0 || visit.node.type === "loop" || visit.cp.status !== "waiting_approval") continue;
+          visit.cp.status = "cancelled"; visit.cp.endedAt = now; visit.cp.error = "Cancelled while waiting for a decision.";
+          delete visit.cp.decisionId;
+        }
+        // Settle running or parked loops (innermost first) whose current iteration has no work left in progress.
         for (const visit of [...visits].reverse()) {
           const loop = visit.cp as LoopNodeCheckpoint;
-          if (visit.node.type !== "loop" || loop.status !== "running") continue;
+          if (visit.node.type !== "loop" || (loop.status !== "running" && loop.status !== "waiting_approval")) continue;
           const current = loop.iterations?.[loop.iterations.length - 1];
           if (current && ["pending", "running", "waiting_approval"].includes(current.status)) {
             if (Object.values(current.nodes).some(child => child.status === "running" || child.status === "waiting_approval")) continue;

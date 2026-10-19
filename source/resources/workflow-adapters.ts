@@ -10,7 +10,7 @@ import { discoverWorkflows, type DiscoveredWorkflow } from "../workflows/discove
 import { listPendingDecisions, type PendingDecision } from "../workflows/decisions.js";
 import { readEvents, type WorkflowEventRecord } from "../workflows/events.js";
 import { formatDuration, formatRunTree, isTerminalRunStatus, shortId, statusGlyph, truncateOutput } from "../workflows/format.js";
-import { scopedCheckpoints, type WorkflowRun, type WorkflowStore } from "../workflows/store.js";
+import { scopedCheckpoints, visitJobScope, type WorkflowRun, type WorkflowStore } from "../workflows/store.js";
 import { cancelRun, decideRunDecision, decisionSummary } from "../workflows/control.js";
 import { launchRun, type LaunchDeps } from "../workflows/launch.js";
 import { assertBackgroundRunsAvailable, cancelJobDeps, launchSummary, listRuns, prepareLaunch, startBackgroundRun, type PreparedLaunch } from "../workflows/background.js";
@@ -332,7 +332,7 @@ export async function formatRunLogs(store: WorkflowStore, registry: ToolRegistry
     if (cp.error) lines.push(`error: ${cp.error}`);
     if (cp.output !== undefined) {
       let output: unknown = cp.output;
-      if (visit.loops.length === 0) output = await store.readOutput(run.id, cp).catch(() => cp.output);
+      output = await store.readOutput(run.id, cp, visitJobScope(visit)).catch(() => cp.output);
       const text = typeof output === "string" ? output : JSON.stringify(output, null, 2) ?? String(output);
       lines.push(text.length > LOG_OUTPUT_CHARS ? `${text.slice(0, LOG_OUTPUT_CHARS)}\n… (${text.length - LOG_OUTPUT_CHARS} more characters)` : text);
     }

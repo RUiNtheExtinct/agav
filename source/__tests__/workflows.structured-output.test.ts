@@ -36,4 +36,11 @@ describe("parseNodeOutput", () => {
     const result = parseNodeOutput("{}", "json", { type: "nonsense" });
     expect(!result.ok && result.error).toMatch(/Invalid output schema/);
   });
+  it("validates repeated schemas with the same $id (fresh Ajv per call)", () => {
+    const withId = { $id: "https://example.com/score.json", ...schema };
+    expect(parseNodeOutput('{"score": 1}', "json", withId)).toEqual({ ok: true, value: { score: 1 } });
+    expect(parseNodeOutput('{"score": 2}', "json", { ...withId })).toEqual({ ok: true, value: { score: 2 } });
+    const changed = { $id: "https://example.com/score.json", type: "object", required: ["name"] };
+    expect(parseNodeOutput('{"score": 3}', "json", changed)).toMatchObject({ ok: false, error: expect.stringMatching(/does not match schema/) });
+  });
 });

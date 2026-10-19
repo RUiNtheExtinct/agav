@@ -249,3 +249,24 @@ describe("policies", () => {
     expect(() => validateDefinition({ version: 1, name: "x", nodes: [read("a")], policies: { permissionMode: "yolo" } }, registry)).toThrow(/Invalid workflow/);
   });
 });
+
+describe("continueOnError (top level)", () => {
+  it("a tolerated failure does not stop the run; dependents branch on its status", async () => {
+    const coordinator = new FakeCoordinator();
+    coordinator.pollStates = ["failed"];
+    const inv = invoker("reported");
+    const done = await run(def([
+      { id: "test", type: "job", command: "npm test", continueOnError: true },
+      { id: "report", type: "prompt", prompt: "tests ${nodes.test.status}", dependsOn: ["test"], when: "nodes.test.status == 'failed'" },
+      { id: "ship", type: "tool", tool: "read_file", input: { path: "x" }, dependsOn: ["test"], when: "nodes.test.status == 'passed'" },
+    ]), { coordinator, inv });
+    expect(done.status).toBe("passed");
+    expect(done.nodes.map(cp => cp.status)).toEqual(["failed", "passed", "skipped"]);
+    expect(inv.calls).toBe(1);
+  });
+
+  it("is rejected on loop and approval nodes", () => {
+    expect(() => validateDefinition(def([{ id: "a", type: "approval", prompt: "ok?", continueOnError: true }]), registry)).toThrow(/continueOnError is not supported on approval/);
+    expect(() => validateDefinition(def([{ id: "l", type: "loop", maxIterations: 2, continueOnError: true, body: [{ id: "b", type: "prompt", prompt: "p" }] }]), registry)).toThrow(/continueOnError is not supported on loop/);
+  });
+});

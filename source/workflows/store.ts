@@ -24,16 +24,30 @@ export interface NodeCheckpoint { id: string; status: NodeStatus; output?: unkno
 export interface LoopIterationCheckpoint { index: number; status: NodeStatus; nodes: Record<string, NodeCheckpoint>; startedAt?: string; endedAt?: string }
 /** Checkpoint of a `loop` node: `iteration` is the current (0-based) iteration; only the last iteration may be non-terminal. */
 export type LoopNodeCheckpoint = NodeCheckpoint & { iteration?: number; iterations?: LoopIterationCheckpoint[] };
-/** Serialized outputs above this size are written to `<root>/<runId>/artifacts/<nodeId>.json`. */
+/**
+ * Serialized outputs above this size are written to `<root>/<runId>/artifacts/<nodeId>.json`
+ * (loop body nodes: `artifacts/<loopId>.<i>.<nodeId>.json`, nested loops joined with dots).
+ */
 export const MAX_INLINE_OUTPUT_BYTES = 64 * 1024;
-export function artifactRelativePath(nodeId: string): string { return `artifacts/${nodeId}.json`; }
+export function artifactRelativePath(nodeId: string, scope?: JobScope): string { return `artifacts/${scopePrefix(scope)}${nodeId}.json`; }
+/** True for an error recording an unknown outcome (interrupted/unverifiable work); such failures are never tolerated. */
+export function isUncertainError(error: string | undefined): boolean {
+  return error !== undefined && (error.startsWith("uncertain") || error.startsWith("Interrupted tool had an uncertain outcome"));
+}
+/**
+ * A failed or timed-out node with `continueOnError: true` whose outcome is known: it does not fail its scope and its
+ * dependents still run (and can branch on its status with `when`). Uncertain and cancelled outcomes are never tolerated.
+ */
+export function toleratedFailure(node: WorkflowNode | undefined, cp: NodeCheckpoint): boolean {
+  return node?.continueOnError === true && (cp.status === "failed" || cp.status === "timed_out") && !isUncertainError(cp.error);
+}
 export function isArtifactRef(value: unknown): value is ArtifactRef {
   return !!value && typeof value === "object" && !Array.isArray(value) && Object.hasOwn(value, "$artifact");
 }
-function validArtifactRef(value: unknown, nodeId: string): boolean {
+function validArtifactRef(value: unknown, nodeId: string, scope?: JobScope): boolean {
   if (!isArtifactRef(value)) return false;
   const { $artifact, bytes, ...extra } = value as unknown as Record<string, unknown>;
-  return Object.keys(extra).length === 0 && $artifact === artifactRelativePath(nodeId) && typeof bytes === "number" && Number.isInteger(bytes) && bytes > 0;
+  return Object.keys(extra).length === 0 && $artifact === artifactRelativePath(nodeId, scope) && typeof bytes === "number" && Number.isInteger(bytes) && bytes > 0;
 }
 /** One checkpoint found by `scopedCheckpoints`, with its definition node and enclosing loops (outermost first). */
 export interface CheckpointVisit { cp: NodeCheckpoint; node: WorkflowNode; loops: Array<{ cp: LoopNodeCheckpoint; iteration: LoopIterationCheckpoint }> }
@@ -139,9 +153,11 @@ function validateScopeCheckpoints(run: WorkflowRun, nodes: WorkflowNode[], cps: 
   const scope: JobScope | undefined = loopPath.length > 0 ? { loopPath } : undefined;
   const checkpoints = new Map(cps.map(node => [node.id, node]));
   let running = 0;
+  const byId = new Map(nodes.map(node => [node.id, node]));
   for (const [i, node] of nodes.entries()) {
     const cp = cps[i] as LoopNodeCheckpoint;
-    const deps = (node.dependsOn ?? []).map(dep => checkpoints.get(dep)!.status);
+    // A tolerated (continueOnError) failure counts as passed for its dependents.
+    const deps = (node.dependsOn ?? []).map(dep => { const depCp = checkpoints.get(dep)!; return toleratedFailure(byId.get(dep), depCp) ? "passed" : depCp.status; });
     // Every dispatched/decided node requires passed dependencies (or skipped ones with allowSkipped), including
     // approvals. Check all nodes so a forged passed ancestor cannot unblock work.
     // A skipped node only requires settled dependencies (failed/timed_out ones only under stopOnFailure:false).
@@ -155,7 +171,8 @@ function validateScopeCheckpoints(run: WorkflowRun, nodes: WorkflowNode[], cps: 
         (cp.durationMs !== undefined && (!agentNode || typeof cp.durationMs !== "number" || !Number.isFinite(cp.durationMs) || cp.durationMs < 0)) ||
         (cp.usage !== undefined && !agentNode) ||
         (cp.decisionId !== undefined && (typeof cp.decisionId !== "string" || !isDecisionId(cp.decisionId))) ||
-        (node.type === "approval" && !["pending", "waiting_approval", "passed", "failed"].includes(cp.status)) ||
+        // An approval left waiting inside a loop iteration is settled `cancelled` when its run is cancelled.
+        (node.type === "approval" && !["pending", "waiting_approval", "passed", "failed", "cancelled"].includes(cp.status)) ||
         (node.type === "job" && cp.status === "waiting_approval") ||
         (cp.job !== undefined && (node.type !== "job" || !validJobMetadata(cp.job, run.id, node.id, scope))) ||
         // A running or passed job must carry its durable identity; fail closed otherwise.
@@ -192,15 +209,16 @@ function validateLoopCheckpoint(run: WorkflowRun, node: WorkflowNode, cp: LoopNo
     const keys = Object.keys(iteration.nodes);
     if (keys.length !== body.length || body.some(child => !Object.hasOwn(iteration.nodes, child.id))) throw new Error(CORRUPT_NODE);
     const cps = body.map(child => iteration.nodes[child.id]!);
-    if (cps.some((child, j) => !child || typeof child !== "object" || child.id !== body[j]!.id || !NODE_STATUSES.has(child.status) || (isArtifactRef(child.output) && !validArtifactRef(child.output, child.id))) ||
+    const childScope: JobScope = { loopPath: [...loopPath, { loopId: node.id, iteration: index }] };
+    if (cps.some((child, j) => !child || typeof child !== "object" || child.id !== body[j]!.id || !NODE_STATUSES.has(child.status) || (isArtifactRef(child.output) && !validArtifactRef(child.output, child.id, childScope))) ||
         // A settled iteration has no work left in progress.
         (TERMINAL_STATUSES.has(iteration.status) && cps.some(child => child.status === "running" || child.status === "waiting_approval"))) throw new Error(CORRUPT_NODE);
-    running += validateScopeCheckpoints(run, body, cps, [...loopPath, { loopId: node.id, iteration: index }]);
+    running += validateScopeCheckpoints(run, body, cps, childScope.loopPath);
   }
   return running;
 }
 export class WorkflowStore {
-  /** Last output value spilled per `<runId>/<nodeId>`, so unchanged artifacts are not rewritten on every save. */
+  /** Last output value spilled per `<runId>/<artifact path>`, so unchanged artifacts are not rewritten on every save. */
   private readonly spilled = new Map<string, unknown>();
   constructor(readonly root = join(getAgavDir(), "workflow-runs")) {}
   private path(id: string, suffix = ".json"): string { assertRunId(id); return join(this.root, `${id}${suffix}`); }
@@ -209,20 +227,33 @@ export class WorkflowStore {
   async save(run: WorkflowRun): Promise<void> {
     run.updatedAt = new Date().toISOString();
     // Oversized outputs go to artifacts first; the in-memory run keeps the full value.
-    const nodes = await Promise.all(run.nodes.map(cp => this.spill(run.id, cp)));
+    const nodes = await Promise.all(run.nodes.map((cp, i) => this.spillTree(run.id, run.definition.nodes[i], cp, [])));
     await writeAtomic(this.path(run.id), JSON.stringify({ ...run, nodes }, null, 2) + "\n");
     await syncDir(this.root);
   }
-  private async spill(runId: string, cp: NodeCheckpoint): Promise<NodeCheckpoint> {
+  /** `spill` for a checkpoint and, for a loop, the body checkpoints of every iteration (scoped artifact names). */
+  private async spillTree(runId: string, node: WorkflowNode | undefined, cp: NodeCheckpoint, loopPath: JobScope["loopPath"]): Promise<NodeCheckpoint> {
+    const own = await this.spill(runId, cp, loopPath.length > 0 ? { loopPath } : undefined);
+    const iterations = (cp as LoopNodeCheckpoint).iterations;
+    if (node?.type !== "loop" || !Array.isArray(iterations)) return own;
+    const spilledIterations = await Promise.all(iterations.map(async it => {
+      if (!it || typeof it !== "object" || !it.nodes || typeof it.nodes !== "object") return it;
+      const path = [...loopPath, { loopId: node.id, iteration: it.index }];
+      const entries = await Promise.all(Object.entries(it.nodes).map(async ([key, child]) => [key, await this.spillTree(runId, node.body?.find(b => b.id === key), child, path)] as const));
+      return { ...it, nodes: Object.fromEntries(entries) };
+    }));
+    return { ...own, iterations: spilledIterations } as LoopNodeCheckpoint;
+  }
+  private async spill(runId: string, cp: NodeCheckpoint, scope?: JobScope): Promise<NodeCheckpoint> {
     // An existing (unhydrated) reference passes through unchanged.
-    if (cp.output === undefined || validArtifactRef(cp.output, cp.id)) return cp;
+    if (cp.output === undefined || validArtifactRef(cp.output, cp.id, scope)) return cp;
     const serialized = JSON.stringify(cp.output);
     if (serialized === undefined) return cp;
     const bytes = Buffer.byteLength(serialized, "utf8");
     // Any other value shaped like a reference is spilled too, so a persisted `$artifact` object is always a real reference.
     if (bytes <= MAX_INLINE_OUTPUT_BYTES && !isArtifactRef(cp.output)) return cp;
-    const relative = artifactRelativePath(cp.id);
-    const key = `${runId}/${cp.id}`;
+    const relative = artifactRelativePath(cp.id, scope);
+    const key = `${runId}/${relative}`;
     if (this.spilled.get(key) !== cp.output) {
       const target = join(this.runDir(runId), relative);
       await writeAtomic(target, serialized); // Durable before the checkpoint references it.
@@ -232,18 +263,18 @@ export class WorkflowStore {
     return { ...cp, output: { $artifact: relative, bytes } satisfies ArtifactRef };
   }
   /** Resolves a checkpoint output, loading an artifact reference from disk; missing or corrupt artifacts throw. */
-  async readOutput(id: string, cp: NodeCheckpoint): Promise<unknown> {
+  async readOutput(id: string, cp: NodeCheckpoint, scope?: JobScope): Promise<unknown> {
     if (!isArtifactRef(cp.output)) return cp.output;
-    if (!validArtifactRef(cp.output, cp.id)) throw new Error(`Corrupt workflow checkpoint; invalid artifact reference for node ${cp.id}.`);
+    if (!validArtifactRef(cp.output, cp.id, scope)) throw new Error(`Corrupt workflow checkpoint; invalid artifact reference for node ${cp.id}.`);
     const text = await fs.readFile(join(this.runDir(id), cp.output.$artifact), "utf8");
     if (Buffer.byteLength(text, "utf8") !== cp.output.bytes) throw new Error(`Corrupt workflow artifact for node ${cp.id}; size mismatch.`);
     const value = JSON.parse(text) as unknown;
-    this.spilled.set(`${id}/${cp.id}`, value);
+    this.spilled.set(`${id}/${cp.output.$artifact}`, value);
     return value;
   }
-  /** Replaces artifact references in `run` with their stored values (executors need real outputs). */
+  /** Replaces artifact references in `run` (including loop body checkpoints) with their stored values (executors need real outputs). */
   async hydrateOutputs(run: WorkflowRun): Promise<void> {
-    for (const cp of run.nodes) if (isArtifactRef(cp.output)) cp.output = await this.readOutput(run.id, cp);
+    for (const visit of scopedCheckpoints(run)) if (isArtifactRef(visit.cp.output)) visit.cp.output = await this.readOutput(run.id, visit.cp, visitJobScope(visit));
   }
   async read(id: string, registry: ToolRegistry): Promise<WorkflowRun> {
     // Corruption/I/O failures propagate; never treat them as a fresh run.
@@ -262,7 +293,7 @@ export class WorkflowStore {
     // the run still says waiting_approval), but reject impossible settled states.
     if (running > 1 ||
         (run.status === "pending" && run.nodes.some(node => node.status !== "pending")) ||
-        (run.status === "passed" && run.nodes.some(node => node.status !== "passed" && node.status !== "skipped"))) {
+        (run.status === "passed" && run.nodes.some((node, i) => node.status !== "passed" && node.status !== "skipped" && !toleratedFailure(run.definition.nodes[i], node)))) {
       throw new Error("Corrupt workflow checkpoint; invalid run state.");
     }
     return run;

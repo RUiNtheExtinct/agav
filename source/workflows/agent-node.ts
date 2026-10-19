@@ -75,6 +75,11 @@ async function executeAgentNode(ctx: NodeExecutionContext): Promise<NodeResult> 
     if (!agentDeps) throw new Error("Agent nodes unavailable: this execution context supplies no agent invoker.");
     task = String(resolveTemplate(node.type === "agent" ? node.task! : node.prompt!, templateContext(run, ctx.loop, ctx.scopeNodes)));
     const agent = node.type === "agent" ? await resolveAgent(agentDeps, run.cwd, node.agent!) : undefined;
+    // A2A agents run remotely and take only the task: per-node overrides would be silently ignored, so refuse them.
+    if (agent?.manifest.type === "a2a") {
+      const overrides = (["model", "effort", "maxIterations"] as const).filter(field => node[field] !== undefined);
+      if (overrides.length > 0) throw new Error(`Agent "${agent.manifest.name}" is an a2a agent; ${overrides.join(", ")} cannot be applied to remote agents. Remove ${overrides.length > 1 ? "them" : "it"} from node ${node.id}.`);
+    }
     const confirmTool: AgentInvokeRequest["confirmTool"] = async (toolName, input) => {
       const args = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {};
       try {

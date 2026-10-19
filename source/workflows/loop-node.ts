@@ -3,19 +3,30 @@ import { appendEvent } from "./events.js";
 import { evaluateCondition } from "./expr.js";
 import { getNodeExecutor, retriesOnResume, type NodeExecutionContext, type NodeExecutor, type NodeResult } from "./executors.js";
 import type { TemplateContext } from "./interpolate.js";
-import type { LoopIterationCheckpoint, LoopNodeCheckpoint, NodeCheckpoint, NodeStatus } from "./store.js";
+import { MAX_INLINE_OUTPUT_BYTES, toleratedFailure, type LoopIterationCheckpoint, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus } from "./store.js";
 
 const DEFAULT_HISTORY_LIMIT = 5;
 const TERMINAL = new Set<NodeStatus>(["passed", "failed", "cancelled", "timed_out", "skipped"]);
 
 const outputsOf = (it: LoopIterationCheckpoint): Record<string, unknown> => Object.fromEntries(Object.values(it.nodes).map(cp => [cp.id, cp.output]));
 
+/** A history output capped at MAX_INLINE_OUTPUT_BYTES: larger values become a truncated JSON text with a size note. */
+export function capHistoryOutput(output: unknown): unknown {
+  const text = output === undefined ? undefined : JSON.stringify(output);
+  if (text === undefined || Buffer.byteLength(text, "utf8") <= MAX_INLINE_OUTPUT_BYTES) return output;
+  const bytes = Buffer.byteLength(text, "utf8");
+  // Slice by bytes and drop a split trailing multi-byte character.
+  const head = Buffer.from(text, "utf8").subarray(0, MAX_INLINE_OUTPUT_BYTES).toString("utf8").replace(/\uFFFD$/, "");
+  return `${head}… (truncated; ${bytes} bytes)`;
+}
+
 /** `loop.*` for iteration `i`: its index, the previous iteration's body view, and the last `historyLimit` finished iterations. */
 export function loopContext(node: WorkflowNode, iterations: LoopIterationCheckpoint[], i: number): NonNullable<TemplateContext["loop"]> {
   const prevIt = i > 0 ? iterations[i - 1] : undefined;
   const limit = node.historyLimit ?? DEFAULT_HISTORY_LIMIT;
   const finished = iterations.slice(0, i).filter(it => TERMINAL.has(it.status));
-  const history = limit > 0 ? finished.slice(-limit).map(it => ({ index: it.index, status: it.status, outputs: outputsOf(it) })) : [];
+  // Each history output is capped so `limit` large iterations cannot blow up the interpolation context.
+  const history = limit > 0 ? finished.slice(-limit).map(it => ({ index: it.index, status: it.status, outputs: Object.fromEntries(Object.entries(outputsOf(it)).map(([id, out]) => [id, capHistoryOutput(out)])) })) : [];
   return {
     index: i, history,
     ...(prevIt ? { prev: Object.fromEntries(Object.values(prevIt.nodes).map(cp => [cp.id, { status: cp.status, output: cp.output }])) } : {}),
@@ -47,6 +58,8 @@ function normalizeResumedBody(body: WorkflowNode[], cps: Record<string, NodeChec
 /**
  * Sequential loop: runs `body` as a nested scope once per iteration (checkpointed in `iterations[i].nodes`) until
  * `stopWhen`/`until` holds after a passed iteration, a body failure, or `maxIterations` (then `onExhausted`).
+ * An iteration whose only failures are tolerated (`continueOnError`) body nodes counts as passed, so
+ * `stopWhen`/`until` still see the failed statuses (e.g. "run tests, fix, repeat until tests pass").
  * A waiting/cancelled iteration propagates and is continued on resume. `timeoutSeconds` bounds the whole loop,
  * measured from the loop's first start.
  */
@@ -115,8 +128,9 @@ async function executeLoop(ctx: NodeExecutionContext): Promise<NodeResult> {
       }
       if (it.status === "cancelled") return await settle("cancelled", { error: `iteration ${i} cancelled` });
       if (it.status !== "passed") {
-        const failed = body.map(n => it!.nodes[n.id]!).find(n => n.status === "failed" || n.status === "timed_out");
-        const error = it.status === "timed_out" && timedOut ? timeoutError : `iteration ${i} ${it.status}${failed ? `: ${failed.id}: ${failed.error ?? failed.status}` : ""}`;
+        const failed = body.find(n => { const c = it!.nodes[n.id]!; return (c.status === "failed" || c.status === "timed_out") && !toleratedFailure(n, c); });
+        const failedCp = failed ? it.nodes[failed.id] : undefined;
+        const error = it.status === "timed_out" && timedOut ? timeoutError : `iteration ${i} ${it.status}${failedCp ? `: ${failedCp.id}: ${failedCp.error ?? failedCp.status}` : ""}`;
         return await settle(it.status === "timed_out" ? "timed_out" : "failed", { error });
       }
       let stop: boolean;

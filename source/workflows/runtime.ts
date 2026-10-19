@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import type { AgavConfig, PermissionMode } from "../config/config.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { WorkflowExecutionHost } from "./gated-tools.js";
-import { definitionHash, scopedCheckpoints, type JobScope, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
+import { definitionHash, scopedCheckpoints, toleratedFailure, type JobScope, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
 import type { JobNodeDeps } from "./job-node.js";
 import { narrowPermissionMode, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { getNodeExecutor, retriesOnResume, type NodeResult } from "./executors.js";
@@ -37,7 +37,8 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * Why a ready node (every dependency settled) must be skipped instead of executed, or undefined to run it.
- * A failed/timed-out/cancelled dependency (only reachable with `stopOnFailure: false`) skips its dependents;
+ * A failed/timed-out/cancelled dependency (only reachable with `stopOnFailure: false`) skips its dependents,
+ * except a tolerated `continueOnError` failure, which satisfies them (they can branch on its status with `when`);
  * a skipped dependency is satisfied only with `allowSkipped: true`, otherwise the skip cascades. Finally a
  * false `when` skips the node itself. A missing reference in `when` is undefined, never an error.
  */
@@ -48,7 +49,9 @@ export function skipReason(run: WorkflowRun, node: WorkflowNode): string | undef
 /** `skipReason` within one scope: dependencies resolve in `spec.checkpoints`; `when` also sees `outerNodes` and `loop`. */
 function scopeSkipReason(run: WorkflowRun, spec: ScopeSpec, node: WorkflowNode): string | undefined {
   for (const dep of node.dependsOn ?? []) {
-    const status = spec.checkpoints[dep]!.status;
+    const depCp = spec.checkpoints[dep]!;
+    if (toleratedFailure(spec.nodes.find(candidate => candidate.id === dep), depCp)) continue;
+    const status = depCp.status;
     if (status === "failed" || status === "timed_out" || status === "cancelled") return `dependency ${dep} ${status}`;
     if (status === "skipped" && node.allowSkipped !== true) return `dependency ${dep} was skipped`;
   }
@@ -127,7 +130,8 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
   const cps = spec.checkpoints;
   const finish = async (status: ScopeStatus): Promise<ScopeStatus> => status;
   const finalStatus = (): ScopeStatus => {
-    const all = spec.nodes.map(node => cps[node.id]!);
+    // Tolerated (continueOnError) failures do not fail the scope.
+    const all = spec.nodes.map(node => cps[node.id]!).filter((cp, i) => !toleratedFailure(spec.nodes[i], cp));
     if (env.capExceeded) return "failed";
     if (env.deadlineHit()) return "timed_out";
     if (signal.aborted) return "cancelled";
@@ -158,7 +162,7 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
         cp.endedAt = new Date().toISOString();
         await env.save();
         await appendEvent(store, run.id, { type: "node_completed", nodeId: node.id, status: cp.status, ...(cp.error ? { error: cp.error } : {}) });
-        if (cp.status === "failed" && stopOnFailure) break;
+        if (cp.status === "failed" && stopOnFailure && !toleratedFailure(node, cp)) break;
         continue;
       }
       if (node.retry && cp.attempt === undefined) cp.attempt = 1;
@@ -199,7 +203,8 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
     if (env.capExceeded) break;
     if (signal.aborted && cp.status === "pending") break;
     // With stopOnFailure:false a failed or timed-out node only skips its dependents; other branches continue.
-    if (result!.next === "stop" && (stopOnFailure || !["failed", "timed_out"].includes(cp.status))) break;
+    // A tolerated (continueOnError) failure never stops scheduling.
+    if (result!.next === "stop" && !toleratedFailure(node, cp) && (stopOnFailure || !["failed", "timed_out"].includes(cp.status))) break;
   }
   return finish(finalStatus());
 }
@@ -248,7 +253,7 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
     // A crash can occur after a failed node is durable but before the run's
     // terminal status is saved. Never dispatch another branch on resume
     // (with stopOnFailure:false a failed/timed-out node only skips its dependents).
-    const stopped = run.nodes.find(node => node.status === "cancelled" || (stopOnFailure && (node.status === "failed" || node.status === "timed_out")));
+    const stopped = run.nodes.find((node, i) => node.status === "cancelled" || (stopOnFailure && (node.status === "failed" || node.status === "timed_out") && !toleratedFailure(run.definition.nodes[i], node)));
     if (stopped) {
       run.status = stopped.status as RunStatus;
       await store.save(run);
@@ -279,7 +284,7 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
         if (!decisionReady && await hasUnappliedDecision(store, run)) decisionReady = true;
       }).catch(error => { pollingError = error; abort(); });
     }, 100);
-    const failureStops = (): boolean => stopOnFailure && run.nodes.some(cp => cp.status === "failed");
+    const failureStops = (): boolean => stopOnFailure && run.nodes.some((cp, i) => cp.status === "failed" && !toleratedFailure(run.definition.nodes[i], cp));
     const env: ScopeEnv = {
       run, store, registry, config, signal: controller.signal, host, jobDeps, agentDeps,
       save: () => store.save(run),
