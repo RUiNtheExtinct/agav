@@ -8,8 +8,9 @@ import { WorkflowStore } from "../workflows/store.js";
 import { consentEnvNames } from "../workflows/consent-prompt.js";
 import {
   assertBackgroundRunsAvailable, cancelJobDeps, cliEntryPath, inboxLines, launchSummary, listRuns, prepareLaunch,
-  reconcileQuietly, runLine, runSummary, startBackgroundRun,
+  reconcileQuietly, startBackgroundRun,
 } from "../workflows/background.js";
+import { formatRunSummary, formatRunTree, resolveRunId } from "../workflows/format.js";
 import { getSharedCoordinator } from "../background-jobs-integration.js";
 import { isSandboxRequired } from "../utils/sandbox.js";
 
@@ -17,11 +18,12 @@ const USAGE = `Usage: /workflows <action>
   validate <name|file>
   run <name|file> [--input-json {"key":"value"}]
   list
-  status <full-run-uuid>
-  inbox [<full-run-uuid>]
-  approve|deny <full-run-uuid> <node-id|decision-id> [--note <text>]
-  resume|cancel <full-run-uuid>
+  status <run-id>
+  inbox [<run-id>]
+  approve|deny <run-id> <node-id|decision-id> [--note <text>]
+  resume|cancel <run-id>
 
+<run-id> is the full UUID or any unique prefix of at least 4 characters.
 Runs execute in the background and outlive this session; run returns immediately after you
 approve its consent (capabilities and which environment variable names reach the runner).
 Both backgroundJobsEnabled and workflowsEnabled must be true.
@@ -58,18 +60,21 @@ export const workflowsCommand: SlashCommand = {
     try {
       const parsed = parseWorkflowsArgs(args);
       if (!parsed) throw new Error(USAGE);
-      const { action, target, rest } = parsed;
+      const { action, rest } = parsed;
+      let { target } = parsed;
       const decision = action === "approve" || action === "deny";
       if (action === "run" ? rest && !rest.startsWith("--input-json ") : decision ? !/^[A-Za-z][A-Za-z0-9_-]{0,63}(?:\s+--note\s+\S[\s\S]*)?$/.test(rest) : rest !== "") throw new Error(USAGE);
       const registry = createBuiltinToolRegistry(WORKFLOW_TOOLS);
       const store = new WorkflowStore();
+      // Every run-id operand accepts a unique prefix (≥4 chars) or the full UUID (U4).
+      if (target && action !== "validate" && action !== "run") target = await resolveRunId(store, target);
       const launchDeps = async () => ({ coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: context.config.maxConcurrentWorkflowRuns, registry });
       const warnings: string[] = [];
       const warn = (text: string): void => { warnings.push(`warning: ${text}`); };
       if (action === "validate") { await loadDefinition((await resolveWorkflow(target, process.cwd())).path, registry); return message("Workflow valid."); }
       if (action === "list" || action === "status") {
         await reconcileQuietly(store, action === "status" ? target : undefined, await launchDeps(), warn);
-        const text = action === "status" ? runSummary(await store.read(target, registry)) : (await listRuns(store, registry)).map(runLine).join("\n") || "No workflow runs.";
+        const text = action === "status" ? formatRunTree(await store.read(target, registry)) : (await listRuns(store, registry)).map(run => formatRunSummary(run)).join("\n") || "No workflow runs.";
         return message([...warnings, text].join("\n"));
       }
       if (action === "inbox") return message((await inboxLines(store, target || undefined)).join("\n") || "No pending workflow decisions.");

@@ -35,7 +35,7 @@ describe("inbox", () => {
     await executeRun(store, b.id, registry, testConfig(), undefined, fakeHost());
     const all = await inboxLines(store);
     expect(all).toHaveLength(2);
-    expect(all.join("\n")).toMatch(new RegExp(`${a.id}\\s+dec_[a-f0-9]{16}\\s+approval\\s+gate\\s+deploy\\?`));
+    expect(all.join("\n")).toMatch(new RegExp(`◐ ${a.id.slice(0, 8)}\\s+dec_[a-f0-9]{16}\\s+approval\\s+gate\\s+deploy\\?`));
     expect(await inboxLines(store, b.id)).toHaveLength(1);
   });
 

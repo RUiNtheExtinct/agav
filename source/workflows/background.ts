@@ -11,10 +11,10 @@ import { reconcileRun, reconcileRuns } from "./reconcile.js";
 import type { ConsentRequest } from "./consent-prompt.js";
 import { createRun } from "./runtime.js";
 import { listPendingDecisions } from "./decisions.js";
-import { isArtifactRef, type WorkflowRun, type WorkflowStore } from "./store.js";
+import type { WorkflowRun, WorkflowStore } from "./store.js";
+import { formatDecision, formatRunSummary, formatRunTree, shortId, truncateOutput } from "./format.js";
 
-export const TERMINAL_RUN_STATUSES = ["passed", "failed", "cancelled", "timed_out"] as const;
-export function isTerminalRunStatus(status: string): boolean { return (TERMINAL_RUN_STATUSES as readonly string[]).includes(status); }
+export { TERMINAL_RUN_STATUSES, isTerminalRunStatus } from "./format.js";
 
 /** The CLI entry script the runner re-executes (`node <cli> --internal-workflow-runner <id>`). */
 export async function cliEntryPath(argv1: string | undefined = process.argv[1]): Promise<string> {
@@ -53,9 +53,9 @@ export async function startBackgroundRun(store: WorkflowStore, prepared: Prepare
 
 /** One-line launch summary with the follow-up hints. */
 export function launchSummary(result: LaunchResult, prefix = "agav workflows"): string {
-  const id = result.run.id;
+  const id = result.run.id, short = shortId(id);
   const state = result.status === "queued" ? "queued (workflow runner pool full)" : result.status;
-  return `Workflow run ${id} ${state} · status: ${prefix} status ${id} · cancel: ${prefix} cancel ${id}`;
+  return `Workflow run ${id} (${result.run.definition.name}) ${state} · status: ${prefix} status ${short} · cancel: ${prefix} cancel ${short}`;
 }
 
 /**
@@ -94,10 +94,7 @@ export async function listRuns(store: WorkflowStore, registry: ToolRegistry): Pr
 
 /** One concise line per pending inbox decision (all runs when `runId` is omitted). */
 export async function inboxLines(store: WorkflowStore, runId?: string): Promise<string[]> {
-  return (await listPendingDecisions(store, runId)).map(item => {
-    const tool = item.resolved ? ` ${item.resolved.toolName} #${item.resolved.inputHash.slice(0, 8)}` : "";
-    return `${item.runId}  ${item.decisionId}  ${item.kind.padEnd(14)} ${item.nodeId}${tool}  ${item.summary}`;
-  });
+  return (await listPendingDecisions(store, runId)).map(formatDecision);
 }
 
 /** Parses `[--note <text...>]`: the note is the remainder after `--note`. */
@@ -107,27 +104,7 @@ export function parseDecisionArgs(rest: string[]): { note?: string } {
   return { note: rest.slice(1).join(" ") };
 }
 
-export function runLine(run: WorkflowRun): string {
-  return `${run.id}  ${run.status.padEnd(16)} ${run.definition.name}  ${run.createdAt}`;
-}
-
-export function runSummary(run: WorkflowRun): string {
-  const deadline = run.deadlineAt && !isTerminalRunStatus(run.status) ? ` (deadline ${run.deadlineAt})` : "";
-  return [`Workflow run ${run.id} (${run.definition.name}): ${run.status}${deadline}`, ...run.nodes.flatMap(cp => {
-    const definitionNode = run.definition.nodes.find(node => node.id === cp.id);
-    // attempt n/max counts total attempts (the first run plus retry.max retries).
-    const attempt = definitionNode?.retry && cp.attempt !== undefined && (cp.attempt > 1 || cp.status !== "passed") ? ` (attempt ${cp.attempt}/${definitionNode.retry.max + 1})` : "";
-    const line = `  ${cp.id}: ${cp.status}${attempt}${cp.error ? ` — ${cp.error}` : ""}`;
-    const type = definitionNode?.type;
-    if ((type !== "agent" && type !== "prompt") || cp.status !== "passed" || cp.output === undefined) return [line];
-    const meta = [cp.model, cp.durationMs !== undefined ? `${(cp.durationMs / 1000).toFixed(1)}s` : undefined].filter(Boolean).join(", ");
-    return [`${line}${meta ? ` (${meta})` : ""}`, `    → ${summarizeOutput(cp.output)}`];
-  })].join("\n");
-}
-
-/** One short line for an agent/prompt node's output: collapsed whitespace, truncated text or compact JSON. */
-export function summarizeOutput(output: unknown, max = 160): string {
-  if (isArtifactRef(output)) return `(stored in ${output.$artifact}, ${output.bytes} bytes)`;
-  const text = (typeof output === "string" ? output : JSON.stringify(output) ?? String(output)).replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
+/** Aliases kept for callers; the implementations live in format.ts. */
+export const runLine = (run: WorkflowRun): string => formatRunSummary(run);
+export const runSummary = (run: WorkflowRun): string => formatRunTree(run);
+export const summarizeOutput = truncateOutput;

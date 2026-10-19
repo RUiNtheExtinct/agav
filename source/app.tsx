@@ -1102,9 +1102,10 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
             // Same parsing as /workflows (quoted targets are JSON-decoded).
             const { parseWorkflowsArgs } = await import("./commands/workflows.js");
             const parsed = parseWorkflowsArgs(trimmed.replace(/^\/workflows\s+/, ""));
-            if (parsed?.action !== "cancel" || parsed.rest !== "") { showStatusLine("Usage: /workflows cancel <full-run-uuid>"); return; }
-            const id = parsed.target;
+            if (parsed?.action !== "cancel" || parsed.rest !== "") { showStatusLine("Usage: /workflows cancel <run-id>"); return; }
             const { WorkflowStore } = await import("./workflows/store.js");
+            const { resolveRunId } = await import("./workflows/format.js");
+            const id = await resolveRunId(new WorkflowStore(), parsed.target);
             const { cancelRun } = await import("./workflows/control.js");
             const { createBuiltinToolRegistry } = await import("./tools/registry-factory.js");
             const { WORKFLOW_TOOLS } = await import("./workflows/definition.js");

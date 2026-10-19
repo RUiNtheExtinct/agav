@@ -2,7 +2,8 @@ import { promises as fs } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { createExclusive } from "../background-jobs/storage/atomic-file.js";
-import type { WorkflowRun, WorkflowStore } from "./store.js";
+import { scopedCheckpoints, visitJobScope, type WorkflowRun, type WorkflowStore } from "./store.js";
+import { shortId } from "./format.js";
 
 /**
  * Workflow-local mailbox (`<agavDir>/workflow-runs/_mailbox/`). The shared job mailbox's
@@ -17,7 +18,7 @@ const NOTIFIABLE = new Set<string>(["waiting_approval", "passed", "failed", "can
 const NOTIFICATION_ID = /^wfn_[a-f0-9]{24}$/;
 
 export function mailboxDir(store: WorkflowStore): string { return join(store.root, "_mailbox"); }
-export function shortRunId(runId: string): string { return runId.slice(0, 8); }
+export const shortRunId = shortId;
 
 /** The notification text for the run's current status, or undefined when the status is not announced. */
 export function notificationFor(run: WorkflowRun): Omit<WorkflowNotification, "id" | "createdAt"> & { key: string } | undefined {
@@ -25,10 +26,14 @@ export function notificationFor(run: WorkflowRun): Omit<WorkflowNotification, "i
   const kind = run.status as WorkflowNotificationKind;
   const short = shortRunId(run.id);
   if (kind === "waiting_approval") {
-    const waiting = run.nodes.filter(cp => cp.status === "waiting_approval");
+    // Loop body nodes count too (labelled with their iteration); loop containers themselves are not gates.
+    const waiting = scopedCheckpoints(run).filter(visit => visit.cp.status === "waiting_approval" && visit.node.type !== "loop").map(visit => {
+      const path = visitJobScope(visit)?.loopPath.map(step => step.iteration + 1).join(".");
+      return { cp: visit.cp, label: path ? `${visit.cp.id} (iteration ${path})` : visit.cp.id, scope: path ?? "" };
+    });
     // One notification per distinct set of open decisions, so a later park on another gate is announced again.
-    const key = waiting.map(cp => `${cp.id}:${cp.decisionId ?? ""}`).join(",");
-    return { runId: run.id, kind, key, text: `Run ${short} waiting for approval: ${waiting.map(cp => cp.id).join(", ") || "(unknown node)"}` };
+    const key = waiting.map(({ cp, scope }) => `${scope ? `${scope}/` : ""}${cp.id}:${cp.decisionId ?? ""}`).join(",");
+    return { runId: run.id, kind, key, text: `Run ${short} waiting for approval: ${waiting.map(item => item.label).join(", ") || "(unknown node)"}` };
   }
   const label = kind === "timed_out" ? "timed out" : kind;
   return { runId: run.id, kind, key: "", text: `Run ${short} ${label}` };

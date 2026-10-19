@@ -10,8 +10,9 @@ import { launchRun, type RunnerCoordinator } from "../workflows/launch.js";
 import { consentEnvNames, promptWorkflowConsent } from "../workflows/consent-prompt.js";
 import {
   assertBackgroundRunsAvailable, cancelJobDeps, cliEntryPath, inboxLines, isTerminalRunStatus, launchSummary, listRuns,
-  parseDecisionArgs, prepareLaunch, reconcileQuietly, runLine, runSummary, startBackgroundRun, type StartRunDeps,
+  parseDecisionArgs, prepareLaunch, reconcileQuietly, startBackgroundRun, type StartRunDeps,
 } from "../workflows/background.js";
+import { formatRunSummary, formatRunTree, resolveRunId, statusGlyph } from "../workflows/format.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { applySandboxRequiredPolicy } from "../utils/sandbox-startup.js";
 import { detectSandboxBackend, isSandboxRequired, setSandboxRequired } from "../utils/sandbox.js";
@@ -22,6 +23,9 @@ const USAGE = `Usage
   agav workflows run <name|file> [--input '{"key":"value"}'] [--wait] [--json]
   agav workflows list [--json]
   agav workflows status <run-id> [--json]
+
+<run-id> is the full UUID or any unique prefix of at least 4 characters (list shows 8).
+--json prints the machine-readable form (status: full checkpoint; list/inbox: arrays).
   agav workflows inbox [<run-id>] [--json]
   agav workflows approve|deny <run-id> <node-id|decision-id> [--note <text>]
   agav workflows resume|cancel <run-id>
@@ -74,7 +78,8 @@ export async function runWorkflowsCli(argv: string[], options: WorkflowCliOption
     if (config.backgroundJobsEnabled !== true || config.workflowsEnabled !== true) throw new Error("Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.");
     if (!COMMANDS.includes(command)) throw new Error(`Unsupported workflow command: ${command}`);
     const json = args.includes("--json") && ["list", "status", "run", "inbox"].includes(command);
-    const [target, ...rest] = command === "run" ? args : args.filter(arg => !(json && arg === "--json"));
+    const [operand, ...rest] = command === "run" ? args : args.filter(arg => !(json && arg === "--json"));
+    let target = operand;
     if (command === "list" ? target !== undefined : command !== "inbox" && !target) throw new Error(command === "list" ? `Unexpected argument for workflows list: ${target}` : `Missing operand.\n${USAGE}`);
     const isDecision = command === "approve" || command === "deny";
     if (command !== "run" && !isDecision && rest.length !== 0) throw new Error(`Unexpected or missing argument for workflows ${command}.`);
@@ -83,17 +88,19 @@ export async function runWorkflowsCli(argv: string[], options: WorkflowCliOption
     const store = options.store ?? new WorkflowStore();
     const getCoordinator = options.getCoordinator ?? getSharedCoordinator;
     const launchDeps = async () => ({ coordinator: await getCoordinator(), cliPath: options.cliPath ?? await cliEntryPath(), maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns, registry });
+    // Every run-id operand accepts a unique prefix (≥4 chars) or the full UUID (U4).
+    if (target !== undefined && command !== "validate" && command !== "run") target = await resolveRunId(store, target);
 
     if (command === "validate") { await loadDefinition((await resolveWorkflow(target!, process.cwd())).path, registry); write("Workflow valid.\n"); return 0; }
     if (command === "list" || command === "status") {
       await reconcileQuietly(store, command === "status" ? target : undefined, await launchDeps(), warn);
       if (command === "status") {
         const run = await store.read(target!, registry);
-        write((json ? JSON.stringify(run, null, 2) : runSummary(run)) + "\n");
+        write((json ? JSON.stringify(run, null, 2) : formatRunTree(run)) + "\n");
         return 0;
       }
       const runs = await listRuns(store, registry);
-      write(json ? JSON.stringify(runs.map(({ id, status, createdAt, updatedAt, definition }) => ({ id, status, workflow: definition.name, createdAt, updatedAt })), null, 2) + "\n" : runs.length ? runs.map(runLine).join("\n") + "\n" : "No workflow runs.\n");
+      write(json ? JSON.stringify(runs.map(({ id, status, createdAt, updatedAt, definition }) => ({ id, status, workflow: definition.name, createdAt, updatedAt })), null, 2) + "\n" : runs.length ? runs.map(run => formatRunSummary(run)).join("\n") + "\n" : "No workflow runs.\n");
       return 0;
     }
     if (command === "inbox") {
@@ -163,9 +170,9 @@ async function waitForRun(store: WorkflowStore, initial: WorkflowRun, deps: Star
       if (detached) { write(`Detached; workflow run ${initial.id} continues in the background.\n`); return 0; }
       await reconcileQuietly(store, initial.id, deps, warn);
       const run = await store.read(initial.id, deps.registry);
-      for (const cp of run.nodes) if (statuses.get(cp.id) !== cp.status) { statuses.set(cp.id, cp.status); write(`  ${cp.id}: ${cp.status}${cp.error ? ` — ${cp.error}` : ""}\n`); }
-      if (run.status !== last) { last = run.status; write(`Workflow run ${run.id}: ${run.status}\n`); }
-      if (isTerminalRunStatus(run.status)) return run.status === "passed" ? 0 : 1;
+      for (const cp of run.nodes) if (statuses.get(cp.id) !== cp.status) { statuses.set(cp.id, cp.status); write(`  ${statusGlyph(cp.status)} ${cp.id}: ${cp.status}${cp.error ? ` — ${cp.error}` : ""}\n`); }
+      if (run.status !== last) { last = run.status; write(`${formatRunSummary(run)}\n`); }
+      if (isTerminalRunStatus(run.status)) { write(formatRunTree(run) + "\n"); return run.status === "passed" ? 0 : 1; }
       if (run.status === "waiting_approval") { write(`Waiting for approval: agav workflows inbox ${run.id}, then agav workflows approve ${run.id} <node-id|decision-id>\n`); return 0; }
       if (run.status === "interrupted") { write(`Run is interrupted and was not relaunched: agav workflows status ${run.id}\n`); return 1; }
     }

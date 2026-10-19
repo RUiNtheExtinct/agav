@@ -79,8 +79,8 @@ describe("agav workflows run", () => {
       expect(coordinator.starts).toHaveLength(1);
       expect(coordinator.starts[0]!.envInherit).toEqual(["BBB"]);
       expect(stdout.text()).toContain("echo hi");
-      expect(stdout.text()).toMatch(new RegExp(`Workflow run ${id} started`));
-      expect(stdout.text()).toContain(`agav workflows cancel ${id}`);
+      expect(stdout.text()).toMatch(new RegExp(`Workflow run ${id} \\(test\\) started`));
+      expect(stdout.text()).toContain(`agav workflows cancel ${id!.slice(0, 8)}`);
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });
@@ -145,7 +145,47 @@ describe("agav workflows list", () => {
     const code = await runWorkflowsCli(["list"], { config: testConfig(), store, stdout, getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" });
     expect(code).toBe(0);
     const lines = stdout.text().trim().split("\n");
-    expect(lines.map(line => line.split(/\s+/)[0])).toEqual([third.id, second.id, first.id]);
+    expect(lines.map(line => line.split(/\s+/)[1])).toEqual([third, second, first].map(run => run.id.slice(0, 8)));
+    expect(lines[0]).toMatch(/^… [a-f0-9]{8} {2}test {2}pending {2}started \S+ ago$/);
+    expect(stdout.text()).not.toContain("{");
+  });
+
+  it("list --json keeps the script-friendly shape", async () => {
+    const run = await createRun(store, definition, {});
+    const stdout = sink(false);
+    expect(await runWorkflowsCli(["list", "--json"], { config: testConfig(), store, stdout, getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" })).toBe(0);
+    const parsed = JSON.parse(stdout.text()) as Array<Record<string, unknown>>;
+    expect(parsed).toHaveLength(1);
+    expect(Object.keys(parsed[0]!).sort()).toEqual(["createdAt", "id", "status", "updatedAt", "workflow"]);
+    expect(parsed[0]).toMatchObject({ id: run.id, status: "pending", workflow: "test" });
+  });
+
+  it("status prints a tree by default, the full checkpoint with --json, and accepts a short id", async () => {
+    const run = await createRun(store, definition, {});
+    const tree = sink(false);
+    expect(await runWorkflowsCli(["status", run.id.slice(0, 6)], { config: testConfig(), store, stdout: tree, getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" })).toBe(0);
+    expect(tree.text()).toContain(`Workflow run ${run.id} (test): … pending`);
+    expect(tree.text()).toContain("  … a: pending");
+    expect(tree.text()).not.toContain("{");
+    const json = sink(false);
+    expect(await runWorkflowsCli(["status", run.id, "--json"], { config: testConfig(), store, stdout: json, getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" })).toBe(0);
+    expect(JSON.parse(json.text())).toMatchObject({ id: run.id, status: "pending", nodes: [{ id: "a", status: "pending" }] });
+  });
+
+  it("rejects a too-short run id prefix", async () => {
+    const stderr = captureStderr();
+    const run = await createRun(store, definition, {});
+    expect(await runWorkflowsCli(["status", run.id.slice(0, 3)], { config: testConfig(), store, stdout: sink(false), getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" })).toBe(1);
+    expect(stderr()).toContain("too short");
+  });
+
+  it("inbox --json keeps the pending decision records", async () => {
+    const stdout = sink(false);
+    expect(await runWorkflowsCli(["inbox", "--json"], { config: testConfig(), store, stdout, getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" })).toBe(0);
+    expect(JSON.parse(stdout.text())).toEqual([]);
+    const text = sink(false);
+    expect(await runWorkflowsCli(["inbox"], { config: testConfig(), store, stdout: text, getCoordinator: async () => new FakeCoordinator(), cliPath: "/x/cli.js" })).toBe(0);
+    expect(text.text()).toBe("No pending workflow decisions.\n");
   });
 
   it("status reconciles a queued run (admits it)", async () => {
@@ -169,7 +209,7 @@ describe("agav workflows list", () => {
     const { launchRun } = await import("../workflows/launch.js");
     await launchRun(store, run.id, { coordinator, cliPath: "/x/cli.js", registry });
     const stdout = sink(false);
-    expect(await runWorkflowsCli(["cancel", run.id], { config: testConfig(), store, stdout, getCoordinator: async () => coordinator, cliPath: "/x/cli.js" })).toBe(0);
+    expect(await runWorkflowsCli(["cancel", run.id.slice(0, 8)], { config: testConfig(), store, stdout, getCoordinator: async () => coordinator, cliPath: "/x/cli.js" })).toBe(0);
     expect(coordinator.stops).toEqual(["job-1"]);
     expect(stdout.text()).toContain("cancelled");
   });
