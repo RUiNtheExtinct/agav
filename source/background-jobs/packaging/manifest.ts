@@ -53,6 +53,15 @@ export function getBackgroundTickArgs(cliEntryPath?: string): string[] {
   return cliEntryPath ? [cliEntryPath, BACKGROUND_TICK_INTERNAL_FLAG] : [BACKGROUND_TICK_INTERNAL_FLAG];
 }
 
+/**
+ * Arguments that make the current executable run one headless workflow runner (`[<cli>] <flag> <runId>`).
+ * Standalone binaries reexec themselves directly (their `process.argv[1]` is a virtual, non-executable path);
+ * Node installs must prepend the CLI entry script. Pass `cliEntryPath` only for Node installs.
+ */
+export function getWorkflowRunnerArgs(runId: string, cliEntryPath?: string): string[] {
+  return cliEntryPath ? [cliEntryPath, WORKFLOW_RUNNER_INTERNAL_FLAG, runId] : [WORKFLOW_RUNNER_INTERNAL_FLAG, runId];
+}
+
 /** Bun standalone module URLs are virtual, not externally executable JS files. */
 export function isStandaloneBinary(moduleUrl: string = import.meta.url): boolean {
   return /^file:\/\/\/(?:\$bunfs\/|[a-z]:\/(?:~|%7e)BUN\/)/i.test(moduleUrl);

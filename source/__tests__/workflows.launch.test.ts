@@ -1,10 +1,11 @@
 import { describe, expect, it, beforeEach, afterEach } from "vitest";
 import type { PlatformCapabilities } from "../background-jobs/types.js";
 import { buildConsent } from "../workflows/grant.js";
-import { launchRun, runnerLaunchSession } from "../workflows/launch.js";
+import { getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
+import { launchRun, runnerLaunchSession, runnerStartRequest } from "../workflows/launch.js";
 import { reconcileRuns } from "../workflows/reconcile.js";
 import { createRun } from "../workflows/runtime.js";
-import { WorkflowStore, type WorkflowRun } from "../workflows/store.js";
+import { runnerRequestId, WorkflowStore, type WorkflowRun } from "../workflows/store.js";
 import { def, FakeCoordinator, registry, tempStore } from "./helpers/workflow-fixtures.js";
 
 let store: WorkflowStore, cleanup: () => Promise<void>;
@@ -95,5 +96,35 @@ describe("launchRun", () => {
 
   it("uses a headless session that approves only the workflow-run launch actions", () => {
     expect(runnerLaunchSession().headlessApprovedActions).toEqual(["workflow-run", "start", "headless-start"]);
+  });
+});
+
+describe("runner invocation args", () => {
+  const BUNFS_URL = "file:///$bunfs/root/cli.js";
+  const VIRTUAL_ENTRY = "/$bunfs/root/agav";
+
+  it("getWorkflowRunnerArgs prepends the entry script only when given one", () => {
+    expect(getWorkflowRunnerArgs("run1", CLI)).toEqual([CLI, "--internal-workflow-runner", "run1"]);
+    expect(getWorkflowRunnerArgs("run1")).toEqual(["--internal-workflow-runner", "run1"]);
+  });
+
+  it("recognises the Bun virtual module URL as standalone", () => {
+    expect(isStandaloneBinary(BUNFS_URL)).toBe(true);
+    expect(isStandaloneBinary("file:///opt/agav/build/cli.js")).toBe(false);
+  });
+
+  it("node install: the runner request keeps the entry script before the flag", async () => {
+    const run = await backgroundRun();
+    run.runner = { attempt: 1, requestId: runnerRequestId(run.id, 1), relaunches: 0 };
+    const request = runnerStartRequest(run, CLI, isStandaloneBinary("file:///opt/agav/build/cli.js"));
+    expect(request.invocation).toEqual({ mode: "direct", executable: process.execPath, args: [CLI, "--internal-workflow-runner", run.id] });
+  });
+
+  it("standalone binary: the virtual entry path is dropped and the binary re-executes itself", async () => {
+    const run = await backgroundRun();
+    run.runner = { attempt: 1, requestId: runnerRequestId(run.id, 1), relaunches: 0 };
+    const request = runnerStartRequest(run, VIRTUAL_ENTRY, isStandaloneBinary(BUNFS_URL));
+    expect(request.invocation).toEqual({ mode: "direct", executable: process.execPath, args: ["--internal-workflow-runner", run.id] });
+    expect(request.requestId).toBe(`wf-run-${run.id}-1`);
   });
 });

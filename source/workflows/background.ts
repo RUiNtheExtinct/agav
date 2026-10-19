@@ -16,7 +16,8 @@ import { formatDecision, formatRunSummary, formatRunTree, shortId, truncateOutpu
 
 export { TERMINAL_RUN_STATUSES, isTerminalRunStatus } from "./format.js";
 
-/** The CLI entry script the runner re-executes (`node <cli> --internal-workflow-runner <id>`). */
+/** The CLI entry script the runner re-executes (`node <cli> --internal-workflow-runner <id>`).
+ * In a Bun standalone binary this is a virtual `/$bunfs/...` path that launch ignores (the binary re-executes itself). */
 export async function cliEntryPath(argv1: string | undefined = process.argv[1]): Promise<string> {
   if (!argv1) throw new Error("Cannot resolve the agav CLI entry script (process.argv[1] is empty).");
   const path = resolve(argv1);

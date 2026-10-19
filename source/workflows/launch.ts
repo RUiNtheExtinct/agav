@@ -1,5 +1,5 @@
 import { isLiveLifecycle, isTerminalLifecycle, type CoordinatorClient, type JobSummary, type SessionPolicySnapshot, type StartJobRequest } from "../background-jobs/types.js";
-import { WORKFLOW_RUNNER_INTERNAL_FLAG } from "../background-jobs/packaging/manifest.js";
+import { getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
@@ -15,7 +15,7 @@ export interface LaunchDeps {
   coordinator: RunnerCoordinator;
   /** Session for the runner `start`; defaults to `runnerLaunchSession()`. */
   session?: SessionPolicySnapshot;
-  /** CLI entry script re-executed by `process.execPath`. */
+  /** CLI entry script re-executed by `process.execPath`; ignored by standalone binaries, which re-execute themselves. */
   cliPath: string;
   maxConcurrentWorkflowRuns?: number;
   registry?: ToolRegistry;
@@ -38,12 +38,12 @@ export function runnerLaunchSession(): SessionPolicySnapshot {
 }
 
 /** The supervised runner job for the run's current attempt. */
-export function runnerStartRequest(run: WorkflowRun, cliPath: string): StartJobRequest {
+export function runnerStartRequest(run: WorkflowRun, cliPath: string, standalone: boolean = isStandaloneBinary()): StartJobRequest {
   if (!run.runner) throw new Error(`Workflow run ${run.id} has no runner attempt.`);
   if (!run.consent) throw new Error(`Workflow run ${run.id} has no background consent; refusing to launch.`);
   return {
     requestId: run.runner.requestId,
-    invocation: { mode: "direct", executable: process.execPath, args: [cliPath, WORKFLOW_RUNNER_INTERNAL_FLAG, run.id] },
+    invocation: { mode: "direct", executable: process.execPath, args: getWorkflowRunnerArgs(run.id, standalone ? undefined : cliPath) },
     cwd: run.cwd,
     envInherit: [...run.consent.envNames],
     isolation: { backend: "none", required: false },
