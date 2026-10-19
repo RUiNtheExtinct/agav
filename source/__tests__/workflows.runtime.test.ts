@@ -3,7 +3,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { decideApproval } from "../workflows/control.js";
 import { getNodeExecutor } from "../workflows/executors.js";
-import { createRun, executeRun } from "../workflows/runtime.js";
+import { createRun, executeRun, MAX_EXECUTIONS } from "../workflows/runtime.js";
 import { jobRequestId, MAX_INLINE_OUTPUT_BYTES, WorkflowStore, type WorkflowRun } from "../workflows/store.js";
 import { def, fakeHost, FakeCoordinator, jobDeps, registry, summary, tempStore, testConfig } from "./helpers/workflow-fixtures.js";
 
@@ -42,6 +42,24 @@ describe("executeRun", () => {
     expect(host.calls.map(c => c.name)).toEqual(["read_file", "write_file"]);
     expect(host.calls[1]!.input).toEqual({ path: "o.txt", content: "in:hello" });
     expect((await store.read(run.id, registry)).nodes.map(n => n.status)).toEqual(["passed", "passed"]);
+  });
+
+  it("fails the run once the execution cap is exceeded, without dispatching further nodes", async () => {
+    const host = fakeHost({ read_file: { output: "hello", isError: false } });
+    const d = def([
+      { id: "a", type: "tool", tool: "read_file", input: { path: "a" } },
+      { id: "b", type: "tool", tool: "read_file", input: { path: "b" }, dependsOn: ["a"] },
+    ]);
+    const run = await createRun(store, d, {});
+    const raw = await rawRun(run.id);
+    raw.executionCount = MAX_EXECUTIONS - 1;
+    await writeRaw(raw);
+    const done = await executeRun(store, run.id, registry, config, undefined, host);
+    expect(done.status).toBe("failed");
+    expect(host.calls).toHaveLength(1);
+    expect(done.executionCount).toBe(MAX_EXECUTIONS);
+    expect(done.nodes.map(n => n.status)).toEqual(["passed", "failed"]);
+    expect(done.nodes[1]!.error).toBe(`execution cap (${MAX_EXECUTIONS}) exceeded`);
   });
 
   it("stops at the first failed node", async () => {

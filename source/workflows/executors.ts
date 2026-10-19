@@ -3,7 +3,7 @@ import type { ToolRegistry } from "../tools/registry.js";
 import type { WorkflowNode } from "./definition.js";
 import { gatedToolExecute, type WorkflowExecutionHost } from "./gated-tools.js";
 import { applyJobOutcome, JobCancellationIncompleteError, runJobNode, type JobNodeDeps } from "./job-node.js";
-import { jobRequestId, type NodeCheckpoint, type WorkflowRun, type WorkflowStore } from "./store.js";
+import { jobRequestId, type JobScope, type NodeCheckpoint, type WorkflowRun, type WorkflowStore } from "./store.js";
 import { createPendingDecision, DecisionPendingError, parkCheckpoint } from "./decisions.js";
 import { appendEvent } from "./events.js";
 import { resolveTemplate, type TemplateContext } from "./interpolate.js";
@@ -27,6 +27,8 @@ export interface NodeExecutionContext {
   /** Enclosing loop context for interpolation, and the iteration path used to key decisions (loop nodes). */
   loop?: TemplateContext["loop"];
   iteration?: number[];
+  /** Loop-body position of the node; scopes job requestIds (`jobRequestId(run.id, node.id, attempt, jobScope)`). */
+  jobScope?: JobScope;
   /** True when a running checkpoint is being reattached instead of freshly dispatched. */
   resuming: boolean;
 }
@@ -105,7 +107,7 @@ export const toolExecutor: NodeExecutor = {
 export const jobExecutor: NodeExecutor = {
   type: "job",
   resumable: true,
-  async execute({ store, run, node, checkpoint: cp, signal, jobDeps, resuming }) {
+  async execute({ store, run, node, checkpoint: cp, signal, jobDeps, resuming, jobScope }) {
     const child = new AbortController();
     const abortChild = (): void => { child.abort(); };
     signal.addEventListener("abort", abortChild, { once: true });
@@ -119,7 +121,7 @@ export const jobExecutor: NodeExecutor = {
       if (remaining <= 0) fire(); else timeout = setTimeout(fire, remaining);
     }
     try {
-      await runJobCheckpoint(store, run, cp, node.command!, jobDeps, child.signal, resuming);
+      await runJobCheckpoint(store, run, cp, node.command!, jobDeps, child.signal, resuming, jobScope);
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
       signal.removeEventListener("abort", abortChild);
@@ -160,10 +162,10 @@ export function getNodeExecutor(type: string): NodeExecutor {
 }
 
 /** Executes one job node; the requestId is durable before any start and the jobId right after admission. */
-async function runJobCheckpoint(store: WorkflowStore, run: WorkflowRun, cp: NodeCheckpoint, command: string, deps: JobNodeDeps | undefined, signal: AbortSignal, resuming: boolean): Promise<void> {
+async function runJobCheckpoint(store: WorkflowStore, run: WorkflowRun, cp: NodeCheckpoint, command: string, deps: JobNodeDeps | undefined, signal: AbortSignal, resuming: boolean, jobScope?: JobScope): Promise<void> {
   // A resumed node reattaches with the attempt id it persisted (old checkpoints carry `-1`).
   // A fresh attempt of a retried node gets its own requestId (`-<attempt>`), so it starts a NEW job.
-  const requestId = resuming && cp.job?.requestId ? cp.job.requestId : jobRequestId(run.id, cp.id, cp.attempt ?? 1);
+  const requestId = resuming && cp.job?.requestId ? cp.job.requestId : jobRequestId(run.id, cp.id, cp.attempt ?? 1, jobScope);
   if (!resuming) {
     if (!deps) {
       cp.status = "failed"; cp.error = "Job nodes unavailable: this execution context supplies no background-job support; no job was launched.";

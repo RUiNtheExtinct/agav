@@ -3,11 +3,12 @@ import { realpath } from "node:fs/promises";
 import type { AgavConfig, PermissionMode } from "../config/config.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { WorkflowExecutionHost } from "./gated-tools.js";
-import { definitionHash, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
+import { definitionHash, type JobScope, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
 import type { JobNodeDeps } from "./job-node.js";
 import { narrowPermissionMode, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { getNodeExecutor, retriesOnResume, type NodeResult } from "./executors.js";
-import { templateContext, type AgentNodeDeps } from "./agent-node.js";
+import { type AgentNodeDeps } from "./agent-node.js";
+import type { TemplateContext } from "./interpolate.js";
 import { evaluateCondition } from "./expr.js";
 import { resolveInputs } from "./inputs.js";
 import { appendEvent } from "./events.js";
@@ -41,13 +42,24 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
  * false `when` skips the node itself. A missing reference in `when` is undefined, never an error.
  */
 export function skipReason(run: WorkflowRun, node: WorkflowNode): string | undefined {
+  return scopeSkipReason(run, { nodes: run.definition.nodes, checkpoints: Object.fromEntries(run.nodes.map(cp => [cp.id, cp])) }, node);
+}
+
+/** `skipReason` within one scope: dependencies resolve in `spec.checkpoints`; `when` also sees `outerNodes` and `loop`. */
+function scopeSkipReason(run: WorkflowRun, spec: ScopeSpec, node: WorkflowNode): string | undefined {
   for (const dep of node.dependsOn ?? []) {
-    const status = run.nodes.find(cp => cp.id === dep)!.status;
+    const status = spec.checkpoints[dep]!.status;
     if (status === "failed" || status === "timed_out" || status === "cancelled") return `dependency ${dep} ${status}`;
     if (status === "skipped" && node.allowSkipped !== true) return `dependency ${dep} was skipped`;
   }
-  if (node.when !== undefined && !evaluateCondition(node.when, templateContext(run))) return `when is false: ${node.when}`;
+  if (node.when !== undefined && !evaluateCondition(node.when, scopeTemplateContext(run, spec))) return `when is false: ${node.when}`;
   return undefined;
+}
+
+/** Interpolation context for a scope: run inputs, outer checkpoints overlaid by the scope's own, and the loop context. */
+function scopeTemplateContext(run: WorkflowRun, spec: ScopeSpec): TemplateContext {
+  const view = (cps: Record<string, NodeCheckpoint>): Array<[string, { status: string; output?: unknown }]> => Object.values(cps).map(cp => [cp.id, { status: cp.status, output: cp.output }]);
+  return { inputs: run.inputs, nodes: Object.fromEntries([...view(spec.outerNodes ?? {}), ...view(spec.checkpoints)]), ...(spec.loop ? { loop: spec.loop } : {}) };
 }
 
 /** True when a settled attempt may be retried: retry budget left, not cancelled, and no possibly-live job behind it. */
@@ -64,6 +76,131 @@ function narrowJobDeps(deps: JobNodeDeps | undefined, mode: PermissionMode | und
   if (!deps || mode === undefined) return deps;
   const base = deps.session;
   return { ...deps, session: () => { const session = typeof base === "function" ? base() : base; return { ...session, permissionMode: narrowPermissionMode(session.permissionMode, mode) }; } };
+}
+
+/** Maximum executor dispatches (including retries and resumed reattachments) over a run's lifetime. */
+export const MAX_EXECUTIONS = 500;
+const CAP_ERROR = `execution cap (${MAX_EXECUTIONS}) exceeded`;
+
+/** One sibling scope to schedule: the top-level DAG or one loop iteration's body. */
+export interface ScopeSpec {
+  nodes: WorkflowNode[];
+  /** Checkpoints of `nodes`, keyed by node id (mutated in place; persisted via `env.save`). */
+  checkpoints: Record<string, NodeCheckpoint>;
+  loop?: TemplateContext["loop"];
+  jobScope?: JobScope;
+  /** Checkpoints of enclosing scopes, visible to `when` under the scope's own. */
+  outerNodes?: Record<string, NodeCheckpoint>;
+}
+/** Run-wide context shared by every scope of one execution. */
+export interface ScopeEnv {
+  run: WorkflowRun;
+  store: WorkflowStore;
+  registry: ToolRegistry;
+  config: AgavConfig;
+  /** Run-level abort (caller signal, durable cancel marker, or run deadline). */
+  signal: AbortSignal;
+  host?: WorkflowExecutionHost;
+  jobDeps?: JobNodeDeps;
+  agentDeps?: AgentNodeDeps;
+  save(): Promise<void>;
+  stopOnFailure: boolean;
+  maxRuntimeSeconds?: number;
+  /** True once the run deadline aborted `signal`. */
+  deadlineHit(): boolean;
+  /** A running resumable checkpoint to reattach before scheduling anything else; consumed (cleared) on use. */
+  resume?: NodeCheckpoint;
+  /** Between-node hook (cancel marker, decisions applied by other sessions); true stops scheduling. */
+  betweenNodes?(): Promise<boolean>;
+  /** Set when the execution cap stopped the run. */
+  capExceeded?: boolean;
+}
+export type ScopeStatus = "passed" | "failed" | "timed_out" | "waiting_approval" | "cancelled";
+
+/**
+ * Sequential scheduler for one scope: dependency readiness, when/skip cascade, retries with backoff,
+ * deadline timeouts, parking on pending decisions and executor dispatch. Returns the scope's derived status.
+ */
+export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeStatus> {
+  const { run, store, registry, config, host, jobDeps, agentDeps, stopOnFailure } = env;
+  const signal = env.signal;
+  const cps = spec.checkpoints;
+  const finish = async (status: ScopeStatus): Promise<ScopeStatus> => status;
+  const finalStatus = (): ScopeStatus => {
+    const all = spec.nodes.map(node => cps[node.id]!);
+    if (env.capExceeded) return "failed";
+    if (env.deadlineHit()) return "timed_out";
+    if (signal.aborted) return "cancelled";
+    // With stopOnFailure:false independent branches still parked on decisions keep the run waiting.
+    if (!stopOnFailure && all.some(cp => cp.status === "waiting_approval")) return "waiting_approval";
+    if (all.some(cp => cp.status === "timed_out")) return "timed_out";
+    if (all.some(cp => cp.status === "failed")) return "failed";
+    if (all.some(cp => cp.status === "cancelled")) return "cancelled";
+    return all.every(cp => cp.status === "passed" || cp.status === "skipped") ? "passed" : "waiting_approval";
+  };
+  while (env.resume !== undefined || !signal.aborted) {
+    if (env.resume === undefined && env.betweenNodes && await env.betweenNodes()) break;
+    const resumeCp = env.resume;
+    const node = resumeCp !== undefined
+      ? spec.nodes.find(candidate => candidate.id === resumeCp.id)
+      : spec.nodes.find(candidate => cps[candidate.id]!.status === "pending" && (candidate.dependsOn ?? []).every(dep => SETTLED.has(cps[dep]!.status)));
+    if (!node) break;
+    const cp = cps[node.id]!;
+    const resuming = resumeCp !== undefined;
+    env.resume = undefined;
+    if (!resuming) {
+      let reason: string | undefined;
+      try { reason = scopeSkipReason(run, spec, node); }
+      catch (error) { reason = undefined; cp.status = "failed"; cp.error = `when could not be evaluated: ${error instanceof Error ? error.message : String(error)}`; }
+      if (reason !== undefined || cp.status === "failed") {
+        if (reason !== undefined) { cp.status = "skipped"; cp.error = `Skipped: ${reason}.`; }
+        cp.endedAt = new Date().toISOString();
+        await env.save();
+        await appendEvent(store, run.id, { type: "node_completed", nodeId: node.id, status: cp.status, ...(cp.error ? { error: cp.error } : {}) });
+        if (cp.status === "failed" && stopOnFailure) break;
+        continue;
+      }
+      if (node.retry && cp.attempt === undefined) cp.attempt = 1;
+    }
+    const executor = getNodeExecutor(node.type);
+    let result: NodeResult | undefined;
+    let first = true;
+    for (;;) {
+      // A reattached job is counted but never failed by the cap (its workload may be live).
+      if ((run.executionCount ?? 0) >= MAX_EXECUTIONS && !(resuming && first)) {
+        env.capExceeded = true;
+        cp.status = "failed"; cp.error = CAP_ERROR; cp.endedAt = new Date().toISOString();
+        await env.save();
+        await appendEvent(store, run.id, { type: "node_completed", nodeId: node.id, status: cp.status, error: cp.error });
+        break;
+      }
+      run.executionCount = (run.executionCount ?? 0) + 1;
+      if (!resuming || !first) await appendEvent(store, run.id, { type: "node_started", nodeId: node.id, ...(cp.attempt !== undefined ? { attempt: cp.attempt } : {}) });
+      result = await executor.execute({ store, run, node, checkpoint: cp, registry, config, signal, host, jobDeps, agentDeps, resuming: resuming && first, ...(spec.loop ? { loop: spec.loop } : {}), ...(spec.jobScope ? { jobScope: spec.jobScope } : {}) });
+      first = false;
+      // The run deadline aborted this node: it timed out rather than being cancelled by a user.
+      if (env.deadlineHit() && cp.status === "cancelled") {
+        cp.status = "timed_out"; cp.error = `Run deadline exceeded (policies.maxRuntimeSeconds=${env.maxRuntimeSeconds}).${cp.error ? ` ${cp.error}` : ""}`;
+        await env.save();
+      }
+      if (!["pending", "running", "waiting_approval"].includes(cp.status)) await appendEvent(store, run.id, { type: "node_completed", nodeId: node.id, status: cp.status, ...(cp.error ? { error: cp.error } : {}) });
+      if (!shouldRetry(node, cp, signal)) break;
+      // Durable retry intent first: a crash during backoff resumes with the next attempt (and a new job requestId).
+      const failure = cp.error;
+      cp.attempt = (cp.attempt ?? 1) + 1;
+      cp.status = "pending";
+      for (const key of ["output", "error", "startedAt", "endedAt", "usage", "model", "durationMs", "job"] as const) delete cp[key];
+      await env.save();
+      await appendEvent(store, run.id, { type: "node_retry", nodeId: node.id, attempt: cp.attempt, ...(failure ? { error: failure } : {}) });
+      await sleep((node.retry!.backoffSeconds ?? 0) * 1000, signal);
+      if (signal.aborted) break;
+    }
+    if (env.capExceeded) break;
+    if (signal.aborted && cp.status === "pending") break;
+    // With stopOnFailure:false a failed or timed-out node only skips its dependents; other branches continue.
+    if (result!.next === "stop" && (stopOnFailure || !["failed", "timed_out"].includes(cp.status))) break;
+  }
+  return finish(finalStatus());
 }
 
 /** Sequential DAG execution; the exclusive run lock spans work and shutdown settlement. */
@@ -133,83 +270,32 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
       }).catch(error => { pollingError = error; abort(); });
     }, 100);
     const failureStops = (): boolean => stopOnFailure && run.nodes.some(cp => cp.status === "failed");
-    const finalStatus = (): RunStatus => {
-      if (deadlineHit) return "timed_out";
-      if (controller.signal.aborted) return "cancelled";
-      // With stopOnFailure:false independent branches still parked on decisions keep the run waiting.
-      if (!stopOnFailure && run.nodes.some(cp => cp.status === "waiting_approval")) return "waiting_approval";
-      if (run.nodes.some(cp => cp.status === "timed_out")) return "timed_out";
-      if (run.nodes.some(cp => cp.status === "failed")) return "failed";
-      if (run.nodes.some(cp => cp.status === "cancelled")) return "cancelled";
-      return run.nodes.every(cp => cp.status === "passed" || cp.status === "skipped") ? "passed" : "waiting_approval";
+    const env: ScopeEnv = {
+      run, store, registry, config, signal: controller.signal, host, jobDeps, agentDeps,
+      save: () => store.save(run),
+      stopOnFailure, maxRuntimeSeconds: policies.maxRuntimeSeconds, deadlineHit: () => deadlineHit,
+      resume: resumedJob,
+      async betweenNodes() {
+        if (await store.cancellationRequested(id)) { abort(); return true; }
+        if (decisionReady) {
+          decisionReady = false;
+          if (await applyDecisions(store, run)) await store.save(run);
+          if (failureStops()) return true;
+        }
+        return false;
+      },
     };
     try {
       if (await store.cancellationRequested(id)) abort();
-      let resume = resumedJob;
       for (;;) {
         run.status = "running";
         await store.save(run);
         await appendEvent(store, id, { type: "run_status", status: "running" });
-        while (resume !== undefined || !controller.signal.aborted) {
-          if (resume === undefined && await store.cancellationRequested(id)) { abort(); break; }
-          if (resume === undefined && decisionReady) {
-            decisionReady = false;
-            if (await applyDecisions(store, run)) await store.save(run);
-            if (failureStops()) break;
-          }
-          const node = resume !== undefined
-            ? run.definition.nodes.find(candidate => candidate.id === resume!.id)
-            : run.definition.nodes.find(candidate => run.nodes.find(cp => cp.id === candidate.id)!.status === "pending" && (candidate.dependsOn ?? []).every(dep => SETTLED.has(run.nodes.find(cp => cp.id === dep)!.status)));
-          if (!node) break;
-          const cp = run.nodes.find(item => item.id === node.id)!;
-          const resuming = resume !== undefined;
-          resume = undefined;
-          if (!resuming) {
-            let reason: string | undefined;
-            try { reason = skipReason(run, node); }
-            catch (error) { reason = undefined; cp.status = "failed"; cp.error = `when could not be evaluated: ${error instanceof Error ? error.message : String(error)}`; }
-            if (reason !== undefined || cp.status === "failed") {
-              if (reason !== undefined) { cp.status = "skipped"; cp.error = `Skipped: ${reason}.`; }
-              cp.endedAt = new Date().toISOString();
-              await store.save(run);
-              await appendEvent(store, id, { type: "node_completed", nodeId: node.id, status: cp.status, ...(cp.error ? { error: cp.error } : {}) });
-              if (cp.status === "failed" && stopOnFailure) break;
-              continue;
-            }
-            if (node.retry && cp.attempt === undefined) cp.attempt = 1;
-          }
-          const executor = getNodeExecutor(node.type);
-          let result: NodeResult;
-          let first = true;
-          for (;;) {
-            if (!resuming || !first) await appendEvent(store, id, { type: "node_started", nodeId: node.id, ...(cp.attempt !== undefined ? { attempt: cp.attempt } : {}) });
-            result = await executor.execute({ store, run, node, checkpoint: cp, registry, config, signal: controller.signal, host, jobDeps, agentDeps, resuming: resuming && first });
-            first = false;
-            // The run deadline aborted this node: it timed out rather than being cancelled by a user.
-            if (deadlineHit && cp.status === "cancelled") {
-              cp.status = "timed_out"; cp.error = `Run deadline exceeded (policies.maxRuntimeSeconds=${policies.maxRuntimeSeconds}).${cp.error ? ` ${cp.error}` : ""}`;
-              await store.save(run);
-            }
-            if (!["pending", "running", "waiting_approval"].includes(cp.status)) await appendEvent(store, id, { type: "node_completed", nodeId: node.id, status: cp.status, ...(cp.error ? { error: cp.error } : {}) });
-            if (!shouldRetry(node, cp, controller.signal)) break;
-            // Durable retry intent first: a crash during backoff resumes with the next attempt (and a new job requestId).
-            const failure = cp.error;
-            cp.attempt = (cp.attempt ?? 1) + 1;
-            cp.status = "pending";
-            for (const key of ["output", "error", "startedAt", "endedAt", "usage", "model", "durationMs", "job"] as const) delete cp[key];
-            await store.save(run);
-            await appendEvent(store, id, { type: "node_retry", nodeId: node.id, attempt: cp.attempt, ...(failure ? { error: failure } : {}) });
-            await sleep((node.retry!.backoffSeconds ?? 0) * 1000, controller.signal);
-            if (controller.signal.aborted) break;
-          }
-          if (controller.signal.aborted && cp.status === "pending") break;
-          // With stopOnFailure:false a failed or timed-out node only skips its dependents; other branches continue.
-          if (result.next === "stop" && (stopOnFailure || !["failed", "timed_out"].includes(cp.status))) break;
-        }
+        const scopeStatus = await runScope({ nodes: run.definition.nodes, checkpoints: Object.fromEntries(run.nodes.map(cp => [cp.id, cp])) }, env);
         if (pollingError) throw pollingError;
-        run.status = finalStatus();
+        run.status = scopeStatus;
         await store.save(run);
-        await appendEvent(store, id, { type: "run_status", status: run.status, ...(deadlineHit ? { reason: "run deadline exceeded" } : {}) });
+        await appendEvent(store, id, { type: "run_status", status: run.status, ...(deadlineHit ? { reason: "run deadline exceeded" } : env.capExceeded ? { reason: CAP_ERROR } : {}) });
         // Parked. A decider that saw this runner live does not relaunch, so re-check once the park is durable:
         // a decision written before this point is applied now instead of being stranded.
         if (run.status !== "waiting_approval" || !await applyDecisions(store, run)) return run;
