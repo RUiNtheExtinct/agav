@@ -146,6 +146,11 @@ export interface LaunchSpec {
   cwd: string;
   /** Minimal constructed environment; never contains raw secret values. */
   env: Record<string, string>;
+  /**
+   * Names (never values) of variables inherited from the launching process. Their values reach the
+   * supervisor only through its process environment and are resolved at workload spawn, never persisted.
+   */
+  envInherit?: string[];
   /** Names of credentials resolved at launch time; values never persisted here. */
   credentialRefs: string[];
   isolation: IsolationPolicy;

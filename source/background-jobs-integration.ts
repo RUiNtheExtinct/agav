@@ -41,14 +41,20 @@ export function reconcileOnStartup(
 }
 
 let workflowReconcilePromise: Promise<void> | null = null;
+let workflowReconcileInFlight: Promise<void> | null = null;
+/** Set once workflows are known enabled in this process (startup reconcile ran): the schedule ticker then reconciles runs too. */
+let workflowTickOptions: WorkflowReconcileOptions | null = null;
+
+export interface WorkflowReconcileOptions { maxConcurrentWorkflowRuns?: number }
 
 /**
- * Once per process, fire-and-forget reconcile of background workflow runs (dead runners relaunched,
- * queued runs admitted). Never rejects; errors are logged so they cannot block startup.
+ * Reconciles background workflow runs now: dead runners relaunched, parked runs past their deadline timed out,
+ * the oldest queued runs admitted while the runner pool has room, expired terminal runs pruned. Call it when
+ * the Workflows TUI opens (or any time); concurrent calls share one pass. Never rejects; errors are logged.
  */
-export function reconcileWorkflowRunsOnStartup(opts: { maxConcurrentWorkflowRuns?: number } = {}): Promise<void> {
-  if (workflowReconcilePromise !== null) return workflowReconcilePromise;
-  workflowReconcilePromise = Promise.resolve()
+export function reconcileWorkflowRunsNow(opts: WorkflowReconcileOptions = {}): Promise<void> {
+  if (workflowReconcileInFlight !== null) return workflowReconcileInFlight;
+  workflowReconcileInFlight = Promise.resolve()
     .then(async () => {
       const [{ reconcileRuns }, { WorkflowStore }, { cliEntryPath }] = await Promise.all([
         import("./workflows/reconcile.js"),
@@ -59,9 +65,30 @@ export function reconcileWorkflowRunsOnStartup(opts: { maxConcurrentWorkflowRuns
       for (const result of results) if (result.reason && result.action === "none") debugLog(`workflow reconcile ${result.runId}`, result.reason);
     })
     .catch((err: unknown) => {
-      debugLog("workflow startup reconcile failed", err);
+      debugLog("workflow reconcile failed", err);
+    })
+    .finally(() => {
+      workflowReconcileInFlight = null;
     });
+  return workflowReconcileInFlight;
+}
+
+/**
+ * Once per process, fire-and-forget reconcile of background workflow runs (see `reconcileWorkflowRunsNow`).
+ * Also enables the per-tick workflow reconcile of the schedule ticker with the same options. Never rejects.
+ */
+export function reconcileWorkflowRunsOnStartup(opts: WorkflowReconcileOptions = {}): Promise<void> {
+  workflowTickOptions = { ...opts };
+  if (workflowReconcilePromise !== null) return workflowReconcilePromise;
+  workflowReconcilePromise = reconcileWorkflowRunsNow(opts);
   return workflowReconcilePromise;
+}
+
+/** Test-only: forget the startup workflow reconcile and the ticker's workflow options. */
+export function __resetWorkflowReconcileForTests(): void {
+  workflowReconcilePromise = null;
+  workflowReconcileInFlight = null;
+  workflowTickOptions = null;
 }
 
 /** Test-only: clear the once-per-process guard; `enabled: false` disables the reconcile. */
@@ -114,6 +141,10 @@ export interface BackgroundTickOptions {
   now?: Date;
   /** Config `backgroundAutomation`; `"paused"` returns early without dispatching. */
   backgroundAutomation?: "on" | "paused";
+  /** When set (workflows enabled), also reconcile workflow runs (admits queued runs into freed runner slots). */
+  workflows?: WorkflowReconcileOptions;
+  /** Test seam for the workflow reconcile; defaults to `reconcileWorkflowRunsNow`. */
+  reconcileWorkflows?: (opts: WorkflowReconcileOptions) => Promise<void>;
 }
 
 export interface BackgroundTickSummary {
@@ -164,6 +195,8 @@ export async function runBackgroundTick(opts: BackgroundTickOptions): Promise<Ba
     summary.errorMessages.push(err instanceof Error ? err.message : String(err));
     debugLog("background tick failed", err);
   }
+  // Independent of schedule evaluation (never throws), so a schedule failure cannot strand queued runs.
+  if (opts.workflows !== undefined) await (opts.reconcileWorkflows ?? reconcileWorkflowRunsNow)(opts.workflows);
   return summary;
 }
 
@@ -187,6 +220,7 @@ export function startScheduleTicker(
         await runBackgroundTick({
           session: getSession(),
           backgroundAutomation: opts?.getBackgroundAutomation?.(),
+          ...(workflowTickOptions !== null ? { workflows: workflowTickOptions } : {}),
         });
       } catch (err) {
         debugLog("schedule ticker tick failed", err);

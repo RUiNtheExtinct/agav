@@ -56,6 +56,8 @@ export interface JobSupervisorOptions {
   logOperationTimeoutMs?: number;
   idleExitMs?: number;
   idleExitCheckIntervalMs?: number;
+  /** Values for the spec's `envInherit` names (from the launcher's private channel); never persisted. */
+  inheritedEnv?: Record<string, string>;
 }
 
 type PollResponse = { type: "poll"; job: JobRecord | undefined };
@@ -63,6 +65,34 @@ type LogResponse = { type: "log"; text: string; truncated: boolean; cursor?: str
 type StopResponse = { type: "stop"; job: JobRecord | undefined };
 type WaitResponse = { type: "wait"; job: JobRecord | undefined };
 type ErrorResponse = { type: "error"; message: string };
+
+/**
+ * The workload env: the persisted spec env plus the values of its `envInherit` names taken from
+ * `inherited` (handed over by the launcher, never persisted). Explicit spec values win, matching the
+ * normalize-time order (minimal + inherited, then the explicit overlay).
+ */
+export function workloadEnvironment(spec: Pick<LaunchSpec, "env" | "envInherit">, inherited: Record<string, string>, isWindows: boolean): Record<string, string> {
+  const resolved: Record<string, string> = {};
+  for (const name of spec.envInherit ?? []) {
+    const value = inherited[name];
+    if (typeof value === "string") resolved[isWindows ? name.toUpperCase() : name] = value;
+  }
+  return { ...resolved, ...spec.env };
+}
+
+/** Reads and removes the launcher's inherited-values channel from `env`; malformed input yields none. */
+export function takeInheritedEnvironment(env: NodeJS.ProcessEnv, variable: string): Record<string, string> {
+  const raw = env[variable];
+  delete env[variable];
+  if (raw === undefined) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  } catch {
+    return {};
+  }
+}
 
 function logsDir(root: string, jobId: string): string {
   return join(root, "jobs", jobId, "logs");
@@ -78,6 +108,7 @@ export class JobSupervisor {
   private readonly logOperationTimeoutMs: number;
   private readonly idleExitMs: number;
   private readonly idleExitCheckIntervalMs: number;
+  private readonly inheritedEnv: Record<string, string>;
 
   private child: WorkloadChild | undefined;
   private workloadOwnershipScope: LaunchSpec["ownershipScope"] = "process-group";
@@ -131,6 +162,7 @@ export class JobSupervisor {
     this.logOperationTimeoutMs = opts.logOperationTimeoutMs ?? 5000;
     this.idleExitMs = opts.idleExitMs ?? SUPERVISOR_IDLE_EXIT_MS;
     this.idleExitCheckIntervalMs = opts.idleExitCheckIntervalMs ?? IDLE_EXIT_CHECK_INTERVAL_MS;
+    this.inheritedEnv = opts.inheritedEnv ?? {};
   }
 
   /**
@@ -198,7 +230,7 @@ export class JobSupervisor {
     try {
       child = spawn(executable, spawnArgs, {
         cwd: spec.cwd,
-        env: spec.env,
+        env: workloadEnvironment(spec, this.inheritedEnv, isWindows),
         // POSIX needs a separate workload group; Windows shells need the
         // supervisor's hidden console to retain pipe/output behavior.
         detached: !isWindows,

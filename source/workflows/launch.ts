@@ -1,4 +1,4 @@
-import { isLiveLifecycle, type CoordinatorClient, type JobSummary, type SessionPolicySnapshot, type StartJobRequest } from "../background-jobs/types.js";
+import { isLiveLifecycle, isTerminalLifecycle, type CoordinatorClient, type JobSummary, type SessionPolicySnapshot, type StartJobRequest } from "../background-jobs/types.js";
 import { WORKFLOW_RUNNER_INTERNAL_FLAG } from "../background-jobs/packaging/manifest.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import type { ToolRegistry } from "../tools/registry.js";
@@ -19,6 +19,13 @@ export interface LaunchDeps {
   cliPath: string;
   maxConcurrentWorkflowRuns?: number;
   registry?: ToolRegistry;
+  /**
+   * Start the next attempt even when the existing runner job's state is uncertain (unknown/recovery-required),
+   * i.e. it may still be alive. Only for an explicit user override; never set by automatic reconcile.
+   */
+  force?: boolean;
+  /** A run whose runner is exiting (settled/parked, lock released): its still-live job does not hold a pool slot. */
+  exitingRunId?: string;
 }
 export interface LaunchResult { status: "started" | "attached" | "queued"; run: WorkflowRun; job?: JobSummary }
 
@@ -53,10 +60,11 @@ export async function findRunnerJob(coordinator: RunnerCoordinator, run: Workflo
 }
 
 /** Runs (other than `exceptId`) whose runner job is live; unreadable checkpoints are skipped. */
-export async function liveRunnerCount(store: WorkflowStore, coordinator: RunnerCoordinator, registry: ToolRegistry, exceptId?: string): Promise<number> {
+export async function liveRunnerCount(store: WorkflowStore, coordinator: RunnerCoordinator, registry: ToolRegistry, exceptId?: string | string[]): Promise<number> {
+  const except = new Set(exceptId === undefined ? [] : Array.isArray(exceptId) ? exceptId : [exceptId]);
   let live = 0;
   for (const id of await store.listIds()) {
-    if (id === exceptId) continue;
+    if (except.has(id)) continue;
     const run = await store.read(id, registry).catch(() => undefined);
     if (!run?.runner) continue;
     const job = await findRunnerJob(coordinator, run).catch(() => undefined);
@@ -86,6 +94,10 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
   const existing = await findRunnerJob(deps.coordinator, run);
   // A live attempt, or a dead one while the run still claims running/queued (reconcile decides those), is reattached.
   if (existing && (isLiveLifecycle(existing.state) || ["running", "queued"].includes(run.status))) return { status: "attached", run, job: existing };
+  // An uncertain runner (unknown/recovery-required) may still be executing: a second one would race it.
+  if (existing && !isTerminalLifecycle(existing.state) && deps.force !== true) {
+    throw new Error(`Workflow run ${runId}: runner job ${existing.jobId} is ${existing.state} and may still be running; refusing to start another runner. Verify it has stopped, then retry with force.`);
+  }
   // A finished attempt of a parked/interrupted run: the next launch is a new attempt (requestIds are never reused).
   const nextAttempt = existing ? run.runner!.attempt + 1 : undefined;
 
@@ -95,7 +107,7 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
   }
 
   const max = deps.maxConcurrentWorkflowRuns ?? DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS;
-  const full = await liveRunnerCount(store, deps.coordinator, registry, runId) >= max;
+  const full = await liveRunnerCount(store, deps.coordinator, registry, deps.exitingRunId ? [runId, deps.exitingRunId] : runId) >= max;
   const previous = run.status;
   // Durable intent (status + deterministic requestId) before any start, so a crash stays recoverable.
   run = await updateRun(store, runId, registry, current => {

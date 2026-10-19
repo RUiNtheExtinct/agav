@@ -1,4 +1,6 @@
-import { isLiveLifecycle, isTerminalLifecycle, BackgroundJobError } from "../background-jobs/types.js";
+import { promises as fs } from "node:fs";
+import { join } from "node:path";
+import { isLiveLifecycle, isTerminalLifecycle, BackgroundJobError, DEFAULT_RESOURCE_LIMITS } from "../background-jobs/types.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
 import { appendEvent } from "./events.js";
@@ -6,7 +8,7 @@ import { getNodeExecutor, retriesOnResume } from "./executors.js";
 import { findRunnerJob, launchRun, liveRunnerCount, updateRun, DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS, type LaunchDeps } from "./launch.js";
 import { runnerRequestId, scopedCheckpoints, type WorkflowRun, type WorkflowStore } from "./store.js";
 import { hasUnappliedDecision, parkUncertainNodes } from "./decisions.js";
-import { postRunNotification } from "./notify.js";
+import { mailboxDir, postRunNotification } from "./notify.js";
 
 /** Automatic relaunches after the runner died; beyond this the run stays `interrupted`. */
 export const MAX_RUNNER_RELAUNCHES = 3;
@@ -19,9 +21,20 @@ export type ReconcileAction =
   | "admitted" // queued run started
   | "queued" // queued run still waiting for pool room
   | "parked" // runner gone with an interrupted tool node: waiting on an `uncertain_tool` decision
+  | "timed_out" // parked run whose deadlineAt passed with no live runner
+  | "pruned" // terminal run older than the retention window: checkpoint and run files deleted
   | "busy"; // run lock held: a live writer owns it
 
 export interface ReconcileResult { runId: string; action: ReconcileAction; reason?: string }
+
+export interface ReconcileOptions {
+  /** Terminal runs not updated for this many days are pruned (default: background-jobs `completedLogRetentionDays`). */
+  retentionDays?: number;
+  /** Clock override (ms since epoch), for tests. */
+  now?: number;
+}
+
+const TERMINAL_RUN = new Set(["passed", "failed", "cancelled", "timed_out"]);
 
 /** A running node that can neither be reattached (job) nor safely re-run (retry-safe agent/prompt) has an uncertain outcome. */
 function isUncertain(run: WorkflowRun, cp: WorkflowRun["nodes"][number]): boolean {
@@ -118,27 +131,133 @@ async function admit(store: WorkflowStore, runId: string, deps: LaunchDeps): Pro
   }
 }
 
+function errorResult(runId: string, error: unknown): ReconcileResult {
+  return { runId, action: "none", reason: error instanceof Error ? error.message : String(error) };
+}
+
 /**
- * Reconciles every run: dead runners first (so freed slots are visible), then queued runs FIFO by `createdAt`
- * while the workflow-runner pool has room. Per-run errors are reported, never thrown, so one bad run cannot block others.
+ * A parked run whose deadline passed can never resume within its budget: mark it `timed_out`. Only under the
+ * run lock (no writer) and only when its runner job is not live; pending decisions are left (a terminal run hides them).
  */
-export async function reconcileRuns(store: WorkflowStore, deps: LaunchDeps): Promise<ReconcileResult[]> {
+async function timeOutParked(store: WorkflowStore, runId: string, deps: LaunchDeps, now: number): Promise<ReconcileResult | undefined> {
+  const snapshot = await store.read(runId, deps.registry!);
+  if (snapshot.status !== "waiting_approval" || snapshot.deadlineAt === undefined || Date.parse(snapshot.deadlineAt) > now) return undefined;
+  const job = await findRunnerJob(deps.coordinator, snapshot);
+  if (job && !isTerminalLifecycle(job.state)) return { runId, action: "none", reason: `deadline passed; runner ${job.state}` };
+  let run: WorkflowRun | undefined;
+  try {
+    run = await store.lock(runId, async () => {
+      const current = await store.read(runId, deps.registry!);
+      if (current.status !== "waiting_approval" || current.deadlineAt === undefined || Date.parse(current.deadlineAt) > now) return undefined;
+      current.status = "timed_out";
+      await store.save(current);
+      return current;
+    });
+  } catch (error) {
+    if (isLockHeld(error)) return { runId, action: "busy" };
+    throw error;
+  }
+  if (!run) return undefined;
+  await appendEvent(store, runId, { type: "run_status", status: "timed_out", reason: "run deadline exceeded while waiting for a decision" });
+  await postRunNotification(store, run);
+  return { runId, action: "timed_out" };
+}
+
+/** Deletes the run's mailbox notifications and their `.seen` markers. */
+async function pruneMailbox(store: WorkflowStore, runId: string): Promise<void> {
+  const dir = mailboxDir(store);
+  let names: string[];
+  try { names = await fs.readdir(dir); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return; throw error; }
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue;
+    let record: { runId?: unknown };
+    try { record = JSON.parse(await fs.readFile(join(dir, name), "utf8")) as { runId?: unknown }; }
+    catch { continue; }
+    if (record?.runId !== runId) continue;
+    await fs.rm(join(dir, `${name.slice(0, -5)}.seen`), { force: true });
+    await fs.rm(join(dir, name), { force: true });
+  }
+}
+
+/**
+ * Retention: a terminal run not updated within `retentionDays` is deleted with its run dir (decisions, events,
+ * artifacts), `.cancel` marker and mailbox entries. Non-terminal runs are never pruned. The checkpoint goes last
+ * (under the run lock), so an interrupted prune is simply retried on the next pass.
+ */
+async function pruneRun(store: WorkflowStore, runId: string, deps: LaunchDeps, cutoff: number): Promise<ReconcileResult | undefined> {
+  const isExpired = (run: WorkflowRun): boolean => TERMINAL_RUN.has(run.status) && Date.parse(run.updatedAt) <= cutoff;
+  if (!isExpired(await store.read(runId, deps.registry!))) return undefined;
+  try {
+    const pruned = await store.lock(runId, async () => {
+      if (!isExpired(await store.read(runId, deps.registry!))) return false;
+      await pruneMailbox(store, runId);
+      await fs.rm(join(store.root, `${runId}.cancel`), { force: true });
+      await fs.rm(store.runDir(runId), { recursive: true, force: true });
+      await fs.rm(join(store.root, `${runId}.json`), { force: true });
+      return true;
+    });
+    return pruned ? { runId, action: "pruned" } : undefined;
+  } catch (error) {
+    if (isLockHeld(error)) return { runId, action: "busy" };
+    throw error;
+  }
+}
+
+/**
+ * Admits queued runs FIFO by `createdAt` while the workflow-runner pool has room. `deps.exitingRunId` names a
+ * runner that has settled and released its lock but whose process is still alive: it does not hold a slot.
+ */
+export async function admitQueuedRuns(store: WorkflowStore, deps: LaunchDeps): Promise<ReconcileResult[]> {
   const full: LaunchDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
-  const runs: WorkflowRun[] = [];
+  const queued: WorkflowRun[] = [];
   for (const id of await store.listIds()) {
     const run = await store.read(id, full.registry!).catch(() => undefined);
-    if (run?.runner && run.consent && ["running", "queued", "waiting_approval"].includes(run.status)) runs.push(run);
+    if (run?.runner && run.consent && run.status === "queued") queued.push(run);
   }
   const results: ReconcileResult[] = [];
-  const attempt = async (id: string): Promise<void> => {
-    try { results.push(await reconcileRun(store, id, full)); }
-    catch (error) { results.push({ runId: id, action: "none", reason: error instanceof Error ? error.message : String(error) }); }
+  const max = full.maxConcurrentWorkflowRuns ?? DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS;
+  for (const run of queued.sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+    if (await liveRunnerCount(store, full.coordinator, full.registry!, full.exitingRunId) >= max) break;
+    try { results.push(await reconcileRun(store, run.id, full)); }
+    catch (error) { results.push(errorResult(run.id, error)); }
+  }
+  return results;
+}
+
+/**
+ * Reconciles every run: dead runners first (so freed slots are visible), parked runs past their deadline are
+ * timed out, then queued runs FIFO by `createdAt` while the workflow-runner pool has room, and finally terminal
+ * runs past the retention window are pruned. Per-run errors are reported, never thrown, so one bad run cannot
+ * block others.
+ */
+export async function reconcileRuns(store: WorkflowStore, deps: LaunchDeps, opts: ReconcileOptions = {}): Promise<ReconcileResult[]> {
+  const full: LaunchDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
+  const now = opts.now ?? Date.now();
+  const runs: WorkflowRun[] = [];
+  const terminal: WorkflowRun[] = [];
+  const parked: WorkflowRun[] = [];
+  for (const id of await store.listIds()) {
+    const run = await store.read(id, full.registry!).catch(() => undefined);
+    if (!run) continue;
+    if (TERMINAL_RUN.has(run.status)) terminal.push(run);
+    else if (run.status === "waiting_approval" && run.deadlineAt !== undefined && Date.parse(run.deadlineAt) <= now) parked.push(run);
+    else if (run.runner && run.consent && ["running", "queued", "waiting_approval"].includes(run.status)) runs.push(run);
+  }
+  const results: ReconcileResult[] = [];
+  const attempt = async (id: string, step: (id: string) => Promise<ReconcileResult | undefined>): Promise<void> => {
+    try { const result = await step(id); if (result) results.push(result); }
+    catch (error) { results.push(errorResult(id, error)); }
   };
-  for (const run of runs.filter(run => run.status === "running" || run.status === "waiting_approval")) await attempt(run.id);
+  for (const run of runs.filter(run => run.status === "running" || run.status === "waiting_approval")) await attempt(run.id, id => reconcileRun(store, id, full));
+  for (const run of parked) await attempt(run.id, id => timeOutParked(store, id, full, now));
   const max = full.maxConcurrentWorkflowRuns ?? DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS;
   for (const run of runs.filter(run => run.status === "queued").sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
-    if (await liveRunnerCount(store, full.coordinator, full.registry!) >= max) break;
-    await attempt(run.id);
+    if (await liveRunnerCount(store, full.coordinator, full.registry!, full.exitingRunId) >= max) break;
+    await attempt(run.id, id => reconcileRun(store, id, full));
   }
+  const retentionDays = opts.retentionDays ?? DEFAULT_RESOURCE_LIMITS.completedLogRetentionDays;
+  const cutoff = now - retentionDays * 24 * 60 * 60 * 1000;
+  for (const run of terminal) await attempt(run.id, id => pruneRun(store, id, full, cutoff));
   return results;
 }

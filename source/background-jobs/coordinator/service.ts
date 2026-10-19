@@ -398,10 +398,17 @@ export async function createCoordinator(opts?: CreateCoordinatorOptions): Promis
       if ("existing" in admission) return toJobSummary(admission.existing);
       const jobId = admission.jobId;
 
+      // Inherited values travel only in the supervisor's process environment, never in the stored spec.
+      const inheritedEnv: Record<string, string> = {};
+      for (const name of spec.envInherit ?? []) {
+        const value = process.env[name];
+        if (value !== undefined) inheritedEnv[name] = value;
+      }
+
       // Launch OUTSIDE the coordinator lock; never hold it while spawning.
       let launchResult;
       try {
-        launchResult = await launchSupervisorForJob({ jobId, requestId: request.requestId, root, repositories });
+        launchResult = await launchSupervisorForJob({ jobId, requestId: request.requestId, root, repositories, inheritedEnv });
       } catch (error) {
         // A definite pre-spawn failure means nothing ever ran: terminalize the job so its capacity
         // reservation is released. Ambiguous failures keep the reservation for reconciliation.

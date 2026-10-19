@@ -14,6 +14,8 @@ import { createProvider } from "../providers/registry.js";
 import { createDefaultAgentInvoker, type AgentInvoker } from "./agent-invoker.js";
 import type { AgentNodeDeps } from "./agent-node.js";
 import { WorkflowStore, type WorkflowRun } from "./store.js";
+import type { LaunchDeps } from "./launch.js";
+import { admitQueuedRuns } from "./reconcile.js";
 
 /** SIGTERM must checkpoint within this window, under the supervisor's 5 s SIGKILL grace. */
 export const RUNNER_SHUTDOWN_GRACE_MS = 4000;
@@ -59,6 +61,11 @@ export interface RunnerContext {
   /** Agent/prompt node deps; defaults to `defaultAgentNodeDeps()` (provider from the effective config). */
   agentDeps?: AgentNodeDeps;
   graceMs?: number;
+  /**
+   * Launch deps for admitting the oldest queued runs once this runner has settled/parked and released the run
+   * lock (its own still-exiting job does not count toward the pool). Omitted: no admission.
+   */
+  admitQueued?: Omit<LaunchDeps, "registry" | "exitingRunId">;
 }
 
 /** Real agent deps: the invoker (and its provider, via the app's `createProvider`) is built on first use from the run's effective config. */
@@ -85,6 +92,8 @@ export function startRunner(runId: string, ctx: RunnerContext): RunnerHandle {
     // Parks (waiting_approval) or finishes, then the runner exits; deciding a parked run relaunches it.
     const settled = await executeRun(ctx.store, runId, ctx.registry, config, controller.signal, createBackgroundHost(consent, { store: ctx.store, runId }), jobDeps, ctx.agentDeps ?? defaultAgentNodeDeps());
     await postRunNotification(ctx.store, settled);
+    // executeRun has released the run lock: hand this runner's pool slot to the oldest queued run. Best effort.
+    if (ctx.admitQueued) await admitQueuedRuns(ctx.store, { ...ctx.admitQueued, registry: ctx.registry, exitingRunId: runId }).catch(() => undefined);
     return settled;
   })();
   let shuttingDown: Promise<WorkflowRun | undefined> | undefined;
@@ -110,12 +119,14 @@ export async function runWorkflowRunner(runId: string | undefined): Promise<numb
   if (config.backgroundJobsEnabled !== true || config.workflowsEnabled !== true) throw new Error("Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.");
   applySandboxRequiredPolicy({ flagSet: false, configValue: config.sandboxRequired, detectBackend: detectSandboxBackend, setRequired: setSandboxRequired, warn: message => { process.stderr.write(message); } });
   const { getSharedCoordinator } = await import("../background-jobs-integration.js");
+  const { cliEntryPath } = await import("./background.js");
   const handle = startRunner(runId, {
     store: new WorkflowStore(),
     registry: createBuiltinToolRegistry(WORKFLOW_TOOLS),
     config,
     getCoordinator: getSharedCoordinator,
     sandboxRequired: isSandboxRequired(),
+    admitQueued: { coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns },
   });
   const onSignal = (): void => { void handle.shutdown(); };
   process.on("SIGTERM", onSignal); process.on("SIGINT", onSignal);
