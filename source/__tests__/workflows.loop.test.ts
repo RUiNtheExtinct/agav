@@ -3,9 +3,11 @@ import type { AgentInvokeRequest, AgentInvoker } from "../workflows/agent-invoke
 import type { AgentNodeDeps } from "../workflows/agent-node.js";
 import { validateDefinition, type WorkflowDefinition } from "../workflows/definition.js";
 import { readEvents } from "../workflows/events.js";
+import { cancelRun } from "../workflows/control.js";
+import { decide, listPendingDecisions } from "../workflows/decisions.js";
 import { createRun, executeRun } from "../workflows/runtime.js";
-import type { LoopNodeCheckpoint, WorkflowRun, WorkflowStore } from "../workflows/store.js";
-import { def, fakeHost, FakeCoordinator, jobDeps, registry, tempStore, testConfig } from "./helpers/workflow-fixtures.js";
+import { jobRequestId, type LoopNodeCheckpoint, type WorkflowRun, type WorkflowStore } from "../workflows/store.js";
+import { def, fakeHost, FakeCoordinator, jobDeps, registry, summary, tempStore, testConfig } from "./helpers/workflow-fixtures.js";
 
 let store: WorkflowStore, cleanup: () => Promise<void>;
 beforeEach(async () => { ({ store, cleanup } = await tempStore()); });
@@ -147,5 +149,65 @@ describe("loop execution", () => {
     expect(it0.status).toBe("passed");
     expect(it0.nodes.s!.status).toBe("skipped");
     expect(it0.nodes.s!.error).toMatch(/when is false/);
+  });
+
+  it("parks on an approval inside an iteration and continues the same iteration once approved", async () => {
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 2, onExhausted: "continue", body: [
+      { id: "ok", type: "approval", prompt: "go?" },
+      { id: "a", type: "prompt", prompt: "A${loop.index}", dependsOn: ["ok"] },
+    ] }]));
+    const inv = mockInvoker("x");
+    const parked = await execute(run.id, { inv });
+    expect(parked.status).toBe("waiting_approval");
+    expect(loopCp(parked).status).toBe("waiting_approval");
+    expect(loopCp(parked).iterations![0]!.status).toBe("waiting_approval");
+    const [first] = await listPendingDecisions(store, run.id);
+    expect(first!.iteration).toEqual([0]);
+    await decide(store, run.id, first!.decisionId, true, "tester");
+    const next = await execute(run.id, { inv });
+    // Iteration 1 asks again (decisions are keyed per iteration).
+    expect(next.status).toBe("waiting_approval");
+    expect(loopCp(next).iterations!.map(it => it.status)).toEqual(["passed", "waiting_approval"]);
+    const pending = await listPendingDecisions(store, run.id);
+    const second = pending.find(d => d.decisionId !== first!.decisionId)!;
+    expect(second.iteration).toEqual([1]);
+    await decide(store, run.id, second.decisionId, true, "tester");
+    const done = await execute(run.id, { inv });
+    expect(done.status).toBe("passed");
+    expect(inv.requests.map(r => r.task)).toEqual(["A0", "A1"]);
+  });
+
+  it("times out the loop and aborts its body", async () => {
+    const inv = mockInvoker();
+    inv.invoke = async req => { inv.requests.push(req); await new Promise(resolve => req.signal!.addEventListener("abort", resolve, { once: true })); return { text: "late", durationMs: 1 }; };
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 3, timeoutSeconds: 1, body: [check()] }]));
+    const done = await execute(run.id, { inv });
+    expect(done.status).toBe("timed_out");
+    expect(loopCp(done).status).toBe("timed_out");
+    expect(loopCp(done).error).toMatch(/Loop timed out after 1s/);
+    expect(loopCp(done).iterations![0]!.status).toBe("timed_out");
+  });
+
+  it("cancelRun stops a running job inside a loop iteration and settles the loop", async () => {
+    const coordinator = new FakeCoordinator();
+    const run = await create(def([{ id: "fix", type: "loop", maxIterations: 3, body: [{ id: "build", type: "job", command: "make" }] }]));
+    const scope = { loopPath: [{ loopId: "fix", iteration: 1 }] };
+    const requestId = jobRequestId(run.id, "build", 1, scope);
+    coordinator.jobs.set("job-7", summary(requestId, "job-7", "running"));
+    coordinator.pollStates = ["running"];
+    const t = new Date().toISOString();
+    Object.assign(loopCp(run), { status: "running", startedAt: t, iteration: 1, iterations: [
+      { index: 0, status: "passed", startedAt: t, endedAt: t, nodes: { build: { id: "build", status: "passed", job: { requestId: jobRequestId(run.id, "build", 1, { loopPath: [{ loopId: "fix", iteration: 0 }] }), jobId: "job-6" } } } },
+      { index: 1, status: "running", startedAt: t, nodes: { build: { id: "build", status: "running", startedAt: t, job: { requestId, jobId: "job-7" } } } },
+    ] });
+    run.status = "running";
+    await store.lock(run.id, () => store.save(run));
+    const cancelled = await cancelRun(store, run.id, registry, undefined, jobDeps(coordinator));
+    expect(coordinator.stops).toEqual(["job-7"]);
+    expect(cancelled.status).toBe("cancelled");
+    const cp = loopCp(cancelled);
+    expect(cp.status).toBe("cancelled");
+    expect(cp.iterations![1]).toMatchObject({ status: "cancelled", nodes: { build: { status: "cancelled" } } });
+    await expect(store.read(run.id, registry)).resolves.toBeTruthy();
   });
 });

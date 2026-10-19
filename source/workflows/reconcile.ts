@@ -25,15 +25,13 @@ export interface ReconcileResult { runId: string; action: ReconcileAction; reaso
 
 /** A running node that can neither be reattached (job) nor safely re-run (retry-safe agent/prompt) has an uncertain outcome. */
 function isUncertain(run: WorkflowRun, cp: WorkflowRun["nodes"][number]): boolean {
-  const node = run.definition.nodes.find(item => item.id === cp.id)!;
-  return cp.status === "running" && getNodeExecutor(node.type).resumable !== true && !retriesOnResume(node);
+  // Body checkpoints of loop iterations are included (ids are unique across the definition).
+  const node = scopedCheckpoints(run).find(visit => visit.cp === cp)?.node;
+  return !!node && cp.status === "running" && getNodeExecutor(node.type).resumable !== true && !retriesOnResume(node);
 }
-/**
- * The engine refuses to replay an uncertain node, at top level or inside a loop iteration. (A running loop node
- * itself is resumable; an uncertain body node is failed closed by the loop on resume, so only top-level ones park.)
- */
+/** The engine refuses to replay an uncertain node, at top level or inside a loop iteration (a running loop node itself is resumable). */
 function hasUncertainNode(run: WorkflowRun): boolean {
-  return scopedCheckpoints(run).some(({ cp, node }) => cp.status === "running" && getNodeExecutor(node.type).resumable !== true && !retriesOnResume(node));
+  return scopedCheckpoints(run).some(({ cp }) => isUncertain(run, cp));
 }
 
 function isLockHeld(error: unknown): boolean { return error instanceof BackgroundJobError && error.code === "lock-held"; }
