@@ -391,6 +391,24 @@ export function decisionDetailLines(decision: PendingDecision, run?: WorkflowRun
   return lines;
 }
 
+const CONFIRM_NOUNS: Record<string, string> = { approval: "approval", tool_consent: "tool call", agent_tool_consent: "tool call", job_start: "job start", uncertain_tool: "uncertain tool" };
+
+/**
+ * The short approve/deny confirmation: the action as a question, the prompt, the workflow + short run id and, for
+ * tool decisions, the tool call. The full detail (directory, mode, decision id, input) stays in `decisionDetailLines`.
+ */
+export function decisionConfirmLines(decision: PendingDecision, run: WorkflowRun | undefined, approve: boolean): string[] {
+  const iteration = decision.iteration?.length ? `#${decision.iteration.map((i) => i + 1).join(".")}` : "";
+  const lines = [
+    `${approve ? "Approve" : "Deny"} this ${CONFIRM_NOUNS[decision.kind] ?? decision.kind}?`,
+    truncateOutput(decision.summary, 100),
+    `Run: ${run ? `${run.definition.name} ` : ""}${shortId(decision.runId)} · node ${decision.nodeId}${iteration}`,
+  ];
+  if (decision.resolved) lines.push(`Tool call: ${decision.resolved.toolName} ${truncateOutput(decision.resolved.input, 80)}`);
+  else if (decision.kind === "approval") lines.push("This does not grant tool permissions.");
+  return lines;
+}
+
 export function createInboxAdapter(deps: Pick<WorkflowResourceDeps, "store" | "registry">): ResourceAdapter {
   const runCache = async (ids: string[]) => {
     const runs = new Map<string, WorkflowRun>();

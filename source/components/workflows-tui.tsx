@@ -3,9 +3,10 @@ import { Box, Text, useInput, usePaste, useStdout } from "../ink/index.js";
 import { ResourceManager, type ResourceAction } from "./resource-manager.js";
 import WorkflowConsent from "./workflow-consent.js";
 import type { AgavConfig } from "../config/config.js";
+import type { ClipboardNotice } from "../ink/termio/clipboard.js";
 import type { ResourceItem } from "../resources/types.js";
 import {
-  cancelWorkflowRun, createInboxAdapter, createRunsAdapter, createWorkflowsAdapter, decideWorkflowDecision, decisionDetailLines,
+  cancelWorkflowRun, createInboxAdapter, createRunsAdapter, createWorkflowsAdapter, decideWorkflowDecision, decisionConfirmLines,
   formatRunLogs, inputFields, loadWorkflow, parseInputValues, pendingDecisionFor, prepareWorkflowLaunch, resumeWorkflowRun,
   startWorkflowRun, validateWorkflow, workflowActivity, type WorkflowResourceDeps,
 } from "../resources/workflow-adapters.js";
@@ -36,8 +37,8 @@ export function defaultWorkflowResourceDeps(config: WorkflowsTUIProps["config"])
 export const WORKFLOW_TABS = ["workflows", "runs", "inbox"] as const;
 export type WorkflowTab = typeof WORKFLOW_TABS[number];
 const TAB_LABELS: Record<WorkflowTab, string> = { workflows: "Workflows", runs: "Runs", inbox: "Inbox" };
-/** The shared confirmation footer (jobs TUI, consent prompt). */
-export const CONFIRM_CONTROLS = "y: Approve · n/ESC: Deny";
+/** Footer for a confirmation that names the chosen action, so `n/ESC` never reads as the action itself. */
+export function confirmControls(yes: string, no = "Go back"): string { return `y: Yes, ${yes} · n/ESC: ${no}`; }
 const RUN_REFRESH_MS = 1000;
 const BADGE_POLL_MS = 5000;
 const RESUMABLE = new Set(["interrupted", "waiting_approval", "queued", "pending"]);
@@ -45,6 +46,9 @@ const RESUMABLE = new Set(["interrupted", "waiting_approval", "queued", "pending
 export interface WorkflowsTUIProps {
   onExit(): void;
   config: Pick<AgavConfig, "permissionMode" | "maxConcurrentWorkflowRuns">;
+  /** Height available for the overlay within the app footer. */
+  height?: number;
+  copyNotice?: ClipboardNotice | null;
   /** Store, registry, coordinator and paths (tests pass fakes); defaults to the app's real ones. */
   deps?: WorkflowResourceDeps;
   initialTab?: WorkflowTab;
@@ -58,6 +62,7 @@ export interface WorkflowsTUIProps {
 interface PendingConfirmation {
   prompt: string;
   lines: string[];
+  controls: string;
   resolve(ok: boolean): void;
 }
 
@@ -96,7 +101,7 @@ function InputForm({ stage, onChange, onSubmit, onCancel }: {
   </Box>;
 }
 
-export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "workflows", reconcileRuns }: WorkflowsTUIProps) {
+export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "workflows", reconcileRuns, height: availableHeight, copyNotice }: WorkflowsTUIProps) {
   // Stable across parent renders so adapters (and their refresh timers) are not recreated.
   const deps = useMemo(() => provided ?? defaultWorkflowResourceDeps(config), [provided, config.permissionMode, config.maxConcurrentWorkflowRuns]);
   const [tab, setTab] = useState<WorkflowTab>(initialTab);
@@ -143,19 +148,30 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
     pending.resolve(answer === "y");
   });
 
-  const confirm = (prompt: string, lines: string[]) => new Promise<boolean>((resolve) => setPending({ prompt, lines, resolve }));
+  const confirm = (lines: string[], controls: string) => new Promise<boolean>((resolve) => setPending({ prompt: lines[0] ?? "", lines, controls, resolve }));
 
   /** Approve/deny one decision through the shared confirmation layout; returns the status text. */
   const decideWithConfirm = async (runId: string, decisionId: string, approve: boolean): Promise<string> => {
     const decision = await pendingDecisionFor(deps.store, runId, decisionId);
     if (!decision) throw new Error("That decision is no longer pending.");
     const run = await deps.store.read(runId, deps.registry).catch(() => undefined);
-    const verb = approve ? "Approve" : "Deny";
-    const ok = await confirm(`${verb} ${decision.kind} on ${decision.nodeId} (run ${shortId(runId)})? ${CONFIRM_CONTROLS}`, [`${verb}:`, ...decisionDetailLines(decision, run)]);
+    const ok = await confirm(decisionConfirmLines(decision, run, approve), confirmControls(approve ? "approve" : "deny"));
     if (!ok) return "Not decided.";
     const summary = await decideWorkflowDecision(deps, runId, decisionId, approve);
     void workflowActivity(deps.store).then(({ needApproval }) => { if (mounted.current) setInboxCount(needApproval); }).catch(() => {});
     return summary;
+  };
+
+  /** Cancel one run after a short y/n confirmation; returns the status text. */
+  const cancelWithConfirm = async (runId: string): Promise<string> => {
+    const run = await deps.store.read(runId, deps.registry).catch(() => undefined);
+    const ok = await confirm([
+      "Cancel this run?",
+      `Run: ${run ? `${run.definition.name} ` : ""}${shortId(runId)}`,
+      "Its runner and jobs are stopped.",
+    ], confirmControls("cancel run", "Keep running"));
+    if (!ok) return "Not cancelled.";
+    return cancelWorkflowRun(deps, runId);
   };
 
   /** Inputs (when typed) → consent with env checklist → background launch → Runs tab. */
@@ -210,7 +226,7 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
   if (tab === "runs") {
     const decisionOf = (item: ResourceItem) => item.values?.decisionId;
     actions.push(
-      { key: "x", label: "Cancel", inDetail: true, confirm: "The run's runner and jobs are stopped.", when: (item) => item.stoppable === true, run: async (item: Target) => item ? cancelWorkflowRun(deps, item.id) : undefined },
+      { key: "x", label: "Cancel", inDetail: true, when: (item) => item.stoppable === true, run: async (item: Target) => item ? cancelWithConfirm(item.id) : undefined },
       { key: "a", label: "Approve", hint: "a/D: Approve/Deny", inDetail: true, when: (item) => Boolean(decisionOf(item)), run: async (item: Target) => item ? decideWithConfirm(item.id, decisionOf(item)!, true) : undefined },
       { key: "D", label: "Deny", hint: "", inDetail: true, when: (item) => Boolean(decisionOf(item)), run: async (item: Target) => item ? decideWithConfirm(item.id, decisionOf(item)!, false) : undefined },
       { key: "l", label: "Logs", run: async (item: Target) => item ? { detail: await formatRunLogs(deps.store, deps.registry, item.id) } : undefined },
@@ -230,8 +246,12 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
   if (stage?.kind === "inputs") return <InputForm stage={stage} onChange={setStage} onSubmit={submitInputs} onCancel={() => { setStage(null); setNotice("Run cancelled."); }} />;
   if (stage?.kind === "consent") return <WorkflowConsent request={stage.prepared.request} onDecide={(envNames) => onConsent(stage.prepared, envNames)} />;
 
-  const extraRows = 1 + (notice ? 1 : 0);
-  const height = Math.max(8, (stdout.rows || 24) - 2 - extraRows);
+  const extraRows = 1 + (notice ? 1 : 0) + (copyNotice ? 1 : 0);
+  // The standalone TUI reserves the terminal's two edge rows, but the app-provided
+  // height is already the overlay's usable area. Only budget its tab and notice rows.
+  const height = availableHeight === undefined
+    ? Math.max(8, (stdout.rows || 24) - 2 - extraRows)
+    : Math.max(2, availableHeight - extraRows);
   return <Box flexDirection="column">
     <Text>{WORKFLOW_TABS.map((t, i) => <Text key={t} color={t === tab ? "cyan" : undefined} bold={t === tab} dimColor={t !== tab}>{i ? " │ " : ""}{tabLabel(t)}</Text>)}</Text>
     {notice && <Text color="yellow" wrap="truncate-end">{notice}</Text>}
@@ -244,7 +264,8 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
       refreshIntervalMs={tab === "workflows" ? undefined : RUN_REFRESH_MS}
       emptyText={tab === "inbox" ? "No pending decisions." : undefined}
       prompt={pending?.prompt}
-      promptDetails={pending ? { lines: pending.lines, controls: CONFIRM_CONTROLS } : undefined}
+      promptDetails={pending ? { lines: pending.lines, controls: pending.controls } : undefined}
     />
+    {copyNotice && <Text color={copyNotice === "Copied to clipboard" ? "green" : "cyan"}>{copyNotice === "Copied to clipboard" ? "✓ " : ""}{copyNotice}</Text>}
   </Box>;
 }

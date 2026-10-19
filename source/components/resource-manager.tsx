@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
-import { Box, Text, ScrollBox, useInput, usePaste, useStdout } from "../ink/index.js";
-import type { ScrollBoxControls } from "../ink/index.js";
+import { Box, Text, ScrollBox, useInput, usePaste, useStdout, measureElement } from "../ink/index.js";
+import type { DOMElement, ScrollBoxControls } from "../ink/index.js";
 import type { ResourceAdapter, ResourceItem } from "../resources/types.js";
 import { filterResources, resourcePage } from "../resources/types.js";
 import { useSearch, SearchBar } from "./agents-search.js";
@@ -61,6 +61,8 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
   const [promptOffset, setPromptOffset] = useState(Number.POSITIVE_INFINITY);
   const { searchQuery, searching, handleSearchKey, handleSearchPaste } = useSearch();
   const availableRows = height ?? Math.max(8, rows - 2);
+  const scrollSlotRef = useRef<DOMElement | null>(null);
+  const [scrollHeight, setScrollHeight] = useState(Math.max(2, availableRows - 8));
   const columns = Math.max(1, stdout.columns || 80);
   const filtered = filterResources(items, searchQuery);
   const actionApplies = (a: ResourceAction, target: ResourceItem | undefined) => !a.when || (target !== undefined && a.when(target));
@@ -118,6 +120,17 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
   const promptRows = detailLines ? Math.min(promptContentRows, Math.max(3, Math.floor((availableRows - 7) / 2))) : 0;
   const promptOverflows = promptContentRows > promptRows;
   const promptExtraRows = promptRows + (promptOverflows ? 1 : 0);
+  const detailContentRows = view === "detail" && detail?.detail
+    ? wrapText(detail.detail, columns, "wrap").split("\n").length
+    : 1;
+  useEffect(() => {
+    const availableContent = Math.max(2, availableRows - 7 - promptExtraRows - (view === "list" ? hintExtraRows : 0));
+    const measuredHeight = measureElement(scrollSlotRef.current).height;
+    const nextHeight = view === "detail"
+      ? Math.max(2, Math.min(detailContentRows, availableContent))
+      : Math.max(2, measuredHeight || availableContent);
+    if (nextHeight !== scrollHeight) setScrollHeight(nextHeight);
+  });
   useEffect(() => { setPromptOffset(Number.POSITIVE_INFINITY); }, [prompt]);
   // Latest render state for the refresh timer, which outlives individual renders.
   const live = useRef({ view, detail, itemId: item?.id, searchQuery, detailFromGet: false });
@@ -284,8 +297,8 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
   })}>
     <Text bold color="cyan">{adapter.title} · {view === "list" ? "List" : view === "detail" ? "Inspect" : view}</Text>
     {view === "list" && <SearchBar query={searchQuery} searching={searching} resultCount={filtered.length} itemLabel="resource" />}
-    <Box flexGrow={1} flexShrink={1} flexDirection="column">
-      <ScrollBox key={view} height={Math.max(2, availableRows - 7 - promptExtraRows - hintExtraRows)} controls={scroll} scrollOffset={scrollOffset} onScrollChange={(offset) => {
+    <Box ref={scrollSlotRef} flexGrow={view === "detail" ? 0 : 1} flexShrink={1} flexDirection="column">
+      <ScrollBox key={view} height={Math.max(2, Math.min(scrollHeight, view === "detail" ? detailContentRows : scrollHeight))} controls={scroll} scrollOffset={scrollOffset} onScrollChange={(offset) => {
         // A fresh viewport first measures zero rows. Keep the top sentinel until
         // its content is measured instead of pinning the new detail to the bottom.
         if (Number.isFinite(scrollOffset) || offset > 0) setScrollOffset(offset);

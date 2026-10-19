@@ -6,7 +6,7 @@ import { ResourceManager } from "../components/resource-manager.js";
 import type { ResourceAdapter, ResourceItem } from "../resources/types.js";
 import { filterResources, resourcePage } from "../resources/types.js";
 
-async function mount(overrides: Partial<ResourceAdapter> = {}, props: { refreshIntervalMs?: number } = {}) {
+async function mount(overrides: Partial<ResourceAdapter> = {}, props: { refreshIntervalMs?: number; height?: number } = {}) {
   let items: ResourceItem[] = Array.from({ length: 12 }, (_, i) => ({ id: String(i), title: `Item ${i}`, description: `Description ${i}`, detail: `Full detail ${i}`, enabled: true, removable: true }));
   const adapter: ResourceAdapter = {
     title: "Test resources",
@@ -64,6 +64,18 @@ describe("shared resource manager", () => {
       expect(ui.output()).toContain("Page 1/2");
       await ui.key("\x1b");
       expect(ui.onExit).toHaveBeenCalledOnce();
+    } finally { ui.instance.unmount(); }
+  });
+
+  it("keeps short inspection output compact instead of stretching it to the full TUI height", async () => {
+    const entry = { id: "short", title: "Short", description: "desc", detail: "JOB OUTPUT START\nerror: failed\nJOB OUTPUT END" };
+    const ui = await mount({ list: vi.fn(async () => [entry]), get: vi.fn(async () => entry) });
+    try {
+      await ui.key("\r");
+      const frame = ui.output().replaceAll(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").split("Test resources · Inspect").at(-1) ?? "";
+      expect(frame).toContain("JOB OUTPUT START");
+      expect(frame).toContain("↑↓: Scroll");
+      expect(frame.trimEnd().split("\n").length).toBeLessThan(10);
     } finally { ui.instance.unmount(); }
   });
 

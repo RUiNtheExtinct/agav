@@ -876,6 +876,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
 
   /** Reserve a few global shortcuts for cancellation and tool/subagent inspection. */
   useInput((rawChar, rawKey) => {
+    if (workflowsTUI) return; // The full-screen workflow view owns the keyboard.
     if (voice.isActive()) {
       const { input: char, key } = normalizeKeyEvent(rawChar, rawKey);
       if (key.eventType === "release" || key.eventType === "repeat") return;
@@ -1550,6 +1551,28 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
     docControls.current?.scrollBy(event.direction === "up" ? step : -step);
   }, [documentHeight]);
 
+  const statusHint = useMemo(() => getRandomHint(keybindings, enhancedKeyboard), [messages.length, keybindings, enhancedKeyboard]);
+
+  // Workflows owns the entire frame, not the home footer. Keeping the document
+  // mounted behind it leaves the banner and status bar visible above/below it.
+  if (workflowsTUI) return (
+    <Box flexDirection="column" height={termRows}>
+      <workflowsTUI.WorkflowsTUI
+        config={config}
+        height={termRows}
+        copyNotice={copyNotice}
+        onExit={() => {
+          setWorkflowsTUI(null);
+          setPickerActive(false);
+          setInput("");
+          const resolve = workflowsTUIResolveRef.current;
+          workflowsTUIResolveRef.current = null;
+          resolve?.();
+        }}
+      />
+    </Box>
+  );
+
   return (
     // Pinned to the terminal height so the frame can never grow past the screen
     // even while a measurement is still settling.
@@ -1822,20 +1845,6 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
           />
         )}
 
-        {workflowsTUI && (
-          <workflowsTUI.WorkflowsTUI
-            config={config}
-            onExit={() => {
-              setWorkflowsTUI(null);
-              setPickerActive(false);
-              setInput("");
-              const resolve = workflowsTUIResolveRef.current;
-              workflowsTUIResolveRef.current = null;
-              resolve?.();
-            }}
-          />
-        )}
-
         {resourceAdapter && (
           <ResourceManager adapter={resourceAdapter} onExit={() => {
             setResourceAdapter(null);
@@ -1972,7 +1981,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
           outputTokens={tokenUsage.outputTokens}
           cacheReadTokens={tokenUsage.cacheReadTokens}
           cacheWriteTokens={tokenUsage.cacheWriteTokens}
-          hint={useMemo(() => getRandomHint(keybindings, enhancedKeyboard), [messages.length, keybindings, enhancedKeyboard])}
+          hint={statusHint}
           psResponse={psResponse}
           psLoading={psLoading}
           loopStatus={(() => { const ls = getLoopStatus(); return ls ? `⟳ Loop: "${ls.prompt}" every ${ls.interval} (tick #${ls.tickCount})` : undefined; })()}
