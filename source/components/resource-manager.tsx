@@ -23,7 +23,7 @@ export interface ResourceAction {
   run(item: ResourceItem | undefined): void | string | ResourceActionView | Promise<void | string | ResourceActionView>;
 }
 
-export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, height, prompt, promptDetails }: {
+export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, height, prompt, promptDetails, refreshIntervalMs }: {
   adapter: ResourceAdapter;
   onExit(): void;
   actions?: ResourceAction[];
@@ -33,6 +33,8 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
   prompt?: string;
   /** Full terms for `prompt`; they scroll above the always-visible `controls` line, which replaces `prompt`. */
   promptDetails?: { lines: string[]; controls: string };
+  /** Re-list (and re-fetch an inspected item) on this interval, keeping the selection and detail scroll. */
+  refreshIntervalMs?: number;
 }) {
   const [items, setItems] = useState<ResourceItem[]>([]);
   const [index, setIndex] = useState(0);
@@ -93,6 +95,9 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
   const promptOverflows = promptContentRows > promptRows;
   const promptExtraRows = promptRows + (promptOverflows ? 1 : 0);
   useEffect(() => { setPromptOffset(Number.POSITIVE_INFINITY); }, [prompt]);
+  // Latest render state for the refresh timer, which outlives individual renders.
+  const live = useRef({ view, detail, itemId: item?.id, searchQuery, detailFromGet: false });
+  live.current = { ...live.current, view, detail, itemId: item?.id, searchQuery };
 
   const reload = async () => {
     const loaded = await adapter.list();
@@ -112,6 +117,33 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
     void run(reload);
     return () => { mounted.current = false; };
   }, [adapter]);
+  useEffect(() => {
+    if (!refreshIntervalMs || refreshIntervalMs <= 0) return;
+    let refreshing = false;
+    const timer = setInterval(() => {
+      const state = live.current;
+      // Never race a user operation, a form or a pending confirmation.
+      if (refreshing || busyRef.current || (state.view !== "list" && state.view !== "detail")) return;
+      refreshing = true;
+      void (async () => {
+        try {
+          const loaded = await adapter.list();
+          if (!mounted.current) return;
+          setItems(loaded);
+          // Keep the same item selected even when new items are inserted above it.
+          const at = state.itemId === undefined ? -1 : filterResources(loaded, state.searchQuery).findIndex((entry) => entry.id === state.itemId);
+          setIndex((i) => at >= 0 ? at : Math.min(i, Math.max(0, loaded.length - 1)));
+          if (state.view === "detail" && state.detailFromGet && state.detail?.id) {
+            const fresh = await adapter.get(state.detail.id);
+            // Only replace the detail that is still open; a vanished item keeps its last snapshot.
+            if (fresh && mounted.current && live.current.view === "detail" && live.current.detail?.id === fresh.id) setDetail(fresh);
+          }
+        } catch { /* transient refresh failures keep the last snapshot */ }
+        finally { refreshing = false; }
+      })();
+    }, refreshIntervalMs);
+    return () => clearInterval(timer);
+  }, [adapter, refreshIntervalMs]);
   useEffect(() => {
     const resize = () => setRows(stdout.rows || 24);
     stdout.on("resize", resize);
@@ -194,6 +226,7 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
     else if ((key.return || input === "i") && item) void run(async () => {
       const loaded = await adapter.get(item.id);
       if (!loaded) { await reload(); throw new Error("Resource no longer exists."); }
+      live.current.detailFromGet = true;
       setDetail(loaded); setScrollOffset(Number.POSITIVE_INFINITY); setView("detail");
     });
     else if (input === "r") void run(reload);
@@ -209,7 +242,8 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
       else if (action) void run(async () => {
         const result = await action.run(item);
         if (result && typeof result === "object" && mounted.current) {
-          // A report, not the item itself: never offer delete/stop on it.
+          // A report, not the item itself: never offer delete/stop on it, and never refresh it.
+          live.current.detailFromGet = false;
           setDetail({ ...(item ?? { id: "", title: "", description: "" }), detail: result.detail, removable: false, stoppable: false });
           setScrollOffset(Number.POSITIVE_INFINITY);
           setView("detail");
