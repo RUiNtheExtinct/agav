@@ -122,10 +122,6 @@ Also export a few env vars so the checklist has entries: `export WF_SECRET_A=aaa
 
 **Cleanup:** on the Runs tab select the finished run, press `d`, then `y`. `rm /var/tmp/wf-testing/m1-out.txt`.
 
-**Results:** The workflow failed after 4 attempts because the job failed with error - "error: unknown flag --internal-workflow-runner
-
-**Root cause (orchestrator):** the standalone binary re-executed itself with a virtual entry path; not a setup problem. Fixed in e9ec5a97. Rebuild the binary (command in Setup) and re-run M1 from step 1; delete the failed run first (Runs tab, d).
-
 ## M2. TUI cancel, deny and the status bar badge
 
 **Goal:** Cancel a running run, and approve or deny parked approvals from the Runs tab and the Inbox tab; check the status bar badge.
@@ -598,13 +594,17 @@ nodes:
 **Steps:**
 
 1. - [ ] Start. `rm -f m9-*.txt`, then `agav workflows run m9-consent` (answer `none`, `y`). Within a few seconds `agav workflows inbox` shows an `approval` line on `arm`. Note the run's id8.
-2. - [ ] Drop the tool from the consent. The runner has exited (the run is parked), so the checkpoint is safe to edit:
+2. - [ ] Drop the tool from the consent. The runner has exited (the run is parked), so the checkpoint is safe to edit. The checkpoint is `<runId>.json` **next to** the run directory `<runId>/`, not inside it (the directory holds only `decisions/`, `events.jsonl` and `artifacts/`), so `ls <runId>/*.json` fails with `No such file or directory`. Use the id8 glob, or the full id without a slash:
 
    ```sh
-   F=$(ls $HOME/.agav/workflow-runs/<id8>*.json)
-   jq '.consent.capabilities' "$F"        # {"tools":["write_file"],"jobCommands":[]}
+   F=$(ls $HOME/.agav/workflow-runs/<id8>*.json)     # = $HOME/.agav/workflow-runs/<full-run-id>.json
+   jq -c '.consent.capabilities' "$F"     # {"tools":["write_file"],"jobCommands":[]}
    jq '.consent.capabilities.tools = []' "$F" > "$F.tmp" && mv "$F.tmp" "$F"
+   jq -c '.consent.capabilities' "$F"     # {"tools":[],"jobCommands":[]}
+   agav workflows status <id8>            # still prints the tree (`◐ waiting_approval`), no `Invalid`/`Corrupt workflow checkpoint`
    ```
+
+   Edit only `consent.capabilities.tools`. On read the store requires `consent.definitionHash` to equal the run's `workflowHash` and `consent.cwd` to equal the run's `cwd`, and the consent object must keep exactly its known fields, so do not touch those or add keys. The `.tmp` file must be gone after the `mv`.
 3. - [ ] Release the run. `agav workflows approve <id8> arm`. The output ends `runner started (attempt 2).` After a few seconds the run is `waiting_approval` again (not `failed`), with `same` ◐ in iteration 1 and `changing` pending.
 4. - [ ] Inspect in the TUI. `/workflows` → Inbox. The item reads `◐ same · m9-consent <id8>`, kind `tool consent`. The detail shows `tool consent on same (iteration 1)`, `Directory:` and `Permission mode: ask`, the summary `Allow write_file in node same?`, then `Tool: write_file  (input #<12 hex>)` and the full input JSON: `"path": "m9-same.txt"`, `"content": "constant"`. The last line reads `Approving allows identical calls (same tool and resolved input) of this node for the rest of the run.`
 5. - [ ] Approve in the TUI. Press `a`, then `y`. `cat m9-same.txt` prints `constant`. The Inbox now holds a new item for node `changing` (iteration 1) whose JSON input has `"content": "round 0"`.
@@ -664,9 +664,9 @@ nodes:
 
 ## M11. Timeouts and the run deadline
 
-**Goal:** `timeoutSeconds` stops a slow tool node and a slow job node (the child process is really gone), `policies.maxRuntimeSeconds` makes the whole run `timed_out`, and an approval node never times out (the schema rejects `timeoutSeconds` on it).
+**Goal:** `timeoutSeconds` stops a slow tool node and a slow job node (the child process is really gone), `policies.maxRuntimeSeconds` makes the whole run `timed_out`, and an approval node never times out (`m11-approval-wait` stays parked; a definition that puts `timeoutSeconds` on an approval node is rejected before anything runs, which step 2 checks as a negative test).
 
-**Prerequisites:** four workflows in `.agav/workflows/`. `m11-tool-timeout.yaml`
+**Prerequisites:** five files in `.agav/workflows/`: four valid workflows (`m11-tool-timeout`, `m11-job-timeout`, `m11-deadline`, `m11-approval-wait`) and one deliberately **invalid** one (`m11-approval-timeout`, used only by step 2). `m11-tool-timeout.yaml`
 
 ```yaml
 version: 1
@@ -716,7 +716,7 @@ nodes:
     prompt: Waits until a human decides.
 ```
 
-and `m11-approval-timeout.yaml`, which must **fail** validation
+and `m11-approval-timeout.yaml`, the **negative-test** file (invalid on purpose; it is never expected to run, and no other step uses it):
 
 ```yaml
 version: 1
@@ -732,16 +732,17 @@ Before you start, make sure no stray `sleep` from earlier tests is running: `ps 
 
 **Steps:**
 
-1. - [ ] Validate. The first four print `Workflow valid.`. `agav workflows validate m11-approval-timeout` fails with `Approval nodes do not support timeoutSeconds (approvals wait until decided): gate`.
-2. - [ ] Tool timeout. `agav workflows run m11-tool-timeout --wait` (answer `none`, `y`). While it runs (in a second terminal), `ps -eo pid,args | grep '[s]leep 30'` shows the `sleep 30`. After about 3 s the node shows `⏱ slow: timed_out` (error `Command failed: Command cancelled.`) and the run ends `⏱ timed_out` after about 4 s. The `ps` check is empty a moment later.
-3. - [ ] Job timeout. `agav workflows run m11-job-timeout` (answer `none`, `y`, no `--wait`). Within 2 s `ps -eo pid,args | grep '[s]leep 300'` shows `/bin/sh -c sleep 300` and `sleep 300`. After about 6 s, `agav workflows status <id8>` shows `⏱ slowjob: timed_out — Timed out after 5s; the job was stopped. Job <jobId> was interrupted.` The `ps` check prints nothing: the child job was stopped, not just abandoned. In agav, `/job list` shows that job as `interrupted`.
-4. - [ ] Run deadline. `agav workflows run m11-deadline --wait`. After about 8 s the node shows `⏱ slowjob: timed_out — Run deadline exceeded (policies.maxRuntimeSeconds=8). Job <jobId> was interrupted.` and the run ends `⏱ timed_out` (about 9–10 s). `ps -eo pid,args | grep '[s]leep 300'` prints nothing. The last line of `$HOME/.agav/workflow-runs/<runId>/events.jsonl` has `"status":"timed_out"` and `"reason":"run deadline exceeded"`.
-5. - [ ] Approval never times out. `agav workflows run m11-approval-wait` (answer `none`, `y`). Wait at least 60 s. `agav workflows list` still shows `◐ ... waiting_approval`, and the Inbox still holds the `approval` item. Approve it: the run ends `✓ passed`. (With no `maxRuntimeSeconds` there is no deadline to hit.)
-6. - [ ] Status bar and TUI glyphs. In the TUI Runs tab the timed-out runs show the `⏱` glyph and the status `timed_out`, and the run notification `... timed out` was shown once.
+1. - [ ] Validate the four valid workflows. `agav workflows validate m11-tool-timeout`, `m11-job-timeout`, `m11-deadline` and `m11-approval-wait` each print `Workflow valid.` and exit 0 (`echo $?`).
+2. - [ ] Negative test: an approval node with `timeoutSeconds` is rejected. This step is expected to **fail**; a failure here is the pass. (a) `agav workflows validate m11-approval-timeout; echo "exit=$?"` prints exactly `error: Approval nodes do not support timeoutSeconds (approvals wait until decided): gate` and `exit=1`, and never `Workflow valid.`. (b) In the real terminal, `agav workflows run m11-approval-timeout; echo "exit=$?"` prints the same `error: ...` line and `exit=1`. The definition is validated before consent: no consent summary, no env checklist and no `Approve this background run?` question appear, so there is nothing to answer. (c) `agav workflows list` shows no run for `m11-approval-timeout`, `ls $HOME/.agav/workflow-runs` has no new `<uuid>.json` or directory, and `pgrep -af internal-workflow-runner | grep m11-approval-timeout` prints nothing.
+3. - [ ] Tool timeout. `agav workflows run m11-tool-timeout --wait` (answer `none`, `y`). While it runs (in a second terminal), `ps -eo pid,args | grep '[s]leep 30'` shows the `sleep 30`. After about 3 s the node shows `⏱ slow: timed_out` (error `Command failed: Command cancelled.`) and the run ends `⏱ timed_out` after about 4 s. The `ps` check is empty a moment later.
+4. - [ ] Job timeout. `agav workflows run m11-job-timeout` (answer `none`, `y`, no `--wait`). Within 2 s `ps -eo pid,args | grep '[s]leep 300'` shows `/bin/sh -c sleep 300` and `sleep 300`. After about 6 s, `agav workflows status <id8>` shows `⏱ slowjob: timed_out — Timed out after 5s; the job was stopped. Job <jobId> was interrupted.` The `ps` check prints nothing: the child job was stopped, not just abandoned. In agav, `/job list` shows that job as `interrupted`.
+5. - [ ] Run deadline. `agav workflows run m11-deadline --wait`. After about 8 s the node shows `⏱ slowjob: timed_out — Run deadline exceeded (policies.maxRuntimeSeconds=8). Job <jobId> was interrupted.` and the run ends `⏱ timed_out` (about 9–10 s). `ps -eo pid,args | grep '[s]leep 300'` prints nothing. The last line of `$HOME/.agav/workflow-runs/<runId>/events.jsonl` has `"status":"timed_out"` and `"reason":"run deadline exceeded"`.
+6. - [ ] Approval never times out. `agav workflows run m11-approval-wait` (answer `none`, `y`). Wait at least 60 s. `agav workflows list` still shows `◐ ... waiting_approval`, and the Inbox still holds the `approval` item. Approve it: the run ends `✓ passed`. (With no `maxRuntimeSeconds` there is no deadline to hit.)
+7. - [ ] Status bar and TUI glyphs. In the TUI Runs tab the timed-out runs show the `⏱` glyph and the status `timed_out`, and the run notification `... timed out` was shown once.
 
-**Expected:** each `timed_out` run ends within a second or two of its limit; no `sleep` process outlives its node; the approval waits without any timeout; the approval-with-timeout file is rejected by the schema.
+**Expected:** each `timed_out` run ends within a second or two of its limit; no `sleep` process outlives its node; the approval (`m11-approval-wait`) waits without any timeout; the negative-test file `m11-approval-timeout` is rejected by `validate` and by `run` (exit 1, same message, no consent prompt, no run created).
 
-**Failure signal:** a run that should time out ends `failed` or `cancelled`; a `sleep 30` or `sleep 300` process is still alive 15 s after the run ended (check with `ps`); a job stays `running` in `/job list`; the approval run changes state on its own; `m11-approval-timeout` validates.
+**Failure signal:** a run that should time out ends `failed` or `cancelled`; a `sleep 30` or `sleep 300` process is still alive 15 s after the run ended (check with `ps`); a job stays `running` in `/job list`; the approval run changes state on its own; `m11-approval-timeout` validates, or `run` on it shows a consent prompt or creates a run.
 
 **Cleanup:** `ps -eo pid,args | grep '[s]leep 30'` should be empty (if not, stop the leftover job with `/job stop <id>` rather than `kill`ing blindly); delete the runs (`d`, `y` in the TUI).
 
