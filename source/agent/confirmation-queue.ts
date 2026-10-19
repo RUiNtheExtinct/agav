@@ -25,13 +25,21 @@ export class ConfirmationQueue {
     this.setPending = setPending;
   }
 
-  enqueue(item: Omit<QueuedConfirmation, "resolve">): Promise<ConfirmResult> {
+  /** `signal` withdraws the prompt: aborting resolves it as "no" and removes it from display/queue. */
+  enqueue(item: Omit<QueuedConfirmation, "resolve">, signal?: AbortSignal): Promise<ConfirmResult> {
     if (this.autoAccept && item.toolName !== "run_background_job" && !item.explicitApprovalOnly) {
       return Promise.resolve("always" as ConfirmResult);
     }
+    if (signal?.aborted) return Promise.resolve("no" as ConfirmResult);
 
-    return new Promise<ConfirmResult>((resolve) => {
+    return new Promise<ConfirmResult>((settle) => {
+      const onAbort = (): void => this.withdraw(entry);
+      const resolve = (choice: ConfirmResult): void => {
+        signal?.removeEventListener("abort", onAbort);
+        settle(choice);
+      };
       const entry: QueuedConfirmation = { ...item, resolve };
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       if (!this.activeItem) {
         this.show(entry);
@@ -41,7 +49,9 @@ export class ConfirmationQueue {
     });
   }
 
-  resolve(choice: ConfirmResult): ConfirmResult | undefined {
+  /** `expected` is the prompt the caller answered; if a different prompt is displayed now, nothing is resolved. */
+  resolve(choice: ConfirmResult, expected?: { readonly resolve: unknown }): ConfirmResult | undefined {
+    if (expected && expected !== this.activeItem) return undefined;
     if (this.activeItem) {
       // These approvals are one-shot: they must not be satisfied or widened by
       // a blanket approval intended for another tool.
@@ -63,6 +73,21 @@ export class ConfirmationQueue {
 
       this.dequeue();
       return choice;
+    }
+  }
+
+  /** Resolve a withdrawn (aborted) confirmation as "no", wherever it is. */
+  private withdraw(entry: QueuedConfirmation): void {
+    if (this.activeItem === entry) {
+      this.activeItem = null;
+      entry.resolve("no");
+      this.dequeue();
+      return;
+    }
+    const index = this.queue.indexOf(entry);
+    if (index !== -1) {
+      this.queue.splice(index, 1);
+      entry.resolve("no");
     }
   }
 

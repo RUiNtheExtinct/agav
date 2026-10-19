@@ -2,7 +2,7 @@
 
 **Orchestrator:** Agav. All implementation is delegated to subagents.
 **Source of truth:** `docs/design/workflow-plan.md` and `docs/design/workflow-roadmap.md`. Supporting docs are in `docs/design/`.
-**Last updated:** Step 1 (analysis) complete.
+**Last updated:** Step 4 (final report) complete.
 
 ## Model selection
 
@@ -50,6 +50,52 @@ Models available for subagents, cheapest first (from the project memory `availab
 | 5 | Workflows TUI and output: adapters, workflows-tui, format, refreshIntervalMs, badge, short ids, --json | 2 (Runs/Inbox), 4 (live loop) | done | session model | 5a 914838bf (format.ts, resolveRunId short ids, human-readable CLI/slash output, --json keeps the old shape; 346 workflow tests). 5b 39c81166, c1e54a54, cfbb5173 (refreshIntervalMs, Workflows/Runs/Inbox adapters, workflows-tui with tabs, consent + env checklist on R, simple field editor, status badge; 424 tests in the targeted set). Typecheck has only the 2 pre-existing errors. Skipped: graph editor (parked), `n` scaffold, `$EDITOR`, `g` revoke grant, approve/deny note. Not yet walked through in a real 80×24 terminal. |
 | 6 | P1 follow-ups | release | deferred | n/a | Out of P0 scope. Not implemented in this pass. |
 
+## Step 3: Review and validation
+
+Two read-only review subagents ran in parallel. Review A covered the engine, runner, inbox and consent. Review B covered agent, loop, expressions, TUI and docs. Their findings went to fix-up subagents, split by file ownership so that parallel subagents never edited the same file.
+
+### Findings and resolutions
+
+| # | Severity | Finding | Fix commit |
+|---|---|---|---|
+| B1 | blocker | Agent sub-tools named in `native-tools` / `allowedTools` skipped `confirmTool`, even under deny-writes. The permission mode was hard-coded to `ask`. | e9c2d791: new `toolGate` option in agent/loop.ts. The allowlist now only restricts tools; non-SAFE tools are confirmed; the narrowed permission mode is passed. |
+| A1/B2 | blocker | The consent ignored loop bodies, so a job node inside a loop always failed in the background. | e9c2d791: `buildConsent` uses `walkNodes` |
+| B3 | blocker | `docs/docs/reference/workflows.md` was outdated (§8 definition of done). | c4ff8c92: full rewrite |
+| A2/B5 | major | Tool-node consent covered agent sub-tools by name with any input. Agent `run_command` had no destructive-command check. | e9c2d791: agent sub-tools go to `agent_tool_consent` (deduped by input hash); destructive commands refused |
+| A3 | major | Secret env values were persisted in background-job spec files. | d11cb730: specs store names only; values pass through a non-persisted `AGAV_BG_INHERITED_ENV` channel (generic, all jobs) |
+| A4 | major | Queued runs were admitted only on status, list or startup. | d11cb730 + fba567e7: admit on runner exit, on background tick (in-app and headless), and when the TUI opens |
+| B4 | major | A failed body node always failed the loop, so "test → fix → repeat" was impossible. | 492658ef: `continueOnError` (R4 pulled forward); until/stopWhen evaluated after tolerated failures |
+| B6 | major | Loop body outputs were never spilled to artifacts, and `loop.history` was uncapped. | 492658ef: scoped artifacts, history capped at 64 KiB per entry |
+| B7 | major | The Runs/Inbox screens overflowed 80×24. | 53133a6b: wrapped hint rows budgeted, condensed hints, Inbox empty text |
+| A6 | minor | Relaunch over an `unknown` runner could start a second runner. | d11cb730: refused unless `force` |
+| A7 | minor | No retention or pruning (B4). | d11cb730: prune terminal runs after 7 days (default `completedLogRetentionDays`) |
+| B13 | minor | A parked run past its deadline waited forever. | d11cb730: reconcile marks it `timed_out` |
+| B9 | minor | The shared Ajv failed on repeated `$id`. | 492658ef |
+| B11 | minor | A2A agents silently ignored model/effort/maxIterations. | 492658ef: the node fails with a clear error |
+| B12 | minor | Cancel left loop approvals `waiting_approval`. | 492658ef |
+| B8 | minor | The Inbox wording contradicted answer 8. | e9c2d791 |
+| n/a | build | 2 TS2554 errors in use-agent.ts blocked `pnpm build`. They were introduced in this branch (the caller was changed, `ConfirmationQueue` was not). | 66ddfb5a: added `expected` / `signal` params to ConfirmationQueue. The pre-commit hook now passes. |
+
+### Not fixed (documented open items)
+- A5: the runner pool is not separate from `maxConcurrentJobs`, and the admission check is not atomic. A child job refused with `capacity-exceeded` fails its node instead of waiting.
+- A8: the `workflow-run` GrantAction is unused; `run.consent` is the effective grant.
+- A9: the `cancelling` status is never set, and `cancelRun` lock retries are unbounded.
+- A10: uncertain_tool decisions show the uninterpolated input; reconcile doesn't recreate a missing decision for a `waiting_approval` run.
+- B10: agent token usage is not recorded.
+- B14: smaller TUI differences from design Part B (no `n` scaffold, `$EDITOR`, `g` revoke or approve note; no shadowed-definition display); the 1 s Runs refresh re-reads every run.
+- There is no CLI or slash flag for the `launchRun` `force` option.
+- The real-supervisor exit criteria for Phases 1–2 (`kill -9` the TUI, cross-session cancel, killing the runner mid-node) and the manual 80×24 walkthrough have not been executed. All tests use fake coordinators, apart from one real-supervisor env test.
+
+### Final verification (66ddfb5a)
+- `pnpm vitest run source`: 294 files and 4067 tests passed, 22 skipped, 0 failed (at fba567e7). Targeted suites re-run after 66ddfb5a: 407 passed.
+- `npx tsc --noEmit -p .`: 0 errors.
+- `pnpm build`: exit 0.
+- The pre-commit hook passes (no `--no-verify` needed from 66ddfb5a on).
+
+## Final status
+
+P0 (Phases 0–5) is **complete**. Phase 6 is **deferred**. The final report is in `docs/design/workflow-implementation-report.md`. Remaining manual verification and open items are listed in §7 of that report.
+
 ## Log
 
 - Step 1: an analysis subagent summarized the docs and code and identified the models. No code changes.
@@ -58,6 +104,7 @@ Models available for subagents, cheapest first (from the project memory `availab
 - Phase 2 completed: e64f2c36.
 - Phase 4a completed: 49ae25ad.
 - Phase 4b: two subagents returned empty and one timed out (network). The timed-out partial diff was backed up to /tmp/phase4b2a-partial.patch, typechecked by the orchestrator and finished by a follow-up subagent. Phase 4 complete at 95f2e274.
+- Step 3: 2 review subagents, 5 fix-up subagents and 1 build-fix subagent; all succeeded on the first attempt. Commits 53133a6b..66ddfb5a.
 - Step 2 verification (orchestrator, at a894431c): full `pnpm vitest run source` gives 292 files passed and 2 skipped; 4034 tests passed, 23 skipped, 0 failed. `tsc --noEmit` shows only the 2 pre-existing TS2554 errors in use-agent.ts:569,579.
 - Phase 5a (914838bf) and 5b (cfbb5173) complete. The user is back and background jobs are allowed again.
 - User directive: no background jobs (each needs explicit approval). Subagents are told not to use them.
