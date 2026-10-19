@@ -17,7 +17,12 @@ import type {
 } from "../background-jobs/host/daemon.js";
 import type { OsSchedulerDeps } from "../background-jobs/host/os-scheduler/index.js";
 
-type TickConfig = Partial<Pick<AgavConfig, "permissionMode" | "backgroundJobsEnabled" | "backgroundAutomation">>;
+type TickConfig = Partial<Pick<AgavConfig, "permissionMode" | "backgroundJobsEnabled" | "backgroundAutomation" | "workflowsEnabled" | "maxConcurrentWorkflowRuns">>;
+
+/** Workflow reconcile options for a tick, mirroring the in-app ticker; only when the workflows gate is on. */
+function workflowTickOptions(config: TickConfig): Pick<BackgroundTickOptions, "workflows"> {
+  return config.workflowsEnabled === true ? { workflows: { maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns } } : {};
+}
 
 export interface JobCliDeps {
   loadConfig?: () => Promise<TickConfig>;
@@ -238,6 +243,7 @@ async function runDaemonStart(
       coordinator,
       session: { permissionMode: config.permissionMode ?? "ask", headlessApprovedActions: [] },
       backgroundAutomation: config.backgroundAutomation,
+      ...workflowTickOptions(config),
     });
     if (summary.dispatched > 0 || summary.errors > 0) {
       stdout(`tick: dispatched=${summary.dispatched} skipped=${summary.skipped} errors=${summary.errors}\n`);
@@ -345,6 +351,7 @@ async function runTickCommand(
     coordinator,
     session,
     backgroundAutomation: config.backgroundAutomation,
+    ...workflowTickOptions(config),
   });
 
   stdout(`tick: dispatched=${summary.dispatched} skipped=${summary.skipped} errors=${summary.errors}\n`);

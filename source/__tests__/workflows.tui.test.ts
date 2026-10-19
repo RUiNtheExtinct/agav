@@ -20,14 +20,14 @@ beforeEach(async () => {
 });
 afterEach(async () => { await cleanup(); });
 
-async function mount(size: { columns: number; rows: number } = { columns: 140, rows: 30 }) {
+async function mount(size: { columns: number; rows: number } = { columns: 140, rows: 30 }, reconcileRuns?: (opts: { maxConcurrentWorkflowRuns?: number }) => Promise<void>) {
   const onExit = vi.fn();
   let output = "";
   const stdout = new EventEmitter() as NodeJS.WriteStream;
   Object.assign(stdout, { isTTY: true, ...size, write: (text: string) => { output += text; return true; } });
   const stdin = new EventEmitter() as NodeJS.ReadStream;
   Object.assign(stdin, { isTTY: true, setRawMode: () => stdin, resume: () => stdin, pause: () => stdin, read: () => null });
-  const instance = render(h(WorkflowsTUI, { onExit, config: testConfig(), deps }), { stdout, stdin, patchConsole: false, exitOnCtrlC: false });
+  const instance = render(h(WorkflowsTUI, { onExit, config: testConfig(), deps, reconcileRuns }), { stdout, stdin, patchConsole: false, exitOnCtrlC: false });
   const settle = async () => { await new Promise((r) => setTimeout(r, 80)); await instance.waitUntilRenderFlush(); };
   const key = async (text: string) => { output = ""; stdin.emit("data", Buffer.from(text)); await settle(); await settle(); };
   const frame = () => output.replaceAll(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
@@ -36,6 +36,18 @@ async function mount(size: { columns: number; rows: number } = { columns: 140, r
 }
 
 describe("WorkflowsTUI", () => {
+  it("fires a best-effort reconcile/admission pass once on open without blocking render", async () => {
+    const reconcileRuns = vi.fn(() => new Promise<void>(() => {})); // never settles
+    const ui = await mount(undefined, reconcileRuns);
+    try {
+      expect(ui.frame()).toContain("Workflows · List");
+      expect(reconcileRuns).toHaveBeenCalledOnce();
+      expect(reconcileRuns).toHaveBeenCalledWith({ maxConcurrentWorkflowRuns: testConfig().maxConcurrentWorkflowRuns });
+      await ui.key("\t");
+      expect(reconcileRuns).toHaveBeenCalledOnce();
+    } finally { ui.instance.unmount(); }
+  });
+
   it("switches Workflows → Runs → Inbox with Tab, then approves a decision through the y/n confirmation", async () => {
     const dir = join(deps.cwd, ".agav", "workflows");
     await mkdir(dir, { recursive: true });

@@ -17,7 +17,7 @@ import { cliEntryPath } from "../workflows/background.js";
 import { WORKFLOW_TOOLS } from "../workflows/definition.js";
 import { WorkflowStore } from "../workflows/store.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
-import { getSharedCoordinator } from "../background-jobs-integration.js";
+import { getSharedCoordinator, reconcileWorkflowRunsNow, type WorkflowReconcileOptions } from "../background-jobs-integration.js";
 import { isSandboxRequired } from "../utils/sandbox.js";
 
 /** The app's real dependencies: the shared coordinator, the user's run store and the cwd's workflows. */
@@ -48,6 +48,11 @@ export interface WorkflowsTUIProps {
   /** Store, registry, coordinator and paths (tests pass fakes); defaults to the app's real ones. */
   deps?: WorkflowResourceDeps;
   initialTab?: WorkflowTab;
+  /**
+   * Reconcile/admission pass fired (best effort, non-blocking) when the TUI opens. Defaults to
+   * `reconcileWorkflowRunsNow` with the real deps; skipped when fake `deps` are passed without one (tests).
+   */
+  reconcileRuns?: (opts: WorkflowReconcileOptions) => Promise<void>;
 }
 
 interface PendingConfirmation {
@@ -91,7 +96,7 @@ function InputForm({ stage, onChange, onSubmit, onCancel }: {
   </Box>;
 }
 
-export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "workflows" }: WorkflowsTUIProps) {
+export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "workflows", reconcileRuns }: WorkflowsTUIProps) {
   // Stable across parent renders so adapters (and their refresh timers) are not recreated.
   const deps = useMemo(() => provided ?? defaultWorkflowResourceDeps(config), [provided, config.permissionMode, config.maxConcurrentWorkflowRuns]);
   const [tab, setTab] = useState<WorkflowTab>(initialTab);
@@ -107,6 +112,13 @@ export function WorkflowsTUI({ onExit, config, deps: provided, initialTab = "wor
   const workflows = useMemo(() => createWorkflowsAdapter(deps), [deps]);
   const runs = useMemo(() => createRunsAdapter(deps), [deps]);
   const inbox = useMemo(() => createInboxAdapter(deps), [deps]);
+
+  // On open: recover dead runners and admit queued runs into free slots. Never rejects; does not block render.
+  useEffect(() => {
+    const reconcile = reconcileRuns ?? (provided ? undefined : reconcileWorkflowRunsNow);
+    if (!reconcile) return;
+    void Promise.resolve().then(() => reconcile({ maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns })).catch(() => { /* best effort */ });
+  }, []); // once per mount
 
   useEffect(() => {
     mounted.current = true;
