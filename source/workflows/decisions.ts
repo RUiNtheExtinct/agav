@@ -4,7 +4,21 @@ import { createHash } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { createExclusive, readJsonIfExists } from "../background-jobs/storage/atomic-file.js";
 import { appendEvent } from "./events.js";
-import type { NodeCheckpoint, WorkflowRun, WorkflowStore } from "./store.js";
+import { scopedCheckpoints, type CheckpointVisit, type NodeCheckpoint, type WorkflowRun, type WorkflowStore } from "./store.js";
+
+/** Leaf checkpoints (loop nodes are containers) at every depth, including loop iteration bodies. */
+function leafVisits(run: WorkflowRun): CheckpointVisit[] { return scopedCheckpoints(run).filter(visit => visit.node.type !== "loop"); }
+/** Iteration path (outermost loop first) of a visited body checkpoint; undefined at top level. */
+function visitIteration(visit: CheckpointVisit): number[] | undefined { return visit.loops.length > 0 ? visit.loops.map(loop => loop.iteration.index) : undefined; }
+/** Approval decisions inside loops are keyed per iteration, so one iteration's answer never decides the next. */
+export function approvalDiscriminator(iteration?: number[]): string | undefined { return iteration && iteration.length > 0 ? `iteration:${iteration.join(".")}` : undefined; }
+/** A body decision changed: the enclosing (parked) iterations and loops resume running so the scheduler re-enters them. */
+function rearmLoops(visit: CheckpointVisit): void {
+  for (const { cp, iteration } of visit.loops) {
+    if (iteration.status === "waiting_approval") iteration.status = "running";
+    if (cp.status === "waiting_approval") cp.status = "running";
+  }
+}
 
 /**
  * Inbox decisions (`<runDir>/decisions/`). The runner writes `<id>.json` (pending); any session decides by
@@ -157,11 +171,12 @@ export function parkCheckpoint(cp: NodeCheckpoint, decision: PendingDecision): v
  */
 export async function parkUncertainNodes(store: WorkflowStore, run: WorkflowRun, isUncertain: (cp: NodeCheckpoint) => boolean): Promise<PendingDecision[]> {
   const parked: PendingDecision[] = [];
-  for (const cp of run.nodes) {
+  for (const visit of leafVisits(run)) {
+    const { cp, node } = visit;
     if (cp.status !== "running" || !isUncertain(cp)) continue;
-    const node = run.definition.nodes.find(item => item.id === cp.id)!;
+    const iteration = visitIteration(visit);
     const decision = await createPendingDecision(store, run.id, {
-      kind: "uncertain_tool", nodeId: cp.id, discriminator: cp.startedAt ?? run.updatedAt,
+      kind: "uncertain_tool", nodeId: cp.id, discriminator: cp.startedAt ?? run.updatedAt, ...(iteration ? { iteration } : {}),
       summary: `Interrupted ${node.tool ?? node.type} node ${cp.id} has an uncertain outcome; approve to retry, deny to mark it failed.`,
       ...(node.tool ? { resolved: resolvedInput(node.tool, node.input ?? {}) } : {}),
     });
@@ -174,7 +189,7 @@ export async function parkUncertainNodes(store: WorkflowStore, run: WorkflowRun,
 
 /** True when some waiting node's decision has a result the runner has not applied yet. */
 export async function hasUnappliedDecision(store: WorkflowStore, run: WorkflowRun): Promise<boolean> {
-  for (const cp of run.nodes) {
+  for (const { cp } of leafVisits(run)) {
     if (cp.status !== "waiting_approval" || !cp.decisionId) continue;
     if ((await readDecision(store, run.id, cp.decisionId).catch(() => undefined))?.decided) return true;
   }
@@ -191,12 +206,14 @@ export async function hasUnappliedDecision(store: WorkflowStore, run: WorkflowRu
  */
 export async function applyDecisions(store: WorkflowStore, run: WorkflowRun): Promise<boolean> {
   let changed = false;
-  for (const cp of run.nodes) {
+  for (const visit of leafVisits(run)) {
+    const { cp, node } = visit;
     if (cp.status !== "waiting_approval") continue;
-    const node = run.definition.nodes.find(item => item.id === cp.id)!;
     if (!cp.decisionId) {
       if (node.type !== "approval") continue;
-      const decision = await createPendingDecision(store, run.id, { kind: "approval", nodeId: cp.id, summary: node.prompt ?? `Approve ${cp.id}` });
+      const iteration = visitIteration(visit);
+      const discriminator = approvalDiscriminator(iteration);
+      const decision = await createPendingDecision(store, run.id, { kind: "approval", nodeId: cp.id, summary: node.prompt ?? `Approve ${cp.id}`, ...(iteration ? { iteration } : {}), ...(discriminator ? { discriminator } : {}) });
       cp.decisionId = decision.decisionId;
       changed = true;
     }
@@ -225,6 +242,7 @@ export async function applyDecisions(store: WorkflowStore, run: WorkflowRun): Pr
       cp.endedAt = now;
       delete cp.decisionId;
     }
+    rearmLoops(visit);
     changed = true;
     await appendEvent(store, run.id, { type: "decision_applied", nodeId: cp.id, decisionId: pending.decisionId, decision: decided.decision, decidedBy: decided.decidedBy });
   }

@@ -4,7 +4,7 @@ import { WORKFLOW_TOOLS } from "./definition.js";
 import { appendEvent } from "./events.js";
 import { getNodeExecutor, retriesOnResume } from "./executors.js";
 import { findRunnerJob, launchRun, liveRunnerCount, updateRun, DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS, type LaunchDeps } from "./launch.js";
-import { runnerRequestId, type WorkflowRun, type WorkflowStore } from "./store.js";
+import { runnerRequestId, scopedCheckpoints, type WorkflowRun, type WorkflowStore } from "./store.js";
 import { hasUnappliedDecision, parkUncertainNodes } from "./decisions.js";
 import { postRunNotification } from "./notify.js";
 
@@ -28,9 +28,12 @@ function isUncertain(run: WorkflowRun, cp: WorkflowRun["nodes"][number]): boolea
   const node = run.definition.nodes.find(item => item.id === cp.id)!;
   return cp.status === "running" && getNodeExecutor(node.type).resumable !== true && !retriesOnResume(node);
 }
-/** The engine refuses to replay an uncertain node. */
+/**
+ * The engine refuses to replay an uncertain node, at top level or inside a loop iteration. (A running loop node
+ * itself is resumable; an uncertain body node is failed closed by the loop on resume, so only top-level ones park.)
+ */
 function hasUncertainNode(run: WorkflowRun): boolean {
-  return run.nodes.some(cp => isUncertain(run, cp));
+  return scopedCheckpoints(run).some(({ cp, node }) => cp.status === "running" && getNodeExecutor(node.type).resumable !== true && !retriesOnResume(node));
 }
 
 function isLockHeld(error: unknown): boolean { return error instanceof BackgroundJobError && error.code === "lock-held"; }

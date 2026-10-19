@@ -35,6 +35,27 @@ function validArtifactRef(value: unknown, nodeId: string): boolean {
   const { $artifact, bytes, ...extra } = value as unknown as Record<string, unknown>;
   return Object.keys(extra).length === 0 && $artifact === artifactRelativePath(nodeId) && typeof bytes === "number" && Number.isInteger(bytes) && bytes > 0;
 }
+/** One checkpoint found by `scopedCheckpoints`, with its definition node and enclosing loops (outermost first). */
+export interface CheckpointVisit { cp: NodeCheckpoint; node: WorkflowNode; loops: Array<{ cp: LoopNodeCheckpoint; iteration: LoopIterationCheckpoint }> }
+/** Every checkpoint of a run depth-first, including loop nodes and the body checkpoints of each of their iterations. */
+export function scopedCheckpoints(run: WorkflowRun): CheckpointVisit[] {
+  const out: CheckpointVisit[] = [];
+  const walk = (nodes: WorkflowNode[], cps: Record<string, NodeCheckpoint>, loops: CheckpointVisit["loops"]): void => {
+    for (const node of nodes) {
+      const cp = cps[node.id];
+      if (!cp) continue;
+      out.push({ cp, node, loops });
+      if (node.type !== "loop") continue;
+      for (const iteration of (cp as LoopNodeCheckpoint).iterations ?? []) walk(node.body ?? [], iteration.nodes, [...loops, { cp: cp as LoopNodeCheckpoint, iteration }]);
+    }
+  };
+  walk(run.definition.nodes, Object.fromEntries(run.nodes.map(cp => [cp.id, cp])), []);
+  return out;
+}
+/** Job scope (loop path) of a visited checkpoint; undefined at top level. */
+export function visitJobScope(visit: CheckpointVisit): JobScope | undefined {
+  return visit.loops.length > 0 ? { loopPath: visit.loops.map(loop => ({ loopId: loop.cp.id, iteration: loop.iteration.index })) } : undefined;
+}
 /** Position of a body node: the enclosing loops (outermost first) and their iteration indexes. */
 export interface JobScope { loopPath: Array<{ loopId: string; iteration: number }> }
 /** `<loopId>.<i>.` per enclosing loop (node ids never contain dots, so scoped ids cannot collide with top-level ones). */

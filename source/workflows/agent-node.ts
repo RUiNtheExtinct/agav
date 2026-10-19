@@ -9,7 +9,7 @@ import { confirmAgentTool } from "./gated-tools.js";
 import { consentCoversTool } from "./grant.js";
 import { resolveTemplate, type TemplateContext } from "./interpolate.js";
 import { parseNodeOutput } from "./structured-output.js";
-import type { WorkflowRun, WorkflowStore } from "./store.js";
+import type { NodeCheckpoint, WorkflowRun, WorkflowStore } from "./store.js";
 import type { NodeExecutionContext, NodeExecutor, NodeResult } from "./executors.js";
 
 /** Trusted dependencies for agent/prompt nodes; tests inject a mock invoker and fake agents. */
@@ -26,8 +26,8 @@ export interface AgentNodeDeps {
 export const PROMPT_NODE_SYSTEM_PROMPT = "You are a step in an automated workflow. Complete the task in the user message and reply with the result only.";
 
 /** Interpolation context from run inputs and node checkpoints, plus the enclosing loop's context when given. */
-export function templateContext(run: WorkflowRun, loop?: TemplateContext["loop"]): TemplateContext {
-  return { inputs: run.inputs, nodes: Object.fromEntries(run.nodes.map(cp => [cp.id, { status: cp.status, output: cp.output }])), ...(loop ? { loop } : {}) };
+export function templateContext(run: WorkflowRun, loop?: TemplateContext["loop"], scopeNodes?: Record<string, NodeCheckpoint>): TemplateContext {
+  return { inputs: run.inputs, nodes: Object.fromEntries((scopeNodes ? Object.values(scopeNodes) : run.nodes).map(cp => [cp.id, { status: cp.status, output: cp.output }])), ...(loop ? { loop } : {}) };
 }
 
 /** `<runDir>/artifacts/<nodeId>.txt`, next to the overflow `<nodeId>.json` artifacts. */
@@ -74,7 +74,7 @@ async function executeAgentNode(ctx: NodeExecutionContext): Promise<NodeResult> 
   let task = "";
   try {
     if (!agentDeps) throw new Error("Agent nodes unavailable: this execution context supplies no agent invoker.");
-    task = String(resolveTemplate(node.type === "agent" ? node.task! : node.prompt!, templateContext(run, ctx.loop)));
+    task = String(resolveTemplate(node.type === "agent" ? node.task! : node.prompt!, templateContext(run, ctx.loop, ctx.scopeNodes)));
     const agent = node.type === "agent" ? await resolveAgent(agentDeps, run.cwd, node.agent!) : undefined;
     const confirmTool: AgentInvokeRequest["confirmTool"] = async (toolName, input) => {
       const args = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {};

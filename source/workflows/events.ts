@@ -8,6 +8,8 @@ export type WorkflowEvent =
   | { type: "node_retry"; nodeId: string; attempt: number; error?: string }
   | { type: "node_completed"; nodeId: string; status: NodeStatus; error?: string }
   | { type: "run_status"; status: RunStatus; reason?: string }
+  | { type: "loop_iteration_started"; nodeId: string; iteration: number }
+  | { type: "loop_iteration_completed"; nodeId: string; iteration: number; status: NodeStatus }
   | { type: "decision_requested"; nodeId: string; decisionId: string; kind: string }
   | { type: "decision_applied"; nodeId: string; decisionId: string; decision: "approve" | "deny"; decidedBy: string };
 export type WorkflowEventRecord = WorkflowEvent & { at: string };

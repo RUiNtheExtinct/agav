@@ -1,6 +1,6 @@
 import type { ToolRegistry } from "../tools/registry.js";
 import { BackgroundJobError, isLiveLifecycle } from "../background-jobs/types.js";
-import { jobRequestId, WorkflowStore, type WorkflowRun } from "./store.js";
+import { jobRequestId, scopedCheckpoints, visitJobScope, WorkflowStore, type LoopNodeCheckpoint, type WorkflowRun } from "./store.js";
 import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, type JobNodeDeps } from "./job-node.js";
 import { decide, defaultDecider, isDecisionId, listPendingDecisions, readDecision, type DecidedRecord, type DecisionKind, type PendingDecision } from "./decisions.js";
 import { findRunnerJob, launchRun, type LaunchDeps, type LaunchResult } from "./launch.js";
@@ -114,21 +114,36 @@ export async function cancelRun(store: WorkflowStore, id: string, registry: Tool
     try {
       return await store.lock(id, async () => {
         const run = await store.read(id, registry);
-        for (const cp of run.nodes) {
-          if (cp.status !== "running") continue;
-          const definitionNode = run.definition.nodes.find(node => node.id === cp.id);
+        // Leaf checkpoints at every depth, including the body nodes of loop iterations (loop nodes are containers).
+        const visits = scopedCheckpoints(run);
+        for (const visit of visits) {
+          const cp = visit.cp;
+          if (cp.status !== "running" || visit.node.type === "loop") continue;
+          const definitionNode = visit.node;
           const isJob = definitionNode?.type === "job";
           // A retry-safe agent/prompt node ran inside the (now dead: we hold the lock) runner process, so it has stopped.
           if (definitionNode && retriesOnResume(definitionNode)) { cp.status = "cancelled"; cp.endedAt = new Date().toISOString(); continue; }
           // Tool nodes are never replayed or assumed stopped.
           if (!isJob) throw new Error("Cancellation requested, but interrupted work has an uncertain outcome; not claiming it stopped.");
           // Stop the attempt the checkpoint recorded (old checkpoints carry `-1`).
-          const requestId = cp.job?.requestId ?? jobRequestId(run.id, cp.id);
+          const requestId = cp.job?.requestId ?? jobRequestId(run.id, cp.id, cp.attempt ?? 1, visitJobScope(visit));
           if (!jobDeps) throw new Error(`Cancellation requested, but node ${cp.id} has a running job (${requestId}) and this context has no background-job support to stop it; not claiming it stopped. Cancel from a context with job support.`);
           const outcome = await stopJobNodeOutcome(jobDeps, { requestId, jobId: cp.job?.jobId });
           applyJobOutcome(cp, outcome);
           await store.save(run); // Real outcome (or the kept linkage/reason) is durable before anything else.
           if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
+        }
+        // Settle running loops (innermost first) whose current iteration has no work left in progress.
+        const now = new Date().toISOString();
+        for (const visit of [...visits].reverse()) {
+          const loop = visit.cp as LoopNodeCheckpoint;
+          if (visit.node.type !== "loop" || loop.status !== "running") continue;
+          const current = loop.iterations?.[loop.iterations.length - 1];
+          if (current && ["pending", "running", "waiting_approval"].includes(current.status)) {
+            if (Object.values(current.nodes).some(child => child.status === "running" || child.status === "waiting_approval")) continue;
+            current.status = "cancelled"; current.endedAt = now;
+          }
+          loop.status = "cancelled"; loop.endedAt = now;
         }
         if (!["passed", "failed", "cancelled", "timed_out"].includes(run.status)) {
           run.status = "cancelled";

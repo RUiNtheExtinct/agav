@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import type { AgavConfig, PermissionMode } from "../config/config.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { WorkflowExecutionHost } from "./gated-tools.js";
-import { definitionHash, type JobScope, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
+import { definitionHash, scopedCheckpoints, type JobScope, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
 import type { JobNodeDeps } from "./job-node.js";
 import { narrowPermissionMode, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { getNodeExecutor, retriesOnResume, type NodeResult } from "./executors.js";
@@ -143,7 +143,8 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
     const resumeCp = env.resume;
     const node = resumeCp !== undefined
       ? spec.nodes.find(candidate => candidate.id === resumeCp.id)
-      : spec.nodes.find(candidate => cps[candidate.id]!.status === "pending" && (candidate.dependsOn ?? []).every(dep => SETTLED.has(cps[dep]!.status)));
+      // A running loop (re-armed by a decision inside its body, or interrupted) is re-entered to continue its iteration.
+      : spec.nodes.find(candidate => (cps[candidate.id]!.status === "pending" || (candidate.type === "loop" && cps[candidate.id]!.status === "running")) && (candidate.dependsOn ?? []).every(dep => SETTLED.has(cps[dep]!.status)));
     if (!node) break;
     const cp = cps[node.id]!;
     const resuming = resumeCp !== undefined;
@@ -176,7 +177,7 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
       }
       run.executionCount = (run.executionCount ?? 0) + 1;
       if (!resuming || !first) await appendEvent(store, run.id, { type: "node_started", nodeId: node.id, ...(cp.attempt !== undefined ? { attempt: cp.attempt } : {}) });
-      result = await executor.execute({ store, run, node, checkpoint: cp, registry, config, signal, host, jobDeps, agentDeps, resuming: resuming && first, ...(spec.loop ? { loop: spec.loop } : {}), ...(spec.jobScope ? { jobScope: spec.jobScope } : {}) });
+      result = await executor.execute({ store, run, node, checkpoint: cp, registry, config, signal, host, jobDeps, agentDeps, resuming: resuming && first, ...(spec.loop ? { loop: spec.loop } : {}), ...(spec.jobScope ? { jobScope: spec.jobScope, iteration: spec.jobScope.loopPath.map(step => step.iteration) } : {}), scopeNodes: { ...spec.outerNodes, ...cps }, runSubScope: (sub, options) => runSubScope(sub, env, options) });
       first = false;
       // The run deadline aborted this node: it timed out rather than being cancelled by a user.
       if (env.deadlineHit() && cp.status === "cancelled") {
@@ -203,6 +204,13 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
   return finish(finalStatus());
 }
 
+/** Runs a nested scope (loop body) sharing `env`; an optional own abort signal (loop timeout) and resumed checkpoint. */
+async function runSubScope(spec: ScopeSpec, env: ScopeEnv, options: { resume?: NodeCheckpoint; signal?: AbortSignal } = {}): Promise<ScopeStatus> {
+  const sub: ScopeEnv = { ...env, signal: options.signal ?? env.signal, resume: options.resume };
+  try { return await runScope(spec, sub); }
+  finally { if (sub.capExceeded) env.capExceeded = true; }
+}
+
 /** Sequential DAG execution; the exclusive run lock spans work and shutdown settlement. */
 export async function executeRun(store: WorkflowStore, id: string, registry: ToolRegistry, sessionConfig: AgavConfig, signal?: AbortSignal, host?: WorkflowExecutionHost, sessionJobDeps?: JobNodeDeps, agentDeps?: AgentNodeDeps): Promise<WorkflowRun> {
   return store.lock(id, async () => {
@@ -218,15 +226,17 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
     // Tool nodes are never replayed. A running job node is instead reattached below via its durable requestId.
     const resumedJob = run.nodes.find(cp => cp.status === "running" && getNodeExecutor(run.definition.nodes.find(node => node.id === cp.id)!.type).resumable === true);
     // A retry-safe agent/prompt node (retrySafe !== false) is simply dispatched again from scratch.
+    // Body checkpoints of loop iterations follow the same rules (the running loop itself is re-entered).
     let dirty = false;
-    for (const cp of run.nodes) {
-      if (cp.status !== "running" || cp === resumedJob || !retriesOnResume(run.definition.nodes.find(node => node.id === cp.id)!)) continue;
+    for (const { cp, node } of scopedCheckpoints(run)) {
+      if (cp.status !== "running" || cp === resumedJob || !retriesOnResume(node)) continue;
       cp.status = "pending";
       for (const key of ["output", "error", "startedAt", "endedAt", "usage", "model", "durationMs"] as const) delete cp[key];
       dirty = true;
     }
     // An interrupted tool (or retrySafe:false agent) becomes an `uncertain_tool` inbox decision (approve retries, deny fails); never auto-replayed.
-    if ((await parkUncertainNodes(store, run, cp => cp !== resumedJob)).length > 0) dirty = true;
+    const leafResumable = new Set(scopedCheckpoints(run).filter(({ node }) => getNodeExecutor(node.type).resumable === true).map(({ cp }) => cp));
+    if ((await parkUncertainNodes(store, run, cp => cp !== resumedJob && !leafResumable.has(cp))).length > 0) dirty = true;
     // Decisions recorded while no runner was live (the decider never writes run.json).
     if (await applyDecisions(store, run)) dirty = true;
     // The run deadline is fixed at the first execution and persisted, so a resumed run keeps the original budget.

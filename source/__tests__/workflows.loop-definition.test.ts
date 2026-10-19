@@ -92,8 +92,8 @@ nodes:
   });
 });
 
-describe("loop executor stub", () => {
-  it("fails a dispatched loop node", async () => {
+describe("loop executor outside a scheduler", () => {
+  it("fails a loop dispatched without a sub-scope runner", async () => {
     const { store, cleanup } = await tempStore();
     try {
       const d = validateDefinition(base([loop("l", [tool("t")])]), registry);
@@ -102,7 +102,7 @@ describe("loop executor stub", () => {
       const result = await getNodeExecutor("loop").execute({ store, run, node: d.nodes[0]!, checkpoint: cp, registry, config: {} as never, signal: new AbortController().signal, resuming: false });
       expect(result.next).toBe("stop");
       expect(cp.status).toBe("failed");
-      expect(cp.error).toBe("loop execution not implemented");
+      expect(cp.error).toBe("loop execution unavailable in this context");
     } finally { await cleanup(); }
   });
 });

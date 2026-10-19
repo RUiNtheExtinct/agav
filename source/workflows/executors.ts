@@ -4,10 +4,12 @@ import type { WorkflowNode } from "./definition.js";
 import { gatedToolExecute, type WorkflowExecutionHost } from "./gated-tools.js";
 import { applyJobOutcome, JobCancellationIncompleteError, runJobNode, type JobNodeDeps } from "./job-node.js";
 import { jobRequestId, type JobScope, type NodeCheckpoint, type WorkflowRun, type WorkflowStore } from "./store.js";
-import { createPendingDecision, DecisionPendingError, parkCheckpoint } from "./decisions.js";
+import { approvalDiscriminator, createPendingDecision, DecisionPendingError, parkCheckpoint } from "./decisions.js";
 import { appendEvent } from "./events.js";
 import { resolveTemplate, type TemplateContext } from "./interpolate.js";
 import { agentExecutor, promptExecutor, type AgentNodeDeps } from "./agent-node.js";
+import { loopExecutor } from "./loop-node.js";
+import type { ScopeSpec, ScopeStatus } from "./runtime.js";
 
 /** Everything a node executor may use; trusted host callbacks never come from the definition. */
 export interface NodeExecutionContext {
@@ -31,6 +33,10 @@ export interface NodeExecutionContext {
   jobScope?: JobScope;
   /** True when a running checkpoint is being reattached instead of freshly dispatched. */
   resuming: boolean;
+  /** Checkpoints visible to interpolation: enclosing scopes overlaid by the node's own scope (default: `run.nodes`). */
+  scopeNodes?: Record<string, NodeCheckpoint>;
+  /** Runs a nested scope (a loop iteration's body) with the same run-wide environment. */
+  runSubScope?(spec: ScopeSpec, options?: { resume?: NodeCheckpoint; signal?: AbortSignal }): Promise<ScopeStatus>;
 }
 /** `continue`: pick the next ready node. `stop`: end scheduling (the run status is derived from checkpoints). */
 export interface NodeResult { next: "continue" | "stop" }
@@ -44,15 +50,17 @@ export interface NodeExecutor {
 }
 
 /** Resolves `${...}` references in tool input against run inputs and node checkpoints (see interpolate.ts). */
-export function interpolate(value: unknown, run: WorkflowRun): unknown {
-  return resolveTemplate(value, { inputs: run.inputs, nodes: Object.fromEntries(run.nodes.map(cp => [cp.id, { status: cp.status, output: cp.output }])) });
+export function interpolate(value: unknown, run: WorkflowRun, scopeNodes?: Record<string, NodeCheckpoint>, loop?: TemplateContext["loop"]): unknown {
+  const cps = scopeNodes ? Object.values(scopeNodes) : run.nodes;
+  return resolveTemplate(value, { inputs: run.inputs, nodes: Object.fromEntries(cps.map(cp => [cp.id, { status: cp.status, output: cp.output }])), ...(loop ? { loop } : {}) });
 }
 
 /** Approval gates park the node on an inbox decision; other ready branches still run. */
 export const approvalExecutor: NodeExecutor = {
   type: "approval",
-  async execute({ store, run, node, checkpoint: cp }) {
-    const decision = await createPendingDecision(store, run.id, { kind: "approval", nodeId: node.id, summary: node.prompt ?? `Approve ${node.id}` });
+  async execute({ store, run, node, checkpoint: cp, iteration }) {
+    const discriminator = approvalDiscriminator(iteration);
+    const decision = await createPendingDecision(store, run.id, { kind: "approval", nodeId: node.id, summary: node.prompt ?? `Approve ${node.id}`, ...(iteration ? { iteration } : {}), ...(discriminator ? { discriminator } : {}) });
     parkCheckpoint(cp, decision);
     await store.save(run);
     await appendEvent(store, run.id, { type: "decision_requested", nodeId: node.id, decisionId: decision.decisionId, kind: decision.kind });
@@ -63,7 +71,7 @@ export const approvalExecutor: NodeExecutor = {
 /** Tool nodes go only through `gatedToolExecute`; never replayed after an interruption. */
 export const toolExecutor: NodeExecutor = {
   type: "tool",
-  async execute({ store, run, node, checkpoint: cp, registry, config, signal, host }) {
+  async execute({ store, run, node, checkpoint: cp, registry, config, signal, host, scopeNodes, loop, iteration }) {
     cp.status = "running"; cp.startedAt = new Date().toISOString();
     await store.save(run); // Dispatch only after the running checkpoint is durable.
     const child = new AbortController();
@@ -73,9 +81,9 @@ export const toolExecutor: NodeExecutor = {
     let timedOut = false;
     const timeout = node.timeoutSeconds === undefined ? undefined : setTimeout(() => { timedOut = true; child.abort(); }, node.timeoutSeconds * 1000);
     try {
-      const input = interpolate(node.input ?? {}, run) as Record<string, unknown>;
+      const input = interpolate(node.input ?? {}, run, scopeNodes, loop) as Record<string, unknown>;
       // No Promise.race: non-cooperative tools must settle before return or retry.
-      const result = await gatedToolExecute(registry, node.tool!, input, config, child.signal, host, { nodeId: node.id });
+      const result = await gatedToolExecute(registry, node.tool!, input, config, child.signal, host, { nodeId: node.id, ...(iteration ? { iteration } : {}) });
       cp.output = result.output;
       cp.status = timedOut ? "timed_out" : signal.aborted ? "cancelled" : result.isError ? "failed" : "passed";
       if (result.isError) cp.error = result.output;
@@ -138,24 +146,15 @@ export const jobExecutor: NodeExecutor = {
   },
 };
 
-/** Placeholder until loop execution lands: a dispatched loop node fails without running its body. */
-export const loopExecutor: NodeExecutor = {
-  type: "loop",
-  async execute({ store, run, checkpoint: cp }) {
-    cp.status = "failed"; cp.error = "loop execution not implemented";
-    cp.startedAt = new Date().toISOString(); cp.endedAt = cp.startedAt;
-    await store.save(run);
-    return { next: "stop" };
-  },
-};
-
-const EXECUTORS = new Map<string, NodeExecutor>([toolExecutor, approvalExecutor, jobExecutor, agentExecutor, promptExecutor, loopExecutor].map(executor => [executor.type, executor]));
+// Built lazily: loop-node.ts imports this module, so the registry must not read loopExecutor during module evaluation.
+let EXECUTORS: Map<string, NodeExecutor> | undefined;
 /** True when an interrupted (running) node of this definition node is re-dispatched instead of parked as uncertain. */
 export function retriesOnResume(node: WorkflowNode): boolean {
   return getNodeExecutor(node.type).retryOnResume?.(node) === true;
 }
 /** Registry lookup; an unknown node type is a programming error (validation rejects it first). */
 export function getNodeExecutor(type: string): NodeExecutor {
+  EXECUTORS ??= new Map<string, NodeExecutor>([toolExecutor, approvalExecutor, jobExecutor, agentExecutor, promptExecutor, loopExecutor].map(executor => [executor.type, executor]));
   const executor = EXECUTORS.get(type);
   if (!executor) throw new Error(`No executor for workflow node type: ${type}`);
   return executor;
