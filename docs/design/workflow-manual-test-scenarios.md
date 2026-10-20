@@ -38,7 +38,7 @@ Not repeated below as manual steps.
   - So the doc's commands work verbatim, add `alias agav=~/cli/agav/dist/agav` (or a shell function) in every terminal you use.
   - Binaries built before e9ec5a97 fail every background run with `unknown flag --internal-workflow-runner`.
   - Sanity check: `agav workflows run <any simple workflow> --wait` should pass. While a run is going, `pgrep -af internal-workflow-runner` shows `.../agav --internal-workflow-runner <uuid>`.
-- [ ] Isolate the data dir. It is `~/.agav`, and `HOME` is the only isolation knob:
+- [ ] Isolate the data dir. It is `~/.agav`, and on Linux/macOS `HOME` is the only isolation knob (on Windows use `USERPROFILE`, see Running on Windows):
 
   ```sh
   export HOME=/tmp/wf-testing/home
@@ -74,6 +74,231 @@ Not repeated below as manual steps.
 - [ ] Check the baseline: `agav workflows list` prints `No workflow runs.`
 
 Each scenario has a Cleanup step that deletes its runs from the TUI (`d` on a finished run). To wipe everything instead: `rm -rf /tmp/wf-testing/home/.agav/workflow-runs`.
+
+## Running on Windows
+
+Nothing in this section was run on a real Windows host. Claims that come from reading the code only are marked **UNVERIFIED**.
+
+> **What to expect on Windows today**
+>
+> - Background runs are **refused by design**: the Windows platform adapter reports `nativeHelperAvailable=false`. The pass criterion on Windows is therefore "refused clearly **before** any consent prompt, and nothing is created".
+> - Refusal text: `Background workflow runs are unavailable on this host: the native process helper is missing (<limitations joined with "; ">).` The CLI prints it as `error: ...` with exit code `1`; the slash command prints `Workflow error: ...`; the TUI `R` key shows it as status text or form error, without a prefix.
+> - Order in `workflows run`: TTY check, then resolve/load/validate, then the Windows refusal, then the consent prompt. No run is created.
+> - Works without a runner: `workflows validate`, `list`, `status`, `inbox` (read-only), and `cancel` partly.
+> - Blocked as expected: M1, M2, M4, M5, M6, M8-M13, and the run parts of M3 and M7 (matrix below).
+> - There is no supported way to run workflows on Windows today. The `--foreground` fallback proposed in workflow-plan.md §6 was never built (the CLI only has `--input`, `--wait`, `--json`). See "Windows follow-ups".
+
+### Windows setup
+
+Use **Windows Terminal** with PowerShell for the main pass; repeat W4 in legacy conhost. cmd variants are given where simple.
+
+- [ ] Build or install agav (needs Node >= 22.13.0; the binary build also needs `bun.exe`):
+
+  ```powershell
+  cd C:\path\to\agav; git pull
+  pnpm run build:binary          # runs `node scripts\build-binary.mjs native` -> dist\agav.exe
+  # or: pnpm build               # then run `node build\cli.js` (never verified on Windows)
+  ```
+
+  `scripts\install.ps1` installs `agav.exe` into `%LOCALAPPDATA%\agav` and adds it to the user PATH. Use a fresh build, not the installed one, if it is older than e9ec5a97.
+- [ ] Make `agav` resolve in every terminal you use:
+
+  ```powershell
+  function agav { & C:\path\to\agav\dist\agav.exe @args }      # PowerShell (put it in $PROFILE or paste per window)
+  ```
+
+  ```bat
+  doskey agav=C:\path\to\agav\dist\agav.exe $*
+  ```
+
+- [ ] Isolate the data dir. The data dir is `<home>\.agav`; there is no `AGAV_HOME`. On Windows Node's `os.homedir()` reads `USERPROFILE`, **not** `HOME`, so setting `HOME` does nothing. Set `USERPROFILE` **before** starting agav, in a **dedicated terminal window** (changing it can break git, npm and ssh in that shell):
+
+  ```powershell
+  New-Item -ItemType Directory -Force C:\wf-testing\home | Out-Null
+  $env:USERPROFILE = 'C:\wf-testing\home'
+  node -e "console.log(require('os').homedir())"       # must print C:\wf-testing\home
+  ```
+
+  ```bat
+  mkdir C:\wf-testing\home
+  set USERPROFILE=C:\wf-testing\home
+  node -e "console.log(require('os').homedir())"
+  ```
+
+  UNVERIFIED on a real Windows host. If the one-liner prints your real profile, stop and fix that first.
+- [ ] Create `%USERPROFILE%\.agav\config.json` **without a BOM**. Windows PowerShell 5.1 `Out-File -Encoding utf8` and `Set-Content -Encoding UTF8` write a BOM. `config.json` is read with `readFile(..., "utf-8")` + `JSON.parse` inside a `try/catch {}` and no BOM strip, so a BOM file is probably **silently ignored** and the gates look off (UNVERIFIED on Windows; inferred from `loadGlobalConfig`).
+
+  ```powershell
+  $d = Join-Path $env:USERPROFILE '.agav'; New-Item -ItemType Directory -Force $d | Out-Null
+  $noBom = New-Object System.Text.UTF8Encoding $false
+  [System.IO.File]::WriteAllText("$d\config.json", '{"backgroundJobsEnabled":true,"workflowsEnabled":true,"permissionMode":"ask"}', $noBom)
+  ```
+
+  ```bat
+  mkdir %USERPROFILE%\.agav
+  echo {"backgroundJobsEnabled":true,"workflowsEnabled":true,"permissionMode":"ask"}> %USERPROFILE%\.agav\config.json
+  ```
+
+- [ ] Create the workflow cwd: a path with no spaces, **not** under `%TEMP%`:
+
+  ```powershell
+  New-Item -ItemType Directory -Force C:\wf-testing\.agav\workflows | Out-Null; cd C:\wf-testing
+  ```
+
+  Workflow files go in `C:\wf-testing\.agav\workflows\`. Prefer YAML. If you write JSON, save it **without a BOM** (same `WriteAllText` call) and write backslashes as `\\` inside JSON strings.
+- [ ] Baseline: `agav workflows list` prints `No workflow runs.` (it creates `%USERPROFILE%\.agav\background-jobs`; that is fine).
+
+### Command translation (only commands this doc uses)
+
+| Doc (Unix) | PowerShell | cmd |
+| --- | --- | --- |
+| `export X=1`, or `X=1 cmd` | `$env:X = '1'` (stays for the session; `Remove-Item Env:X` to unset) | `set X=1` |
+| `cat f` | `Get-Content f` | `type f` |
+| `rm -f f` / `rm -rf d` | `Remove-Item -Force f -ErrorAction SilentlyContinue` / `Remove-Item -Recurse -Force d` | `del /q f` / `rmdir /s /q d` |
+| `ls d` | `Get-ChildItem d` (a missing dir is an error here: it means nothing was created) | `dir d` |
+| `mkdir -p d` | `New-Item -ItemType Directory -Force d` | `mkdir d` |
+| `cp a b`, `touch f` | `Copy-Item a b`, `New-Item f -ItemType File -Force` | `copy a b` |
+| `diff a b` | `Compare-Object (Get-Content a) (Get-Content b)` (no output = same) | `fc a b` |
+| `jq .consent.envNames f` | `(Get-Content f -Raw \| ConvertFrom-Json).consent.envNames` (or install jq) | install jq |
+| `grep -r pat d` | `Get-ChildItem d -Recurse -File \| Select-String pat` | `findstr /s /i pat d\*` |
+| `pgrep -af internal-workflow-runner` | `Get-CimInstance Win32_Process \| Where-Object CommandLine -like '*internal-workflow-runner*' \| Select-Object ProcessId,CommandLine` | n/a |
+| `kill <pid>` / `kill -9` | `Stop-Process -Id <pid>` / `Stop-Process -Id <pid> -Force` | `taskkill /pid <pid> /f` |
+| `echo $?`, `echo "exit=$?"` | `$LASTEXITCODE` | `echo %ERRORLEVEL%` |
+| `echo y \| agav ...` | `'y' \| agav workflows run x; "exit=$LASTEXITCODE"` | `echo y \| agav workflows run x` |
+| `agav ... \| cat` | `agav ... \| Out-String` | `agav ... \| more` |
+| `sleep N` (shell command) | `Start-Sleep N` (inside a workflow `cmd` job: `timeout /t N`) | `timeout /t N` |
+| `printenv X` | `$env:X` | `echo %X%` |
+| `/proc/<pid>/environ` | no equivalent: the M13 process check is Linux-only | n/a |
+| `script`, pty drivers | Linux-only | n/a |
+| `$(...)`, `seq`, `&&`, `>>`, heredocs (in workflow commands) | the example workflows are POSIX shell; do not port them (nothing can run them) | n/a |
+
+### Scenario matrix
+
+| Scenario | Windows | What to do |
+| --- | --- | --- |
+| M1 | BLOCKED (expected) | Do on Linux instead. On Windows the `R` key shows the refusal (W1). |
+| M2 | BLOCKED (expected) | Do on Linux instead. |
+| M3 | Partial | `v` (validate), Tab, footers work (W4). Its sample jobs use POSIX shell; Run, Logs and Re-run are blocked. |
+| M4 | BLOCKED (expected) | Do on Linux instead. |
+| M5, M6 | BLOCKED (expected) | Do on Linux instead. |
+| M7 | Partial | `agav workflows validate` of the A2A workflow works (as W3); the run is blocked. |
+| M8-M11, M13 | BLOCKED (expected) | Do on Linux instead (M13 also needs `/proc`). |
+| M12 | BLOCKED (expected) | Needs aged finished runs; none can be created. Do on Linux. |
+| M14 | **Run it: W1** | The Windows scenario. |
+| M15 | Partial: **W2** | Gates, no-TTY refusal and the unchanged store work; `pgrep` and `ls` need the translations above. |
+
+### W1. Refusal before consent (M14 on Windows)
+
+**Goal:** `workflows run` is refused before any consent prompt and creates nothing, in the CLI, the slash command and the TUI.
+
+**Prerequisites:** setup above, and `.agav\workflows\m14-any.yaml` (the file from M14). Write it without a BOM:
+
+```powershell
+$y = "version: 1`nname: m14-any`nnodes:`n  - id: hello`n    type: tool`n    tool: run_command`n    input:`n      command: echo hello`n"
+[System.IO.File]::WriteAllText("$PWD\.agav\workflows\m14-any.yaml", $y, (New-Object System.Text.UTF8Encoding $false))
+```
+
+**Steps:**
+
+1. - [ ] `agav workflows validate m14-any` prints `Workflow valid.`
+2. - [ ] In the terminal (not piped): `agav workflows run m14-any; "exit=$LASTEXITCODE"` (cmd: `agav workflows run m14-any` then `echo %ERRORLEVEL%`). Stderr starts with `error: Background workflow runs are unavailable on this host: the native process helper is missing`, then the limitation strings in parentheses and a period. `exit=1`. No consent summary, no env checklist, no `Approve this background run?`.
+3. - [ ] Nothing was created: `agav workflows list` prints `No workflow runs.`; `Get-ChildItem $env:USERPROFILE\.agav\workflow-runs` is missing or empty (no `<uuid>.json`, no run directory); `Get-CimInstance Win32_Process | Where-Object CommandLine -like '*internal-workflow-runner*'` prints nothing.
+4. - [ ] Slash command: start `agav`, type `/workflows run m14-any`. The answer is `Workflow error: Background workflow runs are unavailable on this host: the native process helper is missing...` and no consent screen opens.
+5. - [ ] TUI: open the Workflows tab, select `m14-any`, press `R`. The same message (without a prefix) appears in the status line or the input form. No crash, no consent stage.
+6. - [ ] Repeat step 3.
+
+**Expected:** the refusal before consent, exit code 1, nothing created, no runner process.
+
+**Failure signal:** a consent prompt appears first; a run or `<uuid>.json` exists afterwards; a stack trace or unrelated error; exit code `0`.
+
+**Cleanup:** none. If a stray run exists, delete it from the TUI.
+
+### W2. Gates and no-TTY (M15 on Windows)
+
+**Goal:** the two gates and the no-TTY refusal behave as in M15; nothing is started.
+
+**Prerequisites:** setup above, `.agav\workflows\m15-ok.yaml` (as in M15, `command: echo m15`, written without a BOM), and a copy of the good config: `Copy-Item $env:USERPROFILE\.agav\config.json $env:USERPROFILE\.agav\config.json.good`.
+
+**Steps:**
+
+1. - [ ] `workflowsEnabled:false` (write the config with the `WriteAllText` snippet, no BOM): `agav workflows list`, `run m15-ok` and `validate m15-ok` each print `error: Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.` and exit `1`.
+2. - [ ] `backgroundJobsEnabled:false`: the same message.
+3. - [ ] Restore with `Copy-Item ...config.json.good ...config.json`; `agav workflows list` works again.
+4. - [ ] `Get-ChildItem $env:USERPROFILE\.agav\workflow-runs -ErrorAction SilentlyContinue > C:\wf-testing\before.txt`, then `'y' | agav workflows run m15-ok; "exit=$LASTEXITCODE"` prints `error: workflow run requires interactive consent` and `exit=1`. (This check comes before the runner refusal.)
+5. - [ ] `agav workflows run m15-ok | Out-String` prints the same error and nothing on stdout.
+6. - [ ] Repeat the `Get-ChildItem` into `after.txt`; `Compare-Object (Get-Content C:\wf-testing\before.txt) (Get-Content C:\wf-testing\after.txt)` prints nothing. No `internal-workflow-runner` process (W1 step 3 query).
+7. - [ ] `'y' | agav workflows run x` prints the same `requires interactive consent` error.
+
+**Expected / Failure signal:** as M15. A gate that seems ignored with a BOM config: check the BOM first (setup).
+
+**Cleanup:** `Remove-Item C:\wf-testing\before.txt,C:\wf-testing\after.txt,$env:USERPROFILE\.agav\config.json.good`; make sure both gates are `true` again.
+
+### W3. Validate and discovery, including BOM and CRLF
+
+**Goal:** `workflows validate` works without a runner, and the BOM/CRLF behaviour is recorded.
+
+**Prerequisites:** setup above. Create four files in `.agav\workflows`:
+
+```powershell
+$bom = New-Object System.Text.UTF8Encoding $true
+$yaml = "version: 1`r`nname: w3-bom-yaml`r`nnodes:`r`n  - id: hello`r`n    type: tool`r`n    tool: run_command`r`n    input:`r`n      command: echo hello`r`n"
+$json = '{"version":1,"name":"w3-bom-json","nodes":[{"id":"hello","type":"tool","tool":"run_command","input":{"command":"echo hello"}}]}' + "`r`n"
+[System.IO.File]::WriteAllText("$PWD\.agav\workflows\w3-bom-yaml.yaml", $yaml, $bom)
+[System.IO.File]::WriteAllText("$PWD\.agav\workflows\w3-bom-json.json", $json, $bom)
+[System.IO.File]::WriteAllText("$PWD\.agav\workflows\w3-bad.yaml", "version: 1`nname: w3-bad`nnodes:`n  - id: x`n    type: bogus`n", (New-Object System.Text.UTF8Encoding $false))
+```
+
+**Steps:**
+
+1. - [ ] `agav workflows validate m14-any` prints `Workflow valid.`
+2. - [ ] `agav workflows validate w3-bad` prints an `error:` line naming the problem (the unknown node type) and exits `1`; never `Workflow valid.`
+3. - [ ] `agav workflows validate w3-bom-yaml` prints `Workflow valid.` (BOM + CRLF YAML is accepted).
+4. - [ ] `agav workflows validate w3-bom-json` fails with a JSON parse error and exit `1`. This is the **current behaviour**, not the wanted one: `loadDefinition` does not strip a BOM (listed under follow-ups). The exact message text is UNVERIFIED on Windows. A CRLF-only JSON file (no BOM) is expected to pass; the definition hash is the same as with LF.
+5. - [ ] In the TUI Workflows tab all valid definitions are listed; press `v` on one: it validates.
+
+**Expected:** steps 1, 3 pass; 2 and 4 fail with a clear message.
+
+**Failure signal:** a stack trace; `w3-bom-json` validates (then the BOM was fixed: update this doc); `w3-bad` validates.
+
+**Cleanup:** `Remove-Item .\.agav\workflows\w3-*`.
+
+### W4. TUI rendering at 80x24
+
+**Goal:** the TUI is usable at 80x24 in Windows Terminal and in legacy conhost (`conhost.exe`, e.g. `cmd` opened from Win+R).
+
+**Steps:**
+
+1. - [ ] Resize to 80x24 (conhost: Properties > Layout; Windows Terminal: drag until the size is shown). Start `agav`, open the workflows view. Three tabs render (Workflows, Runs, Inbox) and Tab switches between them.
+2. - [ ] The Workflows tab lists `m14-any`. The Runs tab shows its empty state. The Inbox shows `No pending decisions.`
+3. - [ ] Footers wrap or truncate without overlapping the list.
+4. - [ ] Glyphs: `✓ ✗ ● ◐ ⊘ ⏱ ↷ …` and the `│` separator are legible. They have no ASCII fallback. Windows Terminal is expected to be fine; `⏱` and `⊘` may render as boxes or `?` in conhost (UNVERIFIED). Record the font and host.
+
+**Expected:** a usable layout in Windows Terminal. In conhost, bad glyphs are a known gap (follow-ups), not a test failure; record them.
+
+**Failure signal:** overlapped or garbled layout, a crash on resize, keys not working.
+
+### W5. Empty store, list, status, inbox, Ctrl+C
+
+**Steps:**
+
+1. - [ ] With an empty store: `agav workflows list` prints `No workflow runs.`; `agav workflows inbox` prints `No pending workflow decisions.` and exits `0`; `agav workflows status 00000000` fails with an `error:` line (the exact text is UNVERIFIED) and no stack trace.
+2. - [ ] `Test-Path $env:USERPROFILE\.agav\background-jobs` is `True` after `list` (it creates the dir; fine). Reconcile problems may print as warnings only.
+3. - [ ] Ctrl+C in the open TUI exits it cleanly: the prompt returns, the cursor is visible and the console is not left in raw mode (typed characters echo again). `Get-CimInstance Win32_Process | Where-Object CommandLine -like '*agav*'` shows no leftover `agav` started by this test (UNVERIFIED on Windows).
+
+**Expected:** clean empty states and a clean exit.
+
+**Failure signal:** a stack trace, a hung terminal, an orphan process, no echo after exit.
+
+### Windows follow-ups (code)
+
+- The `--foreground` fallback from workflow-plan.md §6 was never built, so workflows cannot run on Windows at all.
+- Probable bug: `loadDefinition` does not strip a UTF-8 BOM, so JSON workflows saved by PowerShell 5.1 fail to parse (YAML is fine). Strip `\uFEFF` before `JSON.parse`. The same holds for `config.json` (silently ignored).
+- The example workflows in this doc are POSIX shell (`seq`, `$(...)`, `sleep`, `&&`, `>>`, `printenv`); run_command nodes use `cmd.exe /d /s /c` on win32 and `job` nodes with `command` default to `cmd`. They matter only once a runner exists.
+- There is no sandbox backend on Windows; settings that require a sandbox make `run_command` refuse.
+- `createExclusive` uses `fs.link` with no `EPERM` retry (unlike `writeAtomic`): it fails closed with storage-unavailable on FAT/exFAT, some ReFS setups and network shares (UNVERIFIED).
+- Checkpoints pin the cwd with strict `!==` after `realpath`; no drive-letter or case normalisation (UNVERIFIED how `realpath` cases on NTFS).
+- Status glyphs have no ASCII fallback (`format.ts`).
+- The data dir has no override (`AGAV_HOME`) and reads `homedir()` at module load, which forces the `USERPROFILE` trick above.
 
 ## M1. TUI run flow
 
@@ -885,6 +1110,8 @@ Then, in the terminal where you launch the run: `export HOME=/tmp/wf-testing/hom
 
 **Goal:** On Windows, or any host where the background-jobs capabilities report `nativeHelperAvailable: false`, `workflows run` refuses **before** the consent prompt, with a clear message, and creates no run. Skip this scenario on Linux/macOS (the helper is available there and there is no supported switch to turn it off); mark it `n/a` in the log.
 
+**Windows:** this is the scenario to run there; the translated steps are in **W1** (see Running on Windows).
+
 **Prerequisites:** a Windows host (or another host without the helper), `backgroundJobsEnabled` and `workflowsEnabled` set, and `.agav/workflows/m14-any.yaml`
 
 ```yaml
@@ -901,9 +1128,9 @@ nodes:
 **Steps:**
 
 1. - [ ] `agav workflows validate m14-any` prints `Workflow valid.` (validation does not need the helper).
-2. - [ ] In a real terminal: `agav workflows run m14-any`. Before any consent text or `Approve this background run?` question appears, stderr shows `error: Background workflow runs are unavailable on this host: the native process helper is missing`, followed by the capability limitations in parentheses (if there are any) and a period. The exit code is `1` (`echo $?`).
+2. - [ ] In a real terminal: `agav workflows run m14-any`. Before any consent text or `Approve this background run?` question appears, stderr shows `error: Background workflow runs are unavailable on this host: the native process helper is missing`, followed by the capability limitations in parentheses (if there are any) and a period. The exit code is `1` (`echo $?`; PowerShell: `$LASTEXITCODE`; cmd: `echo %ERRORLEVEL%`).
 3. - [ ] In the TUI/app, `/workflows run m14-any` answers `Workflow error: Background workflow runs are unavailable on this host: the native process helper is missing...` and does **not** open the consent screen.
-4. - [ ] `agav workflows list` prints `No workflow runs.` and `ls ~/.agav/workflow-runs` shows no new `<uuid>.json` or run directory.
+4. - [ ] `agav workflows list` prints `No workflow runs.` and `ls ~/.agav/workflow-runs` (PowerShell: `Get-ChildItem $env:USERPROFILE\.agav\workflow-runs`) shows no new `<uuid>.json` or run directory.
 
 **Expected:** the refusal text above, shown before consent, and no run created.
 
@@ -966,6 +1193,31 @@ Keep a copy of the good config: `cp $HOME/.agav/config.json $HOME/.agav/config.j
 | M14 |  |  |  |
 | M15 |  |  |  |
 
+### Windows results
+
+Fill in on a Windows host. `blocked-as-expected` rows are pre-filled from the code, not from a run: confirm each by seeing the refusal (W1), or leave them as is.
+
+| Scenario | Result (pass / fail / blocked-as-expected) | Notes | Date |
+| --- | --- | --- | --- |
+| W1 |  |  |  |
+| W2 |  |  |  |
+| W3 |  | BOM JSON fails: expected today |  |
+| W4 |  | host/font: |  |
+| W5 |  |  |  |
+| M1 | blocked-as-expected |  |  |
+| M2 | blocked-as-expected |  |  |
+| M3 | blocked-as-expected | `v`, Tab, footers checked in W4 |  |
+| M4 | blocked-as-expected |  |  |
+| M5 | blocked-as-expected |  |  |
+| M6 | blocked-as-expected |  |  |
+| M7 | blocked-as-expected | `validate` alone works (W3) |  |
+| M8 | blocked-as-expected |  |  |
+| M9 | blocked-as-expected |  |  |
+| M10 | blocked-as-expected |  |  |
+| M11 | blocked-as-expected |  |  |
+| M12 | blocked-as-expected |  |  |
+| M13 | blocked-as-expected | Linux-only (`/proc`) |  |
+
 ## Cleanup
 
 When all scenarios are done:
@@ -986,3 +1238,16 @@ When all scenarios are done:
   ```
 
 - [ ] Unset test variables in your shell: `unset WF_SECRET_A WF_SECRET_B FAKE_SECRET`, and open a new terminal so `HOME` points to your real home again.
+
+**Windows (PowerShell, in the dedicated test terminal):**
+
+- [ ] Stop leftover processes that belong to the test profile only, then check nothing remains:
+
+  ```powershell
+  Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*wf-testing*' -and $_.CommandLine -like '*agav*' } | Select-Object ProcessId,CommandLine
+  # after checking the list: Stop-Process -Id <pid>   (one pid at a time; never match on 'agav' alone)
+  Get-CimInstance Win32_Process | Where-Object CommandLine -like '*internal-workflow-runner*'    # prints nothing
+  ```
+
+- [ ] Delete the throwaway profile and workflow cwd: `Remove-Item -Recurse -Force C:\wf-testing`.
+- [ ] Restore `USERPROFILE` by closing the dedicated terminal window (do not set it back by hand), and remove any `$env:` test variables (`Remove-Item Env:FAKE_SECRET`). Remove the `agav` function if you pasted it only for this pass.
