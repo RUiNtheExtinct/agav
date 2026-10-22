@@ -15,13 +15,16 @@ function fixture(platform = 'win32', failure = true, args: string[] = [], powers
   copyFileSync('scripts/build-binary.mjs', join(root, 'scripts/build-binary.mjs'));
   writeFileSync(join(root, 'source/voice/bundled-runtime.ts'), 'original stub\n');
   writeFileSync(join(root, 'scripts/gen-bundled-skills.mjs'), '');
-  // Mock only Bun in an isolated subprocess; keep real filesystem and Node execution.
+  // Simulate the build host while keeping filesystem paths native to the real host.
   const preload = join(root, 'mock-bun.mjs');
   writeFileSync(preload, `
     import cp from 'node:child_process';
+    import os from 'node:os';
     import { syncBuiltinESMExports } from 'node:module';
     import { writeFileSync } from 'node:fs';
+    os.tmpdir = () => ${JSON.stringify(root)};
     Object.defineProperty(process, 'platform', { value: ${JSON.stringify(platform)} });
+    Object.defineProperty(process, 'arch', { value: 'x64' });
     const original = cp.spawnSync;
     cp.spawnSync = (command, args, options) => {
       if (command === 'powershell.exe') {
