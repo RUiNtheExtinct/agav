@@ -24,6 +24,12 @@ interface Props {
   canExpandPaste?: boolean;
   onRemoveAttachment?: () => void;
   onClearAttachments?: () => void;
+  /** Replace externally owned text without reporting it as a user edit. */
+  onRegisterReplace?: (replace: (text: string, preserveCursor?: boolean) => void) => void;
+  /** Keep the composer visible while another controller owns keyboard input. */
+  readOnly?: boolean;
+  /** Other controller exclusively handles plain Enter/Escape/Ctrl+C. */
+  ownsVoiceControls?: () => boolean;
   onRegisterInsert?: (fn: (label: string) => void) => void;
   /** Shares the synchronous buffer with other keyboard handlers before React commits. */
   onRegisterRead?: (read: () => string) => void;
@@ -268,7 +274,7 @@ function isWithinRoot(root: string, candidate: string): boolean {
 }
 
 /** Renders the interactive prompt with history, completion, and paste handling. */
-export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPaste, canExpandPaste = false, onRemoveAttachment, onClearAttachments, onRegisterInsert, onRegisterRead, onRegisterExpand, onOpenAttachment, disabled, suppressHistory = false, commands = [], keybindings, enhancedKeyboard = false, resumeUserMessages, agentLock, agentNames = [] }: Props) {
+export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPaste, canExpandPaste = false, onRemoveAttachment, onClearAttachments, onRegisterInsert, onRegisterReplace, onRegisterRead, onRegisterExpand, onOpenAttachment, disabled, readOnly = false, ownsVoiceControls, suppressHistory = false, commands = [], keybindings, enhancedKeyboard = false, resumeUserMessages, agentLock, agentNames = [] }: Props) {
   const { isRawModeSupported } = useStdin();
   const { stdout } = useStdout();
   const [, bumpCursor] = useState(0);
@@ -308,11 +314,23 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
   const text = liveRef.current.value;
   const cursorPos = Math.min(liveRef.current.cursor, text.length);
 
-  /** Replaces the buffer and places the caret, live and for the parent both. */
-  const applyEdit = (nextValue: string, nextCursor: number) => {
+  /**
+   * Replaces the buffer and places the caret, live and for the parent both.
+   *
+   * Any edit ends history browsing: once the user types, deletes, clears, or
+   * completes a suggestion the recalled text is no longer "the history entry
+   * under the cursor", so the browsing index and saved draft are dropped. The
+   * history-recall handlers themselves pass `keepHistory` to write the next
+   * entry without resetting the state they are mid-walking.
+   */
+  const applyEdit = (nextValue: string, nextCursor: number, keepHistory = false) => {
     preferredColumnRef.current = null;
     liveRef.current = { value: nextValue, cursor: nextCursor };
     lastEmittedRef.current = nextValue;
+    if (!keepHistory) {
+      historyIndexRef.current = -1;
+      draftRef.current = null;
+    }
     emitValue(nextValue);
     bumpCursor((n) => n + 1);
   };
@@ -464,6 +482,17 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
     onRegisterRead?.(() => liveRef.current.value);
   }, [onRegisterRead]);
 
+  useEffect(() => {
+    onRegisterReplace?.((nextValue, preserveCursor = false) => {
+      if (!preserveCursor) preferredColumnRef.current = null;
+      const old = liveRef.current;
+      const following = old.cursor === old.value.length && selAnchorRef.current === null;
+      liveRef.current = { value: nextValue, cursor: preserveCursor && !following ? Math.min(old.cursor, nextValue.length) : nextValue.length };
+      lastEmittedRef.current = nextValue;
+      bumpCursor(n => n + 1);
+    });
+  }, [onRegisterReplace]);
+
   // Register insert function so parent can insert text at cursor (e.g. Ctrl+I image)
   useEffect(() => {
     if (onRegisterInsert) {
@@ -575,13 +604,15 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
 
   useInput(
     (rawInput, rawKey) => {
-      if (disabled) return;
+      if (disabled || readOnly) return;
       // Shadow the render-scope text and caret with the live ones. The render
       // scope is a snapshot from the last commit, and the whole point is that
       // this key may have arrived before that commit caught up.
       const value = liveRef.current.value;
       const cursorPos = Math.min(liveRef.current.cursor, value.length);
       const { input, key } = normalizeKeyEvent(rawInput, rawKey);
+      if (ownsVoiceControls?.() && (key.escape || (key.ctrl && input === "c") ||
+          (key.return && !key.shift && !key.ctrl && !key.meta && !key.super && !key.hyper))) return;
       const match = keyResolverRef.current.feed(input, key);
       if (match.pending) return;
 
@@ -652,8 +683,10 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
         }
       }
 
-      // Agent argument suggestions (for `/agent <partial>`)
-      if (hasAgentArgSuggestions) {
+      // Agent argument suggestions (for `/agent <partial>`). As with command
+      // suggestions, yield up/down to history navigation while the user is
+      // actively browsing history.
+      if (hasAgentArgSuggestions && historyIndexRef.current < 0) {
         if (match.action === "historyDown") {
           setSelectedSuggestion((prev) => Math.min(prev + 1, matchingAgentArgs.length - 1));
           return;
@@ -662,6 +695,8 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
           setSelectedSuggestion((prev) => Math.max(prev - 1, 0));
           return;
         }
+      }
+      if (hasAgentArgSuggestions) {
         if (key.tab) {
           const selected = matchingAgentArgs[selectedSuggestion];
           if (selected) {
@@ -687,8 +722,11 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
         }
       }
 
-      // Command suggestions navigation
-      if (hasCommandSuggestions) {
+      // Command suggestions navigation. While the user is actively browsing
+      // prompt history (historyIndexRef >= 0), a recalled slash command opens
+      // this dropdown — but up/down must keep cycling history rather than being
+      // captured here, so the user can walk past the recalled command.
+      if (hasCommandSuggestions && historyIndexRef.current < 0) {
         if (key.downArrow || match.action === "historyDown") {
           setSelectedSuggestion((prev) => Math.min(prev + 1, matchingCommands.length - 1));
           return;
@@ -697,6 +735,10 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
           setSelectedSuggestion((prev) => Math.max(prev - 1, 0));
           return;
         }
+      }
+      // Non-arrow command-suggestion actions (tab/submit/cancel) apply whether
+      // or not history browsing is active.
+      if (hasCommandSuggestions) {
         if (key.tab) {
           const selected = matchingCommands[selectedSuggestion];
           if (selected) {
@@ -766,7 +808,7 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
         const nextIdx = Math.min(historyIndexRef.current + 1, history.length - 1);
         historyIndexRef.current = nextIdx;
         const msg = history[history.length - 1 - nextIdx]!;
-        applyEdit(msg, msg.length);
+        applyEdit(msg, msg.length, /* keepHistory */ true);
         return;
       }
 
@@ -786,7 +828,7 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
         }
         historyIndexRef.current--;
         const msg = history[history.length - 1 - historyIndexRef.current]!;
-        applyEdit(msg, msg.length);
+        applyEdit(msg, msg.length, /* keepHistory */ true);
         return;
       }
 
@@ -888,7 +930,7 @@ export default function InputPrompt({ value, onChange: emitValue, onSubmit, onPa
         setSelectedSuggestion(0);
       }
     },
-    { isActive: !disabled },
+    { isActive: !disabled && !readOnly },
   );
 
   if (disabled) return null;

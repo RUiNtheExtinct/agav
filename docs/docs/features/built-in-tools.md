@@ -6,7 +6,7 @@ order: 2
 
 # Built-in Tools
 
-Agav exposes the following default tools to its agent loop. Availability also depends on the execution mode and configured extensions.
+Agav exposes these tools to its agent loop.
 
 | Tool | Purpose |
 | --- | --- |
@@ -14,34 +14,25 @@ Agav exposes the following default tools to its agent loop. Availability also de
 | `write_file` | Create or replace a file |
 | `edit_file` | Replace one exact, unique string in a file |
 | `find_files` | Find names and glob matches |
-| `grep_search` | Search file contents with regular expressions, or return unique matching text-file paths |
+| `grep_search` | Search file contents with regular expressions |
 | `list_directory` | List a directory |
 | `overview` | Map a repository's directory and symbol structure |
 | `run_command` | Execute a shell command with sandbox detection |
 | `run_tests` | Detect and run a supported project test framework |
-| `web_search` | Search the web with DuckDuckGo |
+| `lsp_query` | Request definitions, references, or hover data from a language server; diagnostic notifications are not yet fully surfaced |
+| `read_notebook` | Read Jupyter notebook cells |
+| `edit_notebook` | Change a notebook cell or its type |
+| `web_search` | Search the web with DuckDuckGo (opt-in; see note below) |
 | `fetch_url` | Send an HTTP request and return the response |
-| `update_plan` | Update the active plan's current step (interactive sessions, not headless mode) |
+| `github` | Create or view GitHub pull requests and issues |
+| `update_plan` | Update the active plan's current step |
 | `save_memory` | Persist durable project or user context |
 | `subagent` | Delegate an independent task |
 | `activate_skill` | Run a registered skill by name |
 
-`subagent` and `activate_skill` are registered when their delegation and skill integrations are available. `update_plan` is removed from the main headless registry (`agav -P`, `agav run`, and piped execution); headless runs do not load or mutate an interactive session plan.
+`web_search` is off by default. Enable it per session with the [`--search`](/reference/cli) flag, or turn it on by default with the `search` field in [configuration](/reference/configuration).
 
-### Optional built-ins
-
-These tools ship with Agav but are **not exposed in normal interactive or headless sessions**:
-
-| Tool | Purpose |
-| --- | --- |
-| `lsp_query` | Request definitions, references, or hover data from a language server; diagnostic notifications are not yet fully surfaced |
-| `read_notebook` | Read Jupyter notebook cells |
-| `edit_notebook` | Change a notebook cell or its type |
-| `github` | Create or view GitHub pull requests and issues |
-
-Explicitly name an optional tool in a skill's `allowed-tools` or a native agent's `native-tools` manifest allowlist to expose it **inside that child execution**, not to the main session. A skill without an allowlist does not automatically gain optional built-ins; `disallowed-tools` takes precedence over its allowlist. Native agents receive only the built-ins they explicitly request, alongside their local and declared MCP tools.
-
-Connected MCP servers, installed plugins, and active skills can add more tools. See [the LSP opt-in recipe](/guides/explore-code-with-lsp) for a scoped navigation skill.
+Connected MCP servers, installed plugins, and active skills can add more tools.
 
 ## Output limits and recovery
 
@@ -78,20 +69,6 @@ Use the path in the notice with `read_file` and `start_line`/`end_line`, or `gre
 Large text files are streamed rather than loaded in full. A bounded text read returns a contiguous prefix of the requested range, reserving room for headers and recovery instructions (at most 1,995 selected whole lines). Its continuation notice identifies the next `start_line` in the **original file**, preserving any requested `end_line`; no duplicate temporary copy is needed. Follow that notice rather than treating the returned excerpt as the whole file. If the first requested line alone is too long, Agav returns a bounded excerpt and recommends targeted byte extraction with `run_command`; repeating that same line range will not advance through the line.
 
 PDF and Office ranges use 1-based, inclusive `start_page` and `end_page`, with at most **10 pages** per preview. Images do not accept line or page ranges, and PDF/Office documents do not accept line ranges. Office fallback behavior depends on available conversion tools: without LibreOffice, `.pptx` uses extracted slide text, while `.docx` uses extracted text without preserving page ranges or visual layout. See [files and context](/workflows/files-and-context) for attachment and preview requirements; `@file` attachment limits are separate from these tool-result limits.
-
-### `grep_search`
-
-`pattern` is a regular expression; `path` selects a file or directory (default: the working directory), and `include` filters file names with a glob such as `*.ts`. By default, results include matching content with file paths and line numbers, capped at **100 matching lines**.
-
-Set `files_only: true` to return each matching **text-file path once**, without line numbers or file contents. This mode skips binary files and caps results at **100 files**, not 100 occurrences. Exactly 100 matching files need no truncation notice; an additional matching file produces `... results truncated at 100 files`. `files_only` must be a boolean and defaults to `false`.
-
-```json
-{"pattern": "createToolRegistry", "path": "source", "include": "*.ts", "files_only": true}
-```
-
-Recursive searches skip dependency, VCS, build, and cache directories (`node_modules`, `.git`, `build`, `dist`, `.next`, `.venv`, `__pycache__`, and `coverage`). An explicitly selected file or excluded directory root can still be searched; excluded descendants remain skipped. The JavaScript fallback, always used on Windows, skips files larger than 1 MiB during directory traversal. Narrow the path or read a known file directly when these limits matter.
-
-No matches returns `No matches found.` In files-only mode, invalid regexes, missing roots, and failed or incomplete searches are errors, not empty successful results. Native search failures may preserve partial paths with an incomplete-search warning; do not treat that list as exhaustive. The shared output limits also apply.
 
 ### `overview`
 
@@ -132,7 +109,7 @@ Bounded outputs and focused reads reduce oversized text sent back to the model, 
 
 ## Language-server navigation
 
-The optional `lsp_query` tool can find definitions, references, and hover information in TypeScript, JavaScript, Python, Rust, and Go projects when the matching language-server executable is available.
+The `lsp_query` tool can find definitions, references, and hover information in TypeScript, JavaScript, Python, Rust, and Go projects when the matching language-server executable is available.
 
 | Language | Executable |
 | --- | --- |
@@ -141,7 +118,7 @@ The optional `lsp_query` tool can find definitions, references, and hover inform
 | Rust | `rust-analyzer` |
 | Go | `gopls` |
 
-First opt in through a skill's `allowed-tools: [read_file, grep_search, find_files, lsp_query]` or a native agent's `native-tools` allowlist; installing a server or asking the main session to use LSP does not expose the tool. See [Explore Code with LSP](/guides/explore-code-with-lsp) for a complete skill. Within that opted-in execution, ask for semantic evidence when a text search is not enough:
+Ask Agav for semantic evidence explicitly when a text search is not enough:
 
 ```text
 @counter.py find the increment function.
@@ -166,13 +143,11 @@ The stack contains up to twenty changes and does not survive process exit. A new
 
 ## File boundaries
 
-The file tools (`read_file`, `write_file`, `edit_file`) enforce path boundary checks. Writes are restricted to the working directory, temp directory, and `~/.agav/`. Reads are denied for credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube/config`). Writes to `.git/` and `.agav/` inside the project are always denied. See [security](/reference/security) for details.
+The file tools (`read_file`, `write_file`, `edit_file`) enforce path boundary checks. Writes are restricted to the working directory, temp directory, and `~/.agav/`. Reads are denied for credential stores (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube/config`). Writes to `.git/` and `.agav/` inside the project are always denied. On Windows, these `~/` paths resolve under `%USERPROFILE%\`. See [security](/reference/security) for details.
 
 ## Shell execution
 
-Shell commands have a **30,000 ms (30-second)** default timeout and [bounded output](#output-limits-and-recovery). The optional `timeout_ms` must be an integer from **1 through 120,000**, inclusive. Omit it for the default; use up to 120 seconds for longer builds or checks. Zero, negative or fractional values, strings, `null`, and values above the maximum are rejected before execution. Increasing the timeout does not change sandbox policy, command blocking, confirmation, cancellation, or output limits.
-
-Agav auto-detects macOS Seatbelt or Linux Bubblewrap. The model-visible `sandbox` override is **capability-aware**: it lists only detected installed backends (including Docker when its CLI is installed), plus `none` only when the user started Agav with `AGAV_NO_SANDBOX=1`. If no override is available, the `sandbox` field is omitted from the tool schema. Omit `sandbox` to use the detected default rather than requesting an unavailable backend. Docker overrides still require a running Docker daemon; CLI detection is not proof that a container can start. Explicitly scoped skill/agent registries use the same capability-aware shell schema.
+Shell commands have a 30-second default timeout and [bounded output](#output-limits-and-recovery). Agav auto-detects macOS Seatbelt or Linux Bubblewrap; Docker can be requested as a tool override.
 
 `run_command` streams stdout/stderr, so a large output no longer fails merely by exceeding the old shell buffer. Small results show stdout followed by stderr; oversized results and saved logs use observed arrival order across the two streams. Above 40,000 decoded UTF-8 bytes (or when status/separator formatting crosses that limit), it saves a log and returns a Unicode-safe head/tail preview. The shared registry can additionally truncate results exceeding 2,000 lines.
 
@@ -182,7 +157,7 @@ Commands are non-interactive: stdin is closed and there is no controlling termin
 
 On Unix, native, Seatbelt, and Bubblewrap shell runners own a process group. Failure, cancellation, timeout, buffered-output overflow, and orderly host exit trigger termination, with forced escalation if needed and bounded pipe drainage. Windows uses `taskkill /T` with forced escalation. This is best-effort cleanup, not rollback: descendants that escape the group and external side effects may remain.
 
-Successful background children are not killed merely because the shell leader finishes. Output from children sharing the inherited pipes is collected until the pipes close or the command timeout bounds that wait. A successful leader can still be reported as successful when only pipe drainage reaches the timeout; do not interpret that status as proof that every background job completed. Manage persistent services explicitly.
+Successful background children are not killed merely because the shell leader finishes. Output from children sharing the inherited pipes is collected until the pipes close or the command timeout bounds that wait. A successful leader can still be reported as successful when only pipe drainage reaches the timeout; do not interpret that status as proof that every background job completed. Manage persistent services explicitly, or use [background jobs](/features/background-jobs) when a command must outlive the turn.
 
 The buffered runners used by some integrations still enforce their own output-buffer limits. Test and agent subprocesses receive cancellation signals but do not inherit the shell runner's process-tree cleanup guarantees. MCP cancellation stops Agav's request wait without killing the shared server; server-side work may continue. Docker cancellation signals the local CLI but does **not** guarantee daemon/container cleanup. See [Security](/reference/security#cancellation-is-not-isolation).
 

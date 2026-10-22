@@ -3,10 +3,12 @@ import type { AgavConfig } from "../config/config.js";
 import { listSessions } from "../config/history.js";
 import {
   noProviderCredentialsError,
+  orgPolicyError,
   providerConfigurationError,
   resolveStartupSelection,
   selectConfiguredProvider,
 } from "../config/startup.js";
+import { applyOrgConfig } from "../config/org-config.js";
 import { parseArgs } from "../main.js";
 
 const base: AgavConfig = {
@@ -39,6 +41,151 @@ describe("parseArgs", () => {
     expect(flags.cwd).toBeUndefined();
   });
 
+  it("parses --name with space separation", () => {
+    const flags = parseArgs(["--name", "My run"]);
+    expect(flags.name).toBe("My run");
+  });
+
+  it("parses --name= with equals separation", () => {
+    const flags = parseArgs(["--name=My run"]);
+    expect(flags.name).toBe("My run");
+  });
+
+  it("preserves embedded equals signs in --name= value", () => {
+    const flags = parseArgs(["--name=a=b"]);
+    expect(flags.name).toBe("a=b");
+  });
+
+  it("leaves flags.name undefined if --name is omitted", () => {
+    const flags = parseArgs(["--help"]);
+    expect(flags.name).toBeUndefined();
+  });
+
+  it("parses empty and whitespace-only --name values", () => {
+    expect(parseArgs(["--name="]).name).toBe("");
+    expect(parseArgs(["--name", ""]).name).toBe("");
+    expect(parseArgs(["--name", "   "]).name).toBe("   ");
+    expect(parseArgs(["--name=   "]).name).toBe("   ");
+  });
+
+  it("handles missing flag value at end of argv for --name consistently with neighboring string flags", () => {
+    const flags = parseArgs(["--name"]);
+    expect(flags.name).toBe("");
+  });
+
+  it("rejects --name combined with --print or -P", () => {
+    const mockExit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const mockStderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    parseArgs(["--print", "prompt", "--name", "My run"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    parseArgs(["-P", "prompt", "--name=My run"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    parseArgs(["--name", "My run", "-P", "prompt"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    // When --name has a missing value preceding --print or -P
+    parseArgs(["--name", "--print", "prompt"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    parseArgs(["--name", "-P", "prompt"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    // Even when name is empty or whitespace
+    parseArgs(["-P", "prompt", "--name="]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockRestore();
+    mockStderr.mockRestore();
+  });
+
+  it("does not consume another option flag as the --name value when value is missing", () => {
+    const flags = parseArgs(["--name", "--model", "gpt-4o"]);
+    expect(flags.name).toBe("");
+    expect(flags.model).toBe("gpt-4o");
+  });
+
+  it("rejects --name combined with run", () => {
+    const mockExit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+    const mockStderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+
+    parseArgs(["run", "prompt", "--name", "My run"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    parseArgs(["run", "--name=My run", "prompt"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    parseArgs(["--name", "My run", "run", "prompt"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    // Even when missing value at end or whitespace
+    parseArgs(["run", "prompt", "--name"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockClear();
+    mockStderr.mockClear();
+
+    parseArgs(["run", "--name=   ", "prompt"]);
+    expect(mockExit).toHaveBeenCalledWith(1);
+    expect(mockStderr).toHaveBeenCalledWith(expect.stringContaining("--name is only supported for interactive sessions"));
+
+    mockExit.mockRestore();
+    mockStderr.mockRestore();
+  });
+
+  it("permits ordinary --print and run invocations without --name", () => {
+    const printFlags = parseArgs(["--print", "prompt"]);
+    expect(printFlags.print).toBe(true);
+    expect(printFlags.printPrompt).toBe("prompt");
+    expect(printFlags.name).toBeUndefined();
+
+    const shortPrintFlags = parseArgs(["-P", "prompt"]);
+    expect(shortPrintFlags.print).toBe(true);
+    expect(shortPrintFlags.printPrompt).toBe("prompt");
+    expect(shortPrintFlags.name).toBeUndefined();
+
+    const runFlags = parseArgs(["run", "prompt"]);
+    expect(runFlags.run).toBe(true);
+    expect(runFlags.runPrompt).toBe("prompt");
+    expect(runFlags.name).toBeUndefined();
+  });
+
   it("recognizes subcommands even when flags precede them", () => {
     const runFlags = parseArgs(["--cwd", "/repo", "run"]);
     expect(runFlags.run).toBe(true);
@@ -48,6 +195,9 @@ describe("parseArgs", () => {
 
     const updateFlags = parseArgs(["--cwd", "/repo", "update"]);
     expect(updateFlags.update).toBe(true);
+
+    const sessionFlags = parseArgs(["--cwd", "/repo", "sessions"]);
+    expect(sessionFlags.sessions).toBe(true);
   });
 
   it("treats missing or empty --cwd values as process exits", () => {
@@ -345,6 +495,87 @@ describe("startup provider and model resolution", () => {
     expect(providerConfigurationError({ ...base, provider: "openrouter", openrouterApiKey: "sk-or-test" }))
       .toBeNull();
   });
+
+  it("accepts enrollment gateway auth in place of a personal OpenAI key", () => {
+    // A gateway-only enrolled developer has no openaiApiKey but authenticates via
+    // the injected gateway token (openaiGatewayAuth); startup must not block them.
+    expect(
+      providerConfigurationError({
+        ...base,
+        provider: "openai",
+        openaiApiKey: undefined,
+        openaiGatewayAuth: true,
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("organization selection policy", () => {
+  it("returns null when no org restriction is set", () => {
+    expect(orgPolicyError({ ...base })).toBeNull();
+  });
+
+  it("returns null when an empty allowlist is present (no restriction)", () => {
+    expect(orgPolicyError({ ...base, orgAllowedProviders: [], orgAllowedModels: [] })).toBeNull();
+  });
+
+  it("rejects a provider outside the org allowlist", () => {
+    const err = orgPolicyError({ ...base, provider: "openai", orgAllowedProviders: ["anthropic"] });
+    expect(err).toContain("not permitted by your organization");
+    expect(err).toContain("openai");
+  });
+
+  it("permits a provider inside the org allowlist", () => {
+    expect(orgPolicyError({ ...base, provider: "anthropic", orgAllowedProviders: ["anthropic", "openai"] }))
+      .toBeNull();
+  });
+
+  it("rejects a model outside the org allowlist", () => {
+    const err = orgPolicyError({ ...base, model: "forbidden-model", orgAllowedModels: ["configured-claude"] });
+    expect(err).toContain("not permitted by your organization");
+    expect(err).toContain("forbidden-model");
+  });
+
+  it("permits a model inside the org allowlist", () => {
+    expect(orgPolicyError({ ...base, model: "configured-claude", orgAllowedModels: ["configured-claude"] }))
+      .toBeNull();
+  });
+
+  it("surfaces the policy error through providerConfigurationError before a missing-key error", () => {
+    // Out-of-policy provider AND missing key: policy violation must win.
+    const err = providerConfigurationError({
+      ...base,
+      provider: "openai",
+      openaiApiKey: undefined,
+      orgAllowedProviders: ["anthropic"],
+    });
+    expect(err).toContain("not permitted by your organization");
+    expect(err).not.toContain("OPENAI_API_KEY");
+  });
+
+  it("rejects a provider that drifted from a managed hard pin (not a singleton allowlist)", () => {
+    // Policy pins openai; a later CLI/recent-session selection of ollama must be
+    // caught even though there is no allowlist duplicating the pin.
+    const err = orgPolicyError({ ...base, provider: "ollama", orgManagedProvider: "openai" });
+    expect(err).toContain("not permitted by your organization");
+    expect(err).toContain("requires provider");
+  });
+
+  it("rejects a model that drifted from a managed hard pin", () => {
+    const err = orgPolicyError({ ...base, model: "external-model", orgManagedModel: "gpt-5.4" });
+    expect(err).toContain("not permitted by your organization");
+    expect(err).toContain("requires model");
+  });
+
+  it("permits a provider/model that still matches the managed pin", () => {
+    expect(orgPolicyError({
+      ...base,
+      provider: "openai",
+      model: "gpt-5.4",
+      orgManagedProvider: "openai",
+      orgManagedModel: "gpt-5.4",
+    })).toBeNull();
+  });
 });
 
 describe("listSessions and recent session startup resolution", () => {
@@ -392,5 +623,151 @@ describe("listSessions and recent session startup resolution", () => {
     vi.mocked(listSessions).mockResolvedValue([]);
     const sessions = await listSessions();
     expect(sessions).toEqual([]);
+  });
+
+  it("keeps managed pins authoritative over an implicit recent-session default", async () => {
+    // Last session used Anthropic, but the org pins openai/gpt-5.4 and the user
+    // gave no explicit override: the pin must win so startup is not then rejected.
+    vi.mocked(listSessions).mockResolvedValue([
+      {
+        id: "session-1",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        title: "Saved Session",
+        messages: [],
+      },
+    ]);
+    const pinned = { ...base, orgManagedProvider: "openai" as const, orgManagedModel: "gpt-5.4" };
+    const selection = await resolveStartupSelection(pinned, {});
+    expect(selection).toMatchObject({ provider: "openai", model: "gpt-5.4" });
+  });
+
+  it("does NOT silently correct an explicit out-of-policy CLI selection (left for policy rejection)", async () => {
+    vi.mocked(listSessions).mockResolvedValue([]);
+    const pinned = { ...base, orgManagedProvider: "openai" as const, orgManagedModel: "gpt-5.4" };
+    // An explicit --provider/--model stays as the user typed it so orgPolicyError
+    // can reject it, rather than being quietly overridden by the pin.
+    const selection = await resolveStartupSelection(pinned, { cliProvider: "ollama", cliModel: "llama3" });
+    expect(selection).toMatchObject({ provider: "ollama", model: "llama3" });
+    expect(orgPolicyError(selection)).toMatch(/not permitted by your organization/);
+  });
+
+  it("keeps a compatible pair for a provider-only pin when the recent session conflicts", async () => {
+    // Configured openai/gpt-5.4-mini, pin provider=openai only, latest session is
+    // Anthropic. The Anthropic model must NOT be paired with the openai pin.
+    vi.mocked(listSessions).mockResolvedValue([
+      {
+        id: "s1",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        title: "Saved",
+        messages: [],
+      },
+    ]);
+    const cfg = { ...base, provider: "openai" as const, model: "gpt-5.4-mini", orgManagedProvider: "openai" as const };
+    const selection = await resolveStartupSelection(cfg, {});
+    expect(selection).toMatchObject({ provider: "openai", model: "gpt-5.4-mini" });
+  });
+
+  it("keeps a compatible pair for a model-only pin when the recent session conflicts", async () => {
+    // Configured openai/gpt-5.4-mini, pin model=gpt-5.4-mini only, latest session
+    // is Anthropic. The pinned model must NOT be paired with the Anthropic provider.
+    vi.mocked(listSessions).mockResolvedValue([
+      {
+        id: "s1",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        provider: "anthropic",
+        model: "claude-sonnet-4-20250514",
+        title: "Saved",
+        messages: [],
+      },
+    ]);
+    const cfg = { ...base, provider: "openai" as const, model: "gpt-5.4-mini", orgManagedModel: "gpt-5.4-mini" };
+    const selection = await resolveStartupSelection(cfg, {});
+    expect(selection).toMatchObject({ provider: "openai", model: "gpt-5.4-mini" });
+  });
+
+  it("still uses recent-session history when it is compatible with a partial pin", async () => {
+    // Pin provider=openai; the latest session is also openai, so its model is fine.
+    vi.mocked(listSessions).mockResolvedValue([
+      {
+        id: "s1",
+        createdAt: "2025-01-01T00:00:00.000Z",
+        provider: "openai",
+        model: "gpt-4o",
+        title: "Saved",
+        messages: [],
+      },
+    ]);
+    const cfg = { ...base, provider: "openai" as const, model: "gpt-5.4-mini", orgManagedProvider: "openai" as const };
+    const selection = await resolveStartupSelection(cfg, {});
+    expect(selection).toMatchObject({ provider: "openai", model: "gpt-4o" });
+  });
+});
+
+describe("partial managed pins produce a compatible pair (applyOrgConfig -> resolveStartupSelection)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(listSessions).mockResolvedValue([]);
+  });
+
+  const anthropicConfig = (): AgavConfig => ({ ...base, provider: "anthropic", model: "claude-sonnet-4-20250514" });
+  const anthropicSession = {
+    id: "s1",
+    createdAt: "2025-01-01T00:00:00.000Z",
+    provider: "anthropic" as const,
+    model: "claude-sonnet-4-20250514",
+    title: "Saved",
+    messages: [],
+  };
+
+  it("applyOrgConfig alone resets the model to the provider default for a provider-only pin", () => {
+    // Starting from an incompatible anthropic config, a provider-only openai pin
+    // must not leave openai + claude-sonnet.
+    const cfg = applyOrgConfig(anthropicConfig(), { provider: "openai" });
+    expect(cfg.provider).toBe("openai");
+    expect(cfg.model).toBe("gpt-5.4-mini"); // openai default, not claude-sonnet
+  });
+
+  it("provider-only pin, plain start with conflicting history → compatible pair", async () => {
+    vi.mocked(listSessions).mockResolvedValue([anthropicSession]);
+    const cfg = applyOrgConfig(anthropicConfig(), { provider: "openai" });
+    const selection = await resolveStartupSelection(cfg, {});
+    expect(selection.provider).toBe("openai");
+    expect(selection.model).toBe("gpt-5.4-mini");
+    expect(providerConfigurationError({ ...selection, openaiApiKey: "k" })).toBeNull();
+  });
+
+  it("provider-only pin, resuming a conflicting session → compatible pair", async () => {
+    const cfg = applyOrgConfig(anthropicConfig(), { provider: "openai" });
+    const selection = await resolveStartupSelection(cfg, { session: anthropicSession });
+    expect(selection.provider).toBe("openai");
+    // Not the resumed Anthropic model paired with the openai pin.
+    expect(selection.model).toBe("gpt-5.4-mini");
+  });
+
+  it("model-only pin, resuming a conflicting session → compatible configured provider", async () => {
+    // Configured openai/gpt-5.4-mini, model-only pin, resume Anthropic. Must keep
+    // the configured openai provider with the pinned model, not anthropic.
+    const cfg = applyOrgConfig(
+      { ...base, provider: "openai", model: "gpt-5.4-mini" },
+      { model: "gpt-5.4-mini" },
+    );
+    const selection = await resolveStartupSelection(cfg, { session: anthropicSession });
+    expect(selection.provider).toBe("openai");
+    expect(selection.model).toBe("gpt-5.4-mini");
+  });
+
+  it("model-only pin, plain start with conflicting history → compatible configured provider", async () => {
+    vi.mocked(listSessions).mockResolvedValue([anthropicSession]);
+    const cfg = applyOrgConfig(
+      { ...base, provider: "openai", model: "gpt-5.4-mini" },
+      { model: "gpt-5.4-mini" },
+    );
+    const selection = await resolveStartupSelection(cfg, {});
+    expect(selection.provider).toBe("openai");
+    expect(selection.model).toBe("gpt-5.4-mini");
   });
 });

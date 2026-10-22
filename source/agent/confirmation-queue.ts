@@ -1,5 +1,6 @@
 import type { ConfirmResult } from "./loop.js";
 import type { DiffLine } from "../utils/diff.js";
+import type { PermissionMode } from "../config/config.js";
 
 export interface QueuedConfirmation {
   toolName: string;
@@ -8,6 +9,8 @@ export interface QueuedConfirmation {
   mcpServerName?: string;
   subagentId?: string;
   subagentTask?: string;
+  /** This approval cannot be satisfied by a session-wide or blanket approval. */
+  explicitApprovalOnly?: boolean;
   resolve: (choice: ConfirmResult) => void;
 }
 
@@ -18,13 +21,30 @@ export class ConfirmationQueue {
   private activeItem: QueuedConfirmation | null = null;
   private setPending: SetPendingFn | null = null;
   private autoAccept = false;
+  private permissionFloor: PermissionMode | undefined;
 
   bind(setPending: SetPendingFn): void {
     this.setPending = setPending;
   }
 
+  /**
+   * Set the org-managed permission floor. When the floor still requires
+   * confirmation (anything other than auto-accept), a user's "Always" is
+   * downgraded to a one-shot "yes" instead of flipping the queue to auto-accept —
+   * otherwise the queue would silently approve every later tool despite the
+   * loop/session mode being clamped to `ask`.
+   */
+  setPermissionFloor(floor: PermissionMode | undefined): void {
+    this.permissionFloor = floor;
+  }
+
+  /** True when the org floor forbids a blanket session-wide auto-accept. */
+  private blanketApprovalForbidden(): boolean {
+    return this.permissionFloor !== undefined && this.permissionFloor !== "auto-accept";
+  }
+
   enqueue(item: Omit<QueuedConfirmation, "resolve">): Promise<ConfirmResult> {
-    if (this.autoAccept) {
+    if (this.autoAccept && item.toolName !== "run_background_job" && !item.explicitApprovalOnly) {
       return Promise.resolve("always" as ConfirmResult);
     }
 
@@ -39,22 +59,32 @@ export class ConfirmationQueue {
     });
   }
 
-  resolve(choice: ConfirmResult): void {
+  resolve(choice: ConfirmResult): ConfirmResult | undefined {
     if (this.activeItem) {
-      this.activeItem.resolve(choice);
+      // An org permission floor that requires confirmation forbids a blanket
+      // session-wide auto-accept: normalize "Always" to a one-shot "yes" so the
+      // next tool still prompts. Done before the autoAccept flag is set below.
+      if (choice === "always" && this.blanketApprovalForbidden()) choice = "yes";
+      // These approvals are one-shot: they must not be satisfied or widened by
+      // a blanket approval intended for another tool.
+      if (this.activeItem.explicitApprovalOnly && choice === "always") choice = "no";
+      // Background approval binds only to the displayed specification.
+      if (choice === "always" && this.activeItem.toolName === "run_background_job") choice = "yes";
+      const activeItem = this.activeItem;
+      activeItem.resolve(choice);
       this.activeItem = null;
 
-      if (choice === "always") {
+      if (choice === "always" && !activeItem.explicitApprovalOnly) {
         this.autoAccept = true;
-        for (const queued of this.queue) {
+        this.queue = this.queue.filter((queued) => {
+          if (queued.toolName === "run_background_job" || queued.explicitApprovalOnly) return true;
           queued.resolve("always");
-        }
-        this.queue = [];
-        this.setPending?.(null);
-        return;
+          return false;
+        });
       }
 
       this.dequeue();
+      return choice;
     }
   }
 

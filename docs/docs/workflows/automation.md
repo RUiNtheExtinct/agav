@@ -27,26 +27,13 @@ Supported interval suffixes are `s`, `m`, and `h`. If you omit a suffix, Agav as
 
 | Command | Intent |
 | --- | --- |
-| `/schedule` | Open the interactive schedule manager (textual list in headless mode). |
 | `/schedule add "<cron>" <prompt>` | Save a recurring task using a five-field cron schedule. |
-| `/schedule list` | Show saved scheduled tasks and their state as text, even in the interactive UI. |
+| `/schedule list` | Show saved scheduled tasks and their state. |
 | `/schedule disable <id>` | Pause the scheduled task identified by `<id>`. |
 | `/schedule enable <id>` | Resume the scheduled task identified by `<id>`. |
 | `/schedule remove <id>` | Delete the scheduled task identified by `<id>`. |
 
-Bare `/schedule` opens a searchable, paginated manager in the interactive UI.
-Use **↑↓** to navigate, **←→** to page (page size adapts to terminal height),
-**s** to search names, cron expressions, or prompt text, and **ENTER** to confirm
-the filter. **ENTER** or **i** inspects a task's ID, cron, prompt, and last run;
-**↑↓** scrolls details and **b** or **ESC** returns to the list.
-
-From the list, **n** creates a task using Cron and Prompt fields (**Tab** or
-**↑↓** switches fields; **ENTER** saves; **ESC** cancels), **t** toggles
-enabled/disabled, and **d** requests deletion (**y** confirms; **n** or **ESC**
-cancels). **r** refreshes; **ESC** clears an active search before exiting. There
-is no edit action: remove and recreate a task to change its cron or prompt.
-
-Scheduled tasks use standard five-field cron expressions and persist in `~/.agav/scheduled-tasks.json`:
+Scheduled tasks use standard five-field cron expressions and persist in `~/.agav/scheduled-tasks.json` (`%USERPROFILE%\.agav\scheduled-tasks.json` on Windows):
 
 ```text
 /schedule add "0 9 * * 1-5" review open TODOs
@@ -58,7 +45,9 @@ Scheduled tasks use standard five-field cron expressions and persist in `~/.agav
 
 Cron fields support wildcards (`*`), lists (`1,2,3`), ranges (`1-5`), and steps (`*/15`). `/schedule add` currently validates only that the cron has five fields, so malformed numeric values can still be saved but will never match. Task IDs can be given as full IDs or prefixes.
 
-The scheduler checks enabled tasks only while Agav is running in the interactive UI. It polls every 30 seconds and runs matching tasks at most once per minute. It does not install an operating-system daemon, so Agav must be active when a schedule matches.
+The scheduler checks enabled tasks only while Agav is running in the interactive UI. It polls every 30 seconds and runs matching tasks at most once per minute. `/schedule` never installs an operating-system daemon, so Agav must be active when one of these tasks matches.
+
+To run shell commands on a schedule that keeps firing while Agav is closed, use [background jobs](/features/background-jobs#recurring-schedules) instead: they can be driven by `agav job tick --install` or `agav job daemon start`.
 
 ## Watch files
 

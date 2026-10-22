@@ -6,6 +6,7 @@ import type { LLMProvider, ContentBlock, InvocationReason, Message } from "../pr
 import type { AgavConfig } from "../config/config.js";
 import { ConversationState } from "../agent/conversation.js";
 import { runAgentLoop } from "../agent/loop.js";
+import { clampPermissionMode } from "../config/org-config.js";
 import { isInternalUserMessage } from "../agent/internal-prompts.js";
 import { createToolRegistry } from "../tools/registry-factory.js";
 import type { ToolRegistry } from "../tools/registry.js";
@@ -105,6 +106,7 @@ export interface PendingConfirmation {
   resolve: (choice: ConfirmResult) => void;
   subagentId?: string;
   subagentTask?: string;
+  explicitApprovalOnly?: boolean;
 }
 
 export interface PendingContextWindowRequest {
@@ -151,6 +153,14 @@ interface UseAgentReturn {
   cancelSubagent: (id: string) => void;
   clearMessages: () => void;
   confirmTool: (choice: ConfirmResult) => void;
+  /**
+   * The permission mode in force for the session: the session "Always" override
+   * when set, otherwise the config default, clamped to the org floor. Reflects
+   * the live decision that `config.permissionMode` does not.
+   */
+  getEffectivePermissionMode: () => AgavConfig["permissionMode"];
+  /** Queue a confirmation outside an agent turn (e.g. from a slash command). */
+  requestConfirmation: (toolName: string, input: Record<string, unknown>) => Promise<ConfirmResult>;
   conversation: ConversationState;
   toolRegistry: ToolRegistry;
   saveNow: (extraUsage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheWriteTokens: number }) => void;
@@ -292,7 +302,7 @@ export function useAgent(
       }
     }
   }, []);
-  const toolRegistryRef = useRef(createToolRegistry());
+  const toolRegistryRef = useRef(createToolRegistry(config));
   const registeredMcpToolsRef = useRef(new Set<string>());
   const mcpManagerRef = useRef(new MCPManager());
   const abortRef = useRef<AbortController | null>(null);
@@ -335,7 +345,9 @@ export function useAgent(
           permissionMode: configRef.current.permissionMode,
           effort: configRef.current.effort,
           iterationsBudget: currentIterationsBudgetRef.current ?? { remaining: configRef.current.maxIterations, total: configRef.current.maxIterations },
+          orgPermissionFloor: configRef.current.orgPermissionFloor,
         }),
+        getProviderConfig: () => configRef.current,
         confirmationQueue: confirmationQueueRef.current,
         onProgressUpdate: setSubagentStates,
         onSteerApplied: (_id, title, directives) => {
@@ -439,6 +451,7 @@ export function useAgent(
             effort: configRef.current.effort,
             iterationsBudget: currentIterationsBudgetRef.current ?? { remaining: configRef.current.maxIterations, total: configRef.current.maxIterations },
           }),
+          getProviderConfig: () => configRef.current,
           confirmTool: skillConfirmCallback,
           onTokenUsage: (usage) => setTokenUsage((prev) => ({
             inputTokens: prev.inputTokens + usage.inputTokens,
@@ -561,12 +574,38 @@ export function useAgent(
 
   /** Resolve the oldest pending tool confirmation with the user's decision. */
   const confirmTool = useCallback((choice: ConfirmResult) => {
-    if (choice === "always") sessionPermissionModeRef.current = "auto-accept";
+    // Only the queue's effective generic Always may widen session permission,
+    // and never past the org-managed permission floor.
+    const resolvedChoice = confirmationQueueRef.current.resolve(choice);
+    if (resolvedChoice === "always") {
+      sessionPermissionModeRef.current = clampPermissionMode(
+        "auto-accept",
+        configRef.current.orgPermissionFloor,
+      );
+    }
     // Reset the turn timer so it only counts active agent work, not time
     // spent waiting for the user to approve/deny a tool call.
     updateTurnStart(Date.now());
-    confirmationQueueRef.current.resolve(choice);
   }, []);
+
+  /**
+   * The permission mode actually enforced this session. Mirrors the per-turn
+   * loop's own `clampPermissionMode(sessionPermissionModeRef.current ??
+   * config.permissionMode, floor)` so UI (e.g. /status) cannot report a mode the
+   * loop is not using after an "Always" approval.
+   */
+  const getEffectivePermissionMode = useCallback(
+    () => clampPermissionMode(
+      sessionPermissionModeRef.current ?? configRef.current.permissionMode,
+      configRef.current.orgPermissionFloor,
+    ),
+    [],
+  );
+
+  const requestConfirmation = useCallback(
+    (toolName: string, input: Record<string, unknown>) => confirmationQueueRef.current.enqueue({ toolName, input }),
+    [],
+  );
 
   /**
    * Resolve a pending manual-context-window request. `tokens` is undefined
@@ -951,6 +990,10 @@ export function useAgent(
           }
 
           abortController.signal.throwIfAborted();
+          // Keep the confirmation queue aware of the org floor so an "Always" is
+          // not silently escalated to a blanket auto-accept when the floor still
+          // requires confirmation.
+          confirmationQueueRef.current.setPermissionFloor(configRef.current.orgPermissionFloor);
           // Attach volatile context to the tail of this turn's user message. It is
           // left frozen in history rather than rewritten on later turns: editing an
           // earlier message would invalidate the very prefix this split protects,
@@ -972,7 +1015,12 @@ export function useAgent(
             iterationsBudget: iterationsBudget,
             signal: abortController.signal,
             confirmTool: confirmToolCallback,
-            permissionMode: sessionPermissionModeRef.current ?? config.permissionMode,
+            permissionMode: clampPermissionMode(
+              sessionPermissionModeRef.current ?? config.permissionMode,
+              config.orgPermissionFloor,
+            ),
+            permissionFloor: config.orgPermissionFloor,
+            backgroundPermissionMode: config.permissionMode,
             allowedTools: config.allowedTools,
             hooks: config.hooks,
             // Only the main conversation's loop drains mid-turn /steer
@@ -1218,6 +1266,12 @@ export function useAgent(
                 ]);
                 break;
               }
+
+              case "retry":
+                setMessages((prev) => [...prev, {
+                  id: nextId(), role: "system", content: event.message,
+                }]);
+                break;
 
               case "error": {
                 // Cancellation (including retry backoff) is not a hard UI error.
@@ -1499,6 +1553,7 @@ export function useAgent(
     pendingConfirmation,
     pendingContextWindowRequest,
     resolveContextWindowRequest,
+    requestConfirmation,
     tokenUsage,
     loadedPlugins,
     mcpServers,
@@ -1534,6 +1589,7 @@ export function useAgent(
     cancelSubagent,
     clearMessages,
     confirmTool,
+    getEffectivePermissionMode,
     conversation: conversationRef.current,
     toolRegistry: toolRegistryRef.current,
     saveNow,

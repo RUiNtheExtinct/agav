@@ -22,7 +22,7 @@ Agav loads defaults, then `~/.agav/keybindings.json`, then `./.agav/keybindings.
 | Inspect subagent | `Enter` |
 | Back to overview | `Tab` |
 | Insert newline | `Shift+Enter`, or `Option+Return` on macOS terminals that support it |
-| Submit (queue while busy) | `Enter` |
+| Submit | `Enter` |
 | Prompt history | `Up` / `Down` |
 | Exit, or copy an active Agav selection | `Ctrl+C` |
 | Clear input | `Ctrl+U` |
@@ -32,11 +32,7 @@ Agav loads defaults, then `~/.agav/keybindings.json`, then `./.agav/keybindings.
 | Command palette | `Ctrl+K Ctrl+P` |
 | Show keybindings | `Ctrl+K Ctrl+S` |
 | Clear screen | `Ctrl+L` |
-| Manage queued requests when present; otherwise exit while idle with an empty prompt | `Ctrl+Q` |
-
-## Queue controls
-
-Use `/queue` or **Ctrl+Q** when requests are queued. **Up/Down** selects an entry; **Delete/Backspace** cancels that entry without stopping the active turn. You can also click its **×**. **Esc** or **Ctrl+Q** closes queue management without cancelling requests; automatic dispatch waits while the queue panel is open. `/queue retry` resumes a queue paused after a dispatch failure. See [queued follow-ups](/workflows/planning-and-steering#queued-follow-up-requests).
+| Exit while idle with an empty prompt | `Ctrl+Q` |
 
 ## Cancel versus exit
 
@@ -45,6 +41,16 @@ Press **Esc** to cancel the active turn and stay in Agav. In an actual `subagent
 Press **Ctrl+C** with no text selected in Agav to exit, whether idle or busy. If an Agav output selection is active, Ctrl+C copies it and keeps Agav open; clear the selection before pressing Ctrl+C to exit. **Cmd+C** on macOS and **Ctrl+Shift+C** where supported are copy shortcuts, not exit shortcuts. Terminal-native copy behavior takes precedence when your terminal intercepts a shortcut.
 
 The `cancel` action is configurable. Ctrl+C is also handled by the terminal UI before configurable actions, so rebinding `interrupt` does not turn Ctrl+C into a stay-in-session cancel shortcut. Use Esc for that.
+
+## Voice recording controls
+
+During `/voice`, the prompt remains editable while listening and finalizing.
+**Enter** sends the displayed draft once microphone cleanup is acknowledged;
+click **Stop** to finish without sending and continue editing. **Esc** or
+**Ctrl+C** cancels dictation or a pending voice send instead of exiting Agav.
+During model-download consent, **Y** approves and **N/Esc** declines; Enter alone
+does not approve. These voice controls use their fixed keys rather than the
+configurable prompt-submit/cancel bindings. See [Voice Input](/features/voice-input).
 
 ## Override bindings
 

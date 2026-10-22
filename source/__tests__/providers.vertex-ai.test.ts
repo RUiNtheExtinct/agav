@@ -54,14 +54,23 @@ describe("VertexAIProvider", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "access-token", expires_in: 3600 }), { status: 200 }));
 
-    const nowSeconds = Math.floor(Date.now() / 1000);
+    // The provider samples Date.now() internally when it signs, which may land in
+    // a later whole second than a single pre-sample here. Bracket the signing
+    // with before/after bounds so the assertions tolerate that 1-second sampling
+    // skew without weakening what they check.
+    const beforeSeconds = Math.floor(Date.now() / 1000);
     await new VertexAIAuth(credentialsPath).getAccessToken();
+    const afterSeconds = Math.floor(Date.now() / 1000);
 
     const assertion = new URLSearchParams(String(fetchMock.mock.calls[0]?.[1]?.body)).get("assertion")!;
     const claims = JSON.parse(Buffer.from(assertion.split(".")[1]!, "base64url").toString());
     // iat must sit strictly in the past relative to "now", never in the future.
-    expect(claims.iat).toBeLessThan(nowSeconds);
-    expect(nowSeconds - claims.iat).toBeGreaterThanOrEqual(10);
+    expect(claims.iat).toBeLessThan(beforeSeconds);
+    // iat is signTime - 10; signTime is within [beforeSeconds, afterSeconds], so
+    // the backdate from the pre-sample is at least (10 - elapsed) and at most 10.
+    const elapsed = afterSeconds - beforeSeconds;
+    expect(beforeSeconds - claims.iat).toBeGreaterThanOrEqual(10 - elapsed);
+    expect(afterSeconds - claims.iat).toBeGreaterThanOrEqual(10);
   });
 
   it("retries token minting once when a skewed clock triggers invalid_grant", async () => {
@@ -428,4 +437,37 @@ describe("VertexAIProvider", () => {
     expect(tokens).toEqual(["access-token", "access-token", "access-token"]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("maps minimal effort to low for Claude on Vertex AI", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "access-token", expires_in: 3600 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('data: {"type":"message_stop"}\n\n', { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+
+    const provider = new VertexAIProvider(credentialsPath);
+    for await (const _ of provider.stream({
+      model: "vertex/claude-sonnet-4-5@20250929",
+      effort: "minimal",
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    })) { /* drain */ }
+
+    const body = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(body.output_config).toEqual({ effort: "low" });
+  });
+
+  it("maps minimal effort to low for chat completions on Vertex AI", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: "access-token", expires_in: 3600 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('data: [DONE]\n\n', { status: 200, headers: { "Content-Type": "text/event-stream" } }));
+
+    const provider = new VertexAIProvider(credentialsPath);
+    for await (const _ of provider.stream({
+      model: "vertex/gemini-2.5-flash",
+      effort: "minimal",
+      messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+    })) { /* drain */ }
+
+    const body = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(body.reasoning_effort).toBe("low");
+  });
 });
+

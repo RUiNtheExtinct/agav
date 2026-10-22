@@ -2,12 +2,13 @@ import type { SlashCommand, CommandResult } from "./types.js";
 import { formatMidTurnSafeCommands } from "./mid-turn.js";
 
 const CATEGORIES: Record<string, string[]> = {
-  "Chat": ["clear", "new", "model", "effort", "fast", "deep", "compact", "ps", "export"],
+  "Chat": ["clear", "new", "model", "effort", "fast", "deep", "compact", "status", "ps", "export"],
   "Sessions": ["resume", "search", "branch", "name"],
   "Agents": ["agents", "agent"],
   "Skills": ["skills"],
   "Workflow": ["plan", "steer", "loop", "schedule", "watch"],
   "Memory": ["memory", "remember", "forget"],
+  "Appearance": ["customize"],
   "Safety": ["undo"],
   "Debug": ["context", "debug", "changelog", "exit", "help"],
 };

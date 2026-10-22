@@ -1,6 +1,6 @@
 {
   "name": "agav-cli",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Terminal-native AI coding assistant for real repositories",
   "type": "module",
   "bin": {
@@ -18,8 +18,9 @@
     "test": "vitest run source",
     "test:coverage": "vitest run --coverage",
     "test:installer": "sh scripts/tests/run-installer-tests.sh",
-    "build:binary": "pnpm gen:skills && bun build source/cli.tsx --compile --outfile dist/agav",
-    "build:binary:all": "bash scripts/build-binary.sh all",
+    "build:binary": "node scripts/build-binary.mjs native",
+    "build:binary:voice": "node scripts/build-binary.mjs native --voice",
+    "build:binary:all": "node scripts/build-binary.mjs all",
     "prepare": "husky"
   },
   "engines": {
@@ -39,9 +40,9 @@
     "marked": "^15.0.12",
     "marked-terminal": "^7.3.0",
     "ollama": "^0.6.4",
-    "openai": "^7.32.0",
+    "openai": "^7.41.0",
     "pdfjs-dist": "^6.4.299",
-    "react": "~19.2.8",
+    "react": "~19.2.9",
     "react-reconciler": "0.33.0",
     "scheduler": "^0.27.0",
     "slice-ansi": "^9.0.1",
@@ -56,10 +57,10 @@
     "@types/react": "~19.2.18",
     "@types/react-reconciler": "0.33.0",
     "@types/scheduler": "^0.26.0",
-    "@vitest/coverage-v8": "~4.1.11",
+    "@vitest/coverage-v8": "~4.1.12",
     "husky": "^9.1.7",
     "tsx": "^4.23.15",
     "typescript": "^5.9.3",
-    "vitest": "~4.1.11"
+    "vitest": "~4.1.12"
   }
 }
