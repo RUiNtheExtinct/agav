@@ -461,7 +461,7 @@ export async function loadConfig(): Promise<AgavConfig> {
   ) as unknown as AgavConfig;
 
   sanitizeConfig(merged);
-  
+
   // Treat allowed tools as additive so projects can extend, not erase, a user's global allowlist.
   if (projectConfig.allowedTools) {
     merged.allowedTools = [

@@ -417,7 +417,6 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
     shellAbortRef.current?.abort();
     cancel();
     stopActiveLoop();
-    // Keep Ink alive until the foreground executor has checkpointed settlement.
     exitInk();
     // Keep Ink alive until the foreground executor has checkpointed settlement.
     void settleWorkflow().then(() => exitInk());
@@ -814,8 +813,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
     void reconcileWorkflowRunsOnStartup({ maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns });
   }, [config.backgroundJobsEnabled, config.workflowsEnabled, config.maxConcurrentWorkflowRuns]);
 
-  // Workflow run notifications ("Run <id> waiting for approval: <node>", "Run <id> passed"): each is
-  // claimed with a create-once seen marker, so exactly one session shows it, once.
+  // Create-once seen markers ensure workflow notifications appear in only one session.
   useEffect(() => {
     if (config.backgroundJobsEnabled !== true || config.workflowsEnabled !== true) return;
     const sessionId = `session-${process.pid}-${Date.now()}`;
@@ -898,9 +896,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
       }
       return;
     }
-    // Remember which prompt this key was meant for. Handling it below may withdraw that prompt and advance
-    // the queue before ToolConfirm's own handler (subscribed later, so it runs after this one) sees the same
-    // key; ToolConfirm must still answer the prompt the user was looking at, not the one that became active.
+    // Capture this key's prompt before handlers advance the queue; ToolConfirm runs later.
     keyStartConfirmationRef.current = pendingConfirmation;
     queueMicrotask(() => { keyStartConfirmationRef.current = undefined; });
     // Foreground cancellation must remain reachable even while a confirmation or queue owns input.
