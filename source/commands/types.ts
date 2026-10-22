@@ -30,8 +30,14 @@ export interface CommandContext {
   /** Changes synchronously when the selected model or provider changes. */
   getModelSelectionVersion?: () => number,
   iterationsBudget?: { remaining: number, total: number },
-  setModel: (model: string) => void
-  setProvider: (provider: AgavConfig["provider"]) => void
+  /**
+   * Apply a model change. Returns an error message when the change is rejected
+   * (e.g. the model violates the organization policy), or null on success, so a
+   * command does not report a successful switch when the selection was blocked.
+   */
+  setModel: (model: string) => string | null
+  /** Apply a provider change. Returns an error message when rejected, else null. */
+  setProvider: (provider: AgavConfig["provider"]) => string | null
   setEffort: (effort: import("../config/config.js").EffortLevel) => void
   clearMessages: () => void
   /** Re-read the plan from disk so the on-screen plan panel matches it. */
@@ -46,6 +52,13 @@ export interface CommandContext {
   renameSession: (name: string) => void
   currentSessionId?: string
   exit: () => void
+  /**
+   * The permission mode actually in force for the session, after a generic
+   * "Always" approval widens it and the org floor clamps it. Reflects the live
+   * session decision, which `config.permissionMode` does not. Absent in headless
+   * mode, where `config.permissionMode` is authoritative.
+   */
+  getEffectivePermissionMode?: () => AgavConfig["permissionMode"]
   /** Whether an agent turn is currently in flight. */
   isLoading?: boolean
   getMCPAuthenticationRequired?: () => string[]
@@ -90,7 +103,16 @@ export interface CommandContext {
 
 /** Represents the result of executing a slash command. */
 export type CommandResult =
-  | { type: "message"; text: string }
+  | {
+      type: "message";
+      text: string;
+      /**
+       * Render the text verbatim, skipping terminal path collapsing. Set by
+       * commands like /status whose output intentionally shows the absolute
+       * working directory, which would otherwise be rewritten to ".".
+       */
+      preservePaths?: boolean;
+    }
   | { type: "clear" }
   | { type: "exit" }
   | { type: "none" }

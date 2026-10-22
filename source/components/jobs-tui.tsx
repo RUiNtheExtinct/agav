@@ -13,6 +13,7 @@ import {
 export interface JobsTUIProps {
   onExit: () => void;
   permissionMode: SessionPolicySnapshot["permissionMode"];
+  height?: number;
 }
 
 type ConfirmSpec = BackgroundConfirmSpec;
@@ -36,7 +37,7 @@ function confirmationDetails({ action, spec, subject }: PendingConfirmation): { 
   return { lines: backgroundConfirmationLines(describeBackgroundConfirmation(action, spec, subject)), controls: CONFIRM_CONTROLS };
 }
 
-export function JobsTUI({ onExit, permissionMode }: JobsTUIProps) {
+export function JobsTUI({ onExit, permissionMode, height }: JobsTUIProps) {
   const [schedules, setSchedules] = useState(false);
   const [pending, setPending] = useState<PendingConfirmation | null>(null);
   const pendingRef = useRef<PendingConfirmation | null>(null);
@@ -77,5 +78,5 @@ export function JobsTUI({ onExit, permissionMode }: JobsTUIProps) {
     ]),
     { key: "c", label: "Capabilities", run: async () => ({ detail: await jobCapabilities() }) },
   ];
-  return <ResourceManager key={`${schedules}-${includeAbandoned}`} adapter={schedules ? scheduleAdapter : jobs} onExit={onExit} actions={actions} prompt={pending ? confirmationPrompt(pending) : undefined} promptDetails={pending ? confirmationDetails(pending) : undefined} />;
+  return <ResourceManager key={`${schedules}-${includeAbandoned}`} adapter={schedules ? scheduleAdapter : jobs} height={height} onExit={onExit} actions={actions} prompt={pending ? confirmationPrompt(pending) : undefined} promptDetails={pending ? confirmationDetails(pending) : undefined} />;
 }

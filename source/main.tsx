@@ -35,6 +35,7 @@ import {
   selectConfiguredProvider,
   type ProviderName,
 } from "./config/startup.js";
+import { clampPermissionMode } from "./config/org-config.js";
 
 const KNOWN_FLAGS = [
   "--help", "-h", "--version", "-v", "--provider", "-p", "--model", "-m",
@@ -260,6 +261,12 @@ export function parseArgs(argv: string[]) {
     } else if (arg === "mcp" && !subcommandSeen) {
       flags.mcp = true;
       subcommandSeen = true;
+    } else if (arg === "login" && !subcommandSeen) {
+      flags.login = true;
+      subcommandSeen = true;
+    } else if (arg === "logout" && !subcommandSeen) {
+      flags.logout = true;
+      subcommandSeen = true;
     } else if (arg === "run" && !subcommandSeen) {
       flags.run = true;
       subcommandSeen = true;
@@ -270,7 +277,7 @@ export function parseArgs(argv: string[]) {
       flags.job = true;
       subcommandSeen = true;
     } else if (arg.startsWith("-")) {
-      if (subcommandSeen && (flags.agents || flags.skills || flags.mcp || flags.sessions || flags.job)) {
+      if (subcommandSeen && (flags.agents || flags.skills || flags.mcp || flags.sessions || flags.job || flags.login || flags.logout)) {
         flags._.push(arg);
       } else {
         const suggestion = findClosestFlag(arg);
@@ -307,8 +314,19 @@ export function parseArgs(argv: string[]) {
   if (flags.mcp && pos.length > 0) flags.mcpCommand = pos[0];
   if (flags.run && pos.length > 0) flags.runPrompt = pos.join(" ");
   if (flags.print && pos.length > 0) flags.printPrompt = pos.join(" ");
-  
-  if (!flags.update && !flags.agents && !flags.skills && !flags.sessions && !flags.mcp && !flags.run && !flags.job && !flags.workflows && !flags.print && pos.length > 0) {
+  // Recognize login/logout even when they arrive as the first positional — e.g.
+  // after a `--` separator that package managers inject (`pnpm start -- login`),
+  // which routes the token past the subcommand branch into positionals. Only when
+  // no other subcommand is active, so an argument to another command (for example
+  // `agav mcp logout <name>`) is never mistaken for the enterprise subcommand.
+  const anotherSubcommand = flags.update || flags.agents || flags.skills ||
+    flags.sessions || flags.mcp || flags.run || flags.job || flags.workflows || flags.print;
+  if (!anotherSubcommand && !flags.login && !flags.logout && (pos[0] === "login" || pos[0] === "logout")) {
+    flags[pos[0]] = true;
+    pos.shift();
+  }
+
+  if (!flags.update && !flags.agents && !flags.skills && !flags.sessions && !flags.mcp && !flags.run && !flags.job && !flags.workflows && !flags.print && !flags.login && !flags.logout && pos.length > 0) {
      process.stderr.write(`error: unexpected arguments: ${pos.join(" ")}\n`);
      process.exit(1);
   }
@@ -378,7 +396,13 @@ export async function runPipeMode(
     ? effectiveSystemPrompt
     : `${effectiveSystemPrompt}\n\nYour final response MUST be valid JSON matching this schema: ${schemaJson}. Return only the JSON value, with no markdown fences or commentary.`;
 
-  const permissionMode = options.permissionOverride ?? "auto-accept";
+  // Clamp the headless mode (default or explicit --permission override) to the
+  // org floor: `agav -P` / `agav run` must not auto-accept writes below a managed
+  // deny-writes/ask policy.
+  const permissionMode = clampPermissionMode(
+    options.permissionOverride ?? "auto-accept",
+    config.orgPermissionFloor,
+  );
   const iterationsBudget = { remaining: config.maxIterations, total: config.maxIterations };
 
   const runTurn = async (streamText: boolean): Promise<{ finalText: string; exitCode: number; wroteStreamText: boolean }> => {
@@ -399,6 +423,7 @@ export async function runPipeMode(
         maxTokens: config.maxTokens,
         iterationsBudget: iterationsBudget,
         permissionMode,
+        permissionFloor: config.orgPermissionFloor,
         // print/run mode has no human to confirm background jobs.
         headless: true,
         allowedTools: options.allowedToolsOverride,
@@ -691,10 +716,20 @@ export async function main() {
   if (flags.workflows) {
     const { runWorkflowsCli } = await import("./cli/workflows-cli.js");
     const config = await loadConfig();
-    if (flags.autoAccept) config.permissionMode = "auto-accept";
+    // Clamp to the org floor: `-y` must not loosen a managed permission policy.
+    if (flags.autoAccept) config.permissionMode = clampPermissionMode("auto-accept", config.orgPermissionFloor);
     if (flags.denyWrites) config.permissionMode = "deny-writes";
     if (flags.sandboxRequired) config.sandboxRequired = true;
     process.exit(await runWorkflowsCli([...(flags._ as string[])], { config }));
+    return;
+  }
+
+  // Enterprise enrollment does not require an LLM provider or a running TUI.
+  if (flags.login || flags.logout) {
+    const { runLoginCommand } = await import("./cli/login-cli.js");
+    const args = (flags._ as string[]).filter((a) => a !== "login" && a !== "logout");
+    const exitCode = await runLoginCommand(flags.logout ? "logout" : "login", args);
+    process.exit(exitCode);
     return;
   }
 
@@ -774,6 +809,14 @@ export async function main() {
     cliProvider = p;
   }
 
+  // When the organization policy allows exactly one provider and the user did not
+  // name one, treat that provider as the selection. This keeps the single allowed
+  // provider authoritative through startup routing, so an in-policy --model does
+  // not get re-routed to a disallowed provider by the model catalog.
+  if (!cliProvider && config.orgAllowedProviders?.length === 1) {
+    cliProvider = config.orgAllowedProviders[0];
+  }
+
   // Apply explicit CLI connection overrides last so they win over config and environment defaults.
   if (typeof flags.openaiApi === "string" && (flags.openaiApi === "chat" || flags.openaiApi === "responses")) {
     config.openaiApi = flags.openaiApi;
@@ -807,7 +850,8 @@ export async function main() {
   }
 
   if (flags.autoAccept) {
-    config.permissionMode = "auto-accept";
+    // Clamp to the org floor: `-y` must not loosen a managed permission policy.
+    config.permissionMode = clampPermissionMode("auto-accept", config.orgPermissionFloor);
   } else if (flags.denyWrites) {
     config.permissionMode = "deny-writes";
   }

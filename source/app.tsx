@@ -21,6 +21,7 @@ import SubagentDisplay from "./components/subagent-display.js";
 import { makeAgentProgressTracker } from "./agent/subagent-progress.js";
 import type { SubagentProgress } from "./agent/subagent-types.js";
 import type { AgavConfig } from "./config/config.js";
+import { orgPolicyError } from "./config/startup.js";
 import type { LLMProvider } from "./providers/types.js";
 import { createProvider } from "./providers/registry.js";
 import type { ContentBlock, InvocationReason } from "./providers/types.js";
@@ -288,6 +289,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
     cancelSubagent,
     clearMessages,
     confirmTool,
+    getEffectivePermissionMode,
     conversation,
     toolRegistry,
     saveNow,
@@ -1252,13 +1254,25 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
             config,
             provider: activeProvider ?? undefined,
             getModelSelectionVersion: () => modelSelectionVersion.current,
+            getEffectivePermissionMode,
             setModel: (model: string) => {
+              // Enforce the org policy on interactive model changes (/model,
+              // /fast, /deep): a managed pin or allowlist applies to every
+              // selection path, not only startup. Reject out-of-policy changes and
+              // return the error so the command reports failure instead of a
+              // misleading "switched" message.
+              const policyError = orgPolicyError({ ...config, model });
+              if (policyError) return policyError;
               modelSelectionVersion.current++;
               setConfig((prev) => ({ ...prev, model }));
+              return null;
             },
             setProvider: (provider) => {
+              const policyError = orgPolicyError({ ...config, provider });
+              if (policyError) return policyError;
               modelSelectionVersion.current++;
               setConfig((prev) => ({ ...prev, provider }));
+              return null;
             },
             setEffort: (effort) => {
               setConfig((prev) => ({ ...prev, effort }));
@@ -1390,7 +1404,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
           if (result) {
             switch (result.type) {
               case "message": {
-                const message: DisplayMessage = { id: `sys-${++sysMessageId}`, role: "system", content: result.text };
+                const message: DisplayMessage = { id: `sys-${++sysMessageId}`, role: "system", content: result.text, skipPathFormatting: (result as { preservePaths?: boolean }).preservePaths };
                 if (/^\/(steer|plan)(?:\s|$)/i.test(trimmed)) {
                   addDisplayMessage(message);
                 } else {
@@ -1521,7 +1535,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
 
   const toolMessages = useMemo(() => messages.filter((m) => m.role === "tool"), [messages]);
 
-  // The footer — the prompt or its confirmation dialog, a modal TUI, and the
+  // The home footer — the prompt or its confirmation dialog and the
   // status bar — is measured rather than guessed. It used to be a flat
   // `termRows - 8`, but the footer is unbounded: a keybindings dump or a
   // multi-line prompt pushes the frame taller than the terminal, the terminal
@@ -1568,6 +1582,46 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
       />
     </Box>
   );
+  // Resource managers own the entire viewport while active. Keeping them in the
+  // home footer leaves the transcript and status bar visible and steals rows
+  // from their scrollable content (including a second clipboard notice).
+  if (agentsTUIActive || skillsTUIActive || jobsTUIActive || resourceAdapter) {
+    return <Box flexDirection="column" height={termRows}>
+      {agentsTUIActive && <AgentsTUI height={termRows} provider={activeProvider} config={config} onExit={() => {
+        setAgentsTUIActive(false);
+        setPickerActive(false);
+        setInput("");
+        const resolve = agentsTUIResolveRef.current;
+        agentsTUIResolveRef.current = null;
+        resolve?.();
+        refreshAgentCommands();
+      }} />}
+      {skillsTUIActive && <SkillsTUI marketplace={skillsMarketplace} height={termRows} onExit={() => {
+        setSkillsTUIActive(false);
+        setPickerActive(false);
+        setInput("");
+        const resolve = skillsTUIResolveRef.current;
+        skillsTUIResolveRef.current = null;
+        resolve?.();
+      }} />}
+      {jobsTUIActive && <JobsTUI permissionMode={config.permissionMode} height={termRows} onExit={() => {
+        setJobsTUIActive(false);
+        setPickerActive(false);
+        setInput("");
+        const resolve = jobsTUIResolveRef.current;
+        jobsTUIResolveRef.current = null;
+        resolve?.();
+      }} />}
+      {resourceAdapter && <ResourceManager adapter={resourceAdapter} height={termRows} onExit={() => {
+        setResourceAdapter(null);
+        setPickerActive(false);
+        setInput("");
+        const resolve = resourceTUIResolveRef.current;
+        resourceTUIResolveRef.current = null;
+        resolve?.();
+      }} />}
+    </Box>;
+  }
 
   return (
     // Pinned to the terminal height so the frame can never grow past the screen
@@ -1629,7 +1683,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
         {systemMessages.length > 0 && (
           <Box marginBottom={1} flexDirection="column">
             {systemMessages.map((msg) => {
-              const displayContent = terminalRelativePaths(msg.content);
+              const displayContent = msg.skipPathFormatting ? msg.content : terminalRelativePaths(msg.content);
               const hasMarkdown = /^#{1,3}\s|^\*\*|\*\*$|^- \*\*|```/.test(displayContent);
               if (hasMarkdown && displayContent.length > 200) {
                 return (
@@ -1781,6 +1835,7 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
             mcpServerName={pendingConfirmation.mcpServerName}
             onConfirm={(choice) => confirmTool(choice, keyStartConfirmationRef.current ?? pendingConfirmation ?? undefined)}
             subagentTask={pendingConfirmation.subagentTask}
+            explicitApprovalOnly={pendingConfirmation.explicitApprovalOnly}
             keybindings={keybindings}
           />
         )}
@@ -1797,59 +1852,6 @@ export default function App({ config: initialConfig, keybindings, resumeMessages
             defaultValue={DEFAULT_UNKNOWN_CONTEXT_WINDOW}
             onSubmit={resolveContextWindowRequest}
           />
-        )}
-
-        {agentsTUIActive && (
-          <AgentsTUI
-            onExit={() => {
-              setAgentsTUIActive(false);
-              setPickerActive(false);
-              setInput(""); // clear any paste that leaked into InputPrompt while wizard was active
-              const resolve = agentsTUIResolveRef.current;
-              agentsTUIResolveRef.current = null;
-              resolve?.();
-              refreshAgentCommands();
-            }}
-            provider={activeProvider}
-            config={config}
-          />
-        )}
-        {skillsTUIActive && (
-          <SkillsTUI
-            marketplace={skillsMarketplace}
-            onExit={() => {
-              setSkillsTUIActive(false);
-              setPickerActive(false);
-              setInput("");
-              const resolve = skillsTUIResolveRef.current;
-              skillsTUIResolveRef.current = null;
-              resolve?.();
-            }}
-          />
-        )}
-        {jobsTUIActive && (
-          <JobsTUI
-            permissionMode={config.permissionMode}
-            onExit={() => {
-              setJobsTUIActive(false);
-              setPickerActive(false);
-              setInput("");
-              const resolve = jobsTUIResolveRef.current;
-              jobsTUIResolveRef.current = null;
-              resolve?.();
-            }}
-          />
-        )}
-
-        {resourceAdapter && (
-          <ResourceManager adapter={resourceAdapter} onExit={() => {
-            setResourceAdapter(null);
-            setPickerActive(false);
-            setInput("");
-            const resolve = resourceTUIResolveRef.current;
-            resourceTUIResolveRef.current = null;
-            resolve?.();
-          }} />
         )}
 
         {customizeTUIActive && (
