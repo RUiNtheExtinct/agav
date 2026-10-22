@@ -238,7 +238,16 @@ export interface PlatformAdapter {
 // Storage ownership: one authoritative writer per record kind
 // ---------------------------------------------------------------------------
 
+export interface JobAbandonment {
+  abandonedAt: string;
+  acknowledgement: "outcome-and-descendants-unverified";
+  previousState: "unknown" | "recovery-required";
+  previousNonce: string;
+}
+
 export interface JobRecord {
+  /** Permanent operator audit/tombstone; NOT a verified terminal outcome. */
+  abandonment?: JobAbandonment;
   jobId: JobId;
   requestId: RequestId;
   specHash: string;
@@ -483,6 +492,8 @@ export interface StartJobRequest {
 }
 
 export interface JobSummary {
+  abandonment?: JobAbandonment;
+  uncertaintyReason?: string;
   jobId: JobId;
   requestId: RequestId;
   state: LifecycleState;

@@ -216,7 +216,7 @@ Phase 0 ──► Phase 1 ──► Phase 2 ──┬──► Phase 3 ──►
 | **Runner pool starvation**: parked runs exit and free their slots, but long agent runs hold them | Queue latency | Pool size is configurable. FIFO admission. The TUI shows `queued` with its position. |
 | **Loop blow-up** (cost, time) | Runaway token spend | Hard caps (50 iterations, 500 executions), a run deadline, and a per-node timeout. B7 budgets in P2. |
 | **Hard links unavailable** on network filesystems (`createExclusive` fails closed) | No decisions possible | Detect this at `workflowsEnabled` time and warn. Document that the agav dir must be on a local filesystem. |
-| **Windows**: background jobs report `nativeHelperAvailable:false` and ownership is refused | No background runs on Windows | Ship `--foreground` as the Windows default and gate background mode on the platform capabilities report. |
+| **Windows**: background jobs report `nativeHelperAvailable:false`; workflows now use an unsandboxed fallback | No guaranteed Job Object ownership or descendant cleanup | Warn explicitly; preserve consent and `sandboxRequired`. Docker can sandbox explicit `run_command` calls only, not runners or job nodes. No user-facing `--foreground` is implemented. |
 | **ResourceManager rendering limits** (plain-text titles, a single detail text block) | The live tree has to be text | The design already renders the tree as text. Revisit a richer detail renderer only if needed. |
 
 ---

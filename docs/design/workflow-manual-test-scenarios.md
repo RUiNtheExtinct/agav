@@ -77,16 +77,16 @@ Each scenario has a Cleanup step that deletes its runs from the TUI (`d` on a fi
 
 ## Running on Windows
 
-Nothing in this section was run on a real Windows host. Claims that come from reading the code only are marked **UNVERIFIED**.
+The compiled Node smoke test (`source/__tests__/workflows.windows.test.ts`) passes on a real Windows host: a consented runner executes a cmd job and a `run_command` tool in an isolated profile with spaces and Unicode in its paths. Real TTY, TUI and standalone-binary checks below remain manual; the automated consent stream is not a real terminal pass.
 
 > **What to expect on Windows today**
 >
-> - Background runs are **refused by design**: the Windows platform adapter reports `nativeHelperAvailable=false`. The pass criterion on Windows is therefore "refused clearly **before** any consent prompt, and nothing is created".
-> - Refusal text: `Background workflow runs are unavailable on this host: the native process helper is missing (<limitations joined with "; ">).` The CLI prints it as `error: ...` with exit code `1`; the slash command prints `Workflow error: ...`; the TUI `R` key shows it as status text or form error, without a prefix.
-> - Order in `workflows run`: TTY check, then resolve/load/validate, then the Windows refusal, then the consent prompt. No run is created.
-> - Works without a runner: `workflows validate`, `list`, `status`, `inbox` (read-only), and `cancel` partly.
-> - Blocked as expected: M1, M2, M4, M5, M6, M8-M13, and the run parts of M3 and M7 (matrix below).
-> - There is no supported way to run workflows on Windows today. The `--foreground` fallback proposed in workflow-plan.md §6 was never built (the CLI only has `--input`, `--wait`, `--json`). See "Windows follow-ups".
+> - Background runs use the background-jobs Windows fallback even though `nativeHelperAvailable=false`. A warning explains that workflow runners and job nodes run **unsandboxed**.
+> - Docker is the only supported Windows sandbox override for an explicit `run_command` call (`input: { command: echo hello, sandbox: docker }`); Docker must be installed and usable. It does **not** sandbox the workflow runner or job nodes. Without an override, Windows `run_command` defaults to no sandbox.
+> - No native Job Object helper is bundled. Process-tree ownership and descendant cleanup are **not guaranteed**; cancellation is not proof that all descendants are dead.
+> - Consent, permission checks, opt-in gates and `sandboxRequired` remain intact. With `sandboxRequired`, fresh job nodes are refused; `run_command` must use an available sandbox such as explicit Docker or it refuses.
+> - CLI order: TTY check, resolve/load/validate, availability warning, consent, then creation and launch. Denying consent creates no run. No `--foreground` fallback is needed or available.
+> - POSIX shell examples must be translated for cmd; shell portability is not a Windows workflow launch prohibition.
 
 ### Windows setup
 
@@ -97,10 +97,10 @@ Use **Windows Terminal** with PowerShell for the main pass; repeat W4 in legacy 
   ```powershell
   cd C:\path\to\agav; git pull
   pnpm run build:binary          # runs `node scripts\build-binary.mjs native` -> dist\agav.exe
-  # or: pnpm build               # then run `node build\cli.js` (never verified on Windows)
+  # or: pnpm build               # then run `node build\cli.js` (automated Windows Node smoke verified)
   ```
 
-  `scripts\install.ps1` installs `agav.exe` into `%LOCALAPPDATA%\agav` and adds it to the user PATH. Use a fresh build, not the installed one, if it is older than e9ec5a97.
+  `scripts\install.ps1` installs `agav.exe` into `%LOCALAPPDATA%\agav` and adds it to the user PATH. Use a fresh build that includes current Windows workflow support, rather than an older installed binary.
 - [ ] Make `agav` resolve in every terminal you use:
 
   ```powershell
@@ -125,7 +125,7 @@ Use **Windows Terminal** with PowerShell for the main pass; repeat W4 in legacy 
   node -e "console.log(require('os').homedir())"
   ```
 
-  UNVERIFIED on a real Windows host. If the one-liner prints your real profile, stop and fix that first.
+  If the one-liner prints your real profile, stop and fix that first.
 - [ ] Create `%USERPROFILE%\.agav\config.json` **without a BOM**. Windows PowerShell 5.1 `Out-File -Encoding utf8` and `Set-Content -Encoding UTF8` write a BOM. `config.json` is read with `readFile(..., "utf-8")` + `JSON.parse` inside a `try/catch {}` and no BOM strip, so a BOM file is probably **silently ignored** and the gates look off (UNVERIFIED on Windows; inferred from `loadGlobalConfig`).
 
   ```powershell
@@ -139,7 +139,7 @@ Use **Windows Terminal** with PowerShell for the main pass; repeat W4 in legacy 
   echo {"backgroundJobsEnabled":true,"workflowsEnabled":true,"permissionMode":"ask"}> %USERPROFILE%\.agav\config.json
   ```
 
-- [ ] Create the workflow cwd: a path with no spaces, **not** under `%TEMP%`:
+- [ ] Create the workflow cwd (spaces and Unicode are supported; this simple path keeps manual commands short):
 
   ```powershell
   New-Item -ItemType Directory -Force C:\wf-testing\.agav\workflows | Out-Null; cd C:\wf-testing
@@ -166,52 +166,298 @@ Use **Windows Terminal** with PowerShell for the main pass; repeat W4 in legacy 
 | `echo $?`, `echo "exit=$?"` | `$LASTEXITCODE` | `echo %ERRORLEVEL%` |
 | `echo y \| agav ...` | `'y' \| agav workflows run x; "exit=$LASTEXITCODE"` | `echo y \| agav workflows run x` |
 | `agav ... \| cat` | `agav ... \| Out-String` | `agav ... \| more` |
-| `sleep N` (shell command) | `Start-Sleep N` (inside a workflow `cmd` job: `timeout /t N`) | `timeout /t N` |
+| `sleep N` (shell command) | `Start-Sleep N` (inside a workflow `cmd` job: `powershell -NoProfile -Command Start-Sleep N`) | `powershell -NoProfile -Command Start-Sleep N` |
 | `printenv X` | `$env:X` | `echo %X%` |
 | `/proc/<pid>/environ` | no equivalent: the M13 process check is Linux-only | n/a |
 | `script`, pty drivers | Linux-only | n/a |
-| `$(...)`, `seq`, `&&`, `>>`, heredocs (in workflow commands) | the example workflows are POSIX shell; do not port them (nothing can run them) | n/a |
+| `$(...)`, `seq`, `&&`, `>>`, heredocs (in workflow commands) | rewrite as cmd commands or explicitly invoke PowerShell; no automatic shell translation | n/a |
+
+### Windows companions for M1–M13
+
+Keep the Linux/macOS examples below unchanged; use these replacements on Windows. Run PowerShell from `C:\wf-testing` with the isolated `USERPROFILE` set in **every** terminal. Workflow `command:` fields run through cmd, not your interactive PowerShell. Save copied YAML/JSON and helper scripts without a BOM:
+
+```powershell
+$noBom = New-Object System.Text.UTF8Encoding $false
+$text = @'
+PASTE FILE TEXT HERE
+'@
+[System.IO.File]::WriteAllText("$PWD\.agav\workflows\NAME.yaml", $text, $noBom)
+```
+
+Replace `NAME` and the placeholder before executing. The closing `'@` starts its own line. Single-quoted here-strings preserve `${inputs...}`, `${nodes...}`, `${loop.index}` and quotes literally; do not use an interpolating `@"` here-string. Use the same writer with a `.json` or helper-script path as appropriate.
+
+#### M1–M4: inputs, cancellation, keys and app restart
+
+- **M1:** replace the `greet` command with `command: echo hello & powershell -NoProfile -Command "Start-Sleep -Seconds 4"` (keep the inputs and `write` node). Set `$env:WF_SECRET_A = 'aaa'; $env:WF_SECRET_B = 'bbb'`. Consent must show the Windows cwd and replacement command, not the POSIX text. Check output with `Get-Content .\m1-out.txt`. Check selected names and scan for fake values:
+
+  ```powershell
+  $wr = Join-Path $env:USERPROFILE '.agav\workflow-runs'
+  Get-ChildItem "$wr\*.json" | ForEach-Object { (Get-Content $_.FullName -Raw | ConvertFrom-Json).consent.envNames }
+  Get-ChildItem $wr -Recurse -File | Select-String -Pattern 'aaa|bbb'
+  ```
+
+  The scan should print nothing. Cleanup: `Remove-Item .\m1-out.txt`; after the checklist tests, `Remove-Item Env:WF_SECRET_A,Env:WF_SECRET_B`.
+- **M2:** in `m2-gate.json` use `"command": "powershell -NoProfile -Command Start-Sleep -Seconds 300"`. Approval JSON needs no command change. After cancel inspect test-owned processes using M11 below instead of `pgrep sleep`. A `cancelled` checkpoint does **not** guarantee descendant cleanup on Windows; record survivors separately. After deny, `Test-Path .\m2-out.txt` must be `False`; after approve, `Get-Content .\m2-out.txt` prints `shipped`.
+- **M3:** save this complete Windows `m3-long.yaml` with the BOM-free writer:
+
+  ```yaml
+  version: 1
+  name: m3-long
+  nodes:
+    - id: a
+      type: job
+      command: for /L %i in (1,1,80) do @echo line %i
+    - id: b
+      type: job
+      dependsOn: [a]
+      command: echo done-b
+  ```
+
+  Use **single `%i`**: this goes directly to `cmd /c`. `%%i` is only for a `.bat`/`.cmd` file and is wrong here. Logs must show `line 1` through `line 80`. Replace the two `sed` edits and `head -5` with:
+
+  ```powershell
+  $f = Join-Path $PWD '.agav\workflows\m1-inputs.yaml'
+  $text = [System.IO.File]::ReadAllText($f)
+  [System.IO.File]::WriteAllText($f, ($text -replace '(?m)^version: 1(?=\r?\n|\z)', 'version: 2'), $noBom)
+  # Check invalid state, then restore:
+  $text = [System.IO.File]::ReadAllText($f)
+  [System.IO.File]::WriteAllText($f, ($text -replace '(?m)^version: 2(?=\r?\n|\z)', 'version: 1'), $noBom)
+  Get-Content $f -TotalCount 5   # after TUI edit: verify comment and description
+  ```
+
+- **M4:** in `m4-wait.json` use `"command": "powershell -NoProfile -Command \"Start-Sleep -Seconds 40; Write-Output finished\""`. In each new terminal run `$env:USERPROFILE = 'C:\wf-testing\home'; Set-Location C:\wf-testing` before agav. Repeat close/reopen and one-time notification checks unchanged.
+
+#### M5–M7: credentials and native argument quoting
+
+M5/M6 need credentials in the isolated profile. M7 definitions need no shell changes; use `Get-Content` and `Get-ChildItem` for transcripts and retain A2A limitations.
+
+**M5:** PowerShell 5.1 can strip JSON quotes from native arguments. Use stop-parsing `--%` with an **executable**, not the `agav` PowerShell function. Verify the actual native argument first:
+
+```powershell
+node --% -e "console.log(JSON.parse(process.argv[1]).city)" {\"city\":\"Tokyo\"}
+# Must print Tokyo, not a JSON parse error.
+C:\path\to\agav\dist\agav.exe --% workflows run m5-agent --input {\"city\":\"Tokyo\"} --wait
+$LASTEXITCODE
+Get-Content .\m5-out.txt   # Japan
+Get-ChildItem "$env:USERPROFILE\.agav\workflow-runs\<full-run-id>\artifacts"
+```
+
+For Node use `node --% C:\path\to\agav\build\cli.js workflows run m5-agent --input {\"city\":\"Tokyo\"} --wait`. Keep each `--%` invocation on one line, without a trailing semicolon/pipe; check exit status on the next line. Variables do not expand after `--%`.
+
+**M6:** keep `rm -rf /var/tmp/wf-testing-does-not-exist` **verbatim** in the prompt. It tests the destructive-command block **before shell execution**. Do not translate it to `Remove-Item`, `del` or `rmdir`: expect refusal without an inbox decision, not a cmd “command not found” error. Observe with `Get-ChildItem .\m6-*.txt` and `Get-Content .\m6-a.txt`. Cleanup only test files: `Remove-Item .\m6-*.txt -Force -ErrorAction SilentlyContinue`.
+
+#### M8: executable checks and fix helpers
+
+Create these scripts in the test cwd. The check explicitly exits `1` on missing/nonmatching content; printing a Boolean does **not** set a failing native exit code.
+
+```powershell
+$check = @'
+param([string]$Path = 'm8-target.txt', [int]$DelaySeconds = 0)
+$ErrorActionPreference = 'Stop'
+try {
+    if ($DelaySeconds -gt 0) { Start-Sleep -Seconds $DelaySeconds }
+    if (!(Test-Path -LiteralPath $Path -PathType Leaf)) { exit 1 }
+    if ([System.IO.File]::ReadAllText((Join-Path $PWD $Path)) -notmatch 'ok') { exit 1 }
+    exit 0
+} catch { [Console]::Error.WriteLine($_); exit 1 }
+'@
+$fix = @'
+$ErrorActionPreference = 'Stop'
+try {
+    $n = 0
+    if (Test-Path -LiteralPath 'm8-count') { $n = [int][System.IO.File]::ReadAllText("$PWD\m8-count") }
+    $n++
+    $encoding = New-Object System.Text.UTF8Encoding $false
+    [System.IO.File]::WriteAllText("$PWD\m8-count", [string]$n, $encoding)
+    $value = if ($n -ge 2) { 'ok' } else { 'bad' }
+    [System.IO.File]::WriteAllText("$PWD\m8-target.txt", $value, $encoding)
+    exit 0
+} catch { [Console]::Error.WriteLine($_); exit 1 }
+'@
+[System.IO.File]::WriteAllText("$PWD\m8-check.ps1", $check, $noBom)
+[System.IO.File]::WriteAllText("$PWD\m8-fix.ps1", $fix, $noBom)
+Remove-Item .\m8-count,.\m8-target.txt,.\m8-attempt.txt,.\m8-never.txt -Force -ErrorAction SilentlyContinue
+```
+
+Apply these exact YAML replacements, retaining indentation, dependencies, `when`, loop settings and `continueOnError`:
+
+| File / node | Replacement YAML line |
+| --- | --- |
+| `m8-fix-until-pass` / `test.input` | `command: powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-check.ps1 -Path m8-target.txt -DelaySeconds 20` |
+| `m8-fix-until-pass` / `fix.input` | `command: powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-fix.ps1` |
+| `m8-unfixable` / `test.input` | `command: powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-check.ps1 -Path m8-never.txt` |
+| `m8-fix-agent` / `test.input` | `command: powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-check.ps1 -Path m8-target.txt` |
+| `m8-fix-job` / job `test` | `command: powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-check.ps1 -Path m8-target.txt` |
+| `m8-fix-job` / `fix.input` | `command: powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-fix.ps1` |
+
+`Bypass` applies only to these helper processes; organizational policy may still block it. Preflight: `powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-check.ps1` must return `$LASTEXITCODE` = `1`. Invoke `powershell -NoProfile -ExecutionPolicy Bypass -File .\m8-fix.ps1` twice, then the check: exit `0`, count `2`. **Reset** count/target/attempt before the main run and again before the job variant; remove only target before the agent variant. Keep `m8-never.txt` missing. Agent prompt and unfixable `write_file` need no changes.
+
+Observe with `Get-Content .\m8-count`, `Get-Content .\m8-target.txt`, `Get-Content .\m8-attempt.txt`. List specs with `Get-ChildItem "$env:USERPROFILE\.agav\background-jobs\specs" | Where-Object Name -match 'test-1_i'`. A pure tool variant need not have a child-job supervisor: use status for continued execution and M11 for process checks. Cleanup also removes `m8-check.ps1` and `m8-fix.ps1`.
+
+#### M9–M10: checkpoint edit and line counts
+
+**M9 step 2:** close the TUI; wait until `arm` is parked **and its runner has exited**. Never edit an active checkpoint. This PowerShell-invoked Node edit avoids PowerShell JSON depth/type conversion and uses BOM-free UTF-8, a same-directory temp file and rename. Replace `ID8`:
+
+```powershell
+$wr = Join-Path $env:USERPROFILE '.agav\workflow-runs'
+$files = @(Get-ChildItem "$wr\ID8*.json")
+if ($files.Count -ne 1) { throw 'Expected exactly one checkpoint' }
+$f = $files[0].FullName
+$edit = @'
+const fs = require('node:fs');
+const f = process.argv[2], tmp = f + '.tmp';
+const run = JSON.parse(fs.readFileSync(f, 'utf8'));
+if (run.status !== 'waiting_approval') throw Error('Run must be parked');
+console.log('before', JSON.stringify(run.consent.capabilities));
+run.consent.capabilities.tools = [];
+fs.writeFileSync(tmp, JSON.stringify(run), {encoding: 'utf8', flag: 'wx'});
+fs.renameSync(tmp, f);
+console.log('after', JSON.stringify(run.consent.capabilities));
+'@
+$edit | node - $f
+if ($LASTEXITCODE -ne 0) { throw 'Edit failed; inspect checkpoint/temp file before approving' }
+Test-Path "$f.tmp"   # False
+agav workflows status ID8
+```
+
+Only approve `arm` after status still prints the tree. Keep hashes, cwd, other consent fields and definition untouched. At the end `(Get-ChildItem "$wr\<full-run-id>\decisions" -File | Where-Object Name -match 'decided').Count` must be `5`.
+
+**M10:** `echo round >> m10-rounds.txt` works in cmd; keep it. Replace `wc -l` with `@(Get-Content .\m10-rounds.txt).Count` (expect `1`, then `2`, then `3`). Before starting and after deny, `Test-Path .\m10-rounds.txt` must be `False`; reset with `Remove-Item .\m10-rounds.txt -ErrorAction SilentlyContinue`.
+
+#### M11: delays and safe process observations
+
+Use `command: powershell -NoProfile -Command "Start-Sleep -Seconds 30"` for `m11-tool-timeout`, and `command: powershell -NoProfile -Command "Start-Sleep -Seconds 300"` for `m11-job-timeout` and `m11-deadline`. Leave approval definitions alone, including the invalid one. Exit checks: `agav workflows validate m11-approval-timeout; "exit=$LASTEXITCODE"` (similarly for `run`).
+
+Capture a baseline before M2/M11/M13, then compare in the same observation terminal:
+
+```powershell
+$beforePids = @(Get-CimInstance Win32_Process | Select-Object -ExpandProperty ProcessId)
+# During the test, and again after cancellation/timeout:
+Get-CimInstance Win32_Process | Where-Object {
+    $_.ProcessId -notin $beforePids -and
+    ($_.CommandLine -like '*Start-Sleep*' -or $_.CommandLine -like '*internal-workflow-runner*')
+} | Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine
+```
+
+This is a **candidate list, not proof of ownership**. Cross-check runner UUID, child job id/PID from status and `/job list`, creation time and parent chain. Never kill all PowerShell/Node/agav processes or all `Start-Sleep` matches. Stop a surviving test job with `/job stop <jobId>` first; if needed recheck PID/creation time before `Stop-Process -Id <verified-test-pid>`. No Job Object descendant-cleanup guarantee exists. Record survivors as a Windows limitation, not proof cleanup is safe; timeout states and approval validation must still match M11. OS-specific error suffixes may differ. Read the deadline event with `Get-Content "$env:USERPROFILE\.agav\workflow-runs\<full-run-id>\events.jsonl" -Tail 1`.
+
+#### M12: retention from PowerShell
+
+Use only the isolated profile, close the TUI, and age only finished runs or a fully parked run whose runner has exited. YAML needs no changes. Set `$A`, `$C`, `$P` to the **full UUIDs** from M12 step 2:
+
+```powershell
+$wr = Join-Path $env:USERPROFILE '.agav\workflow-runs'
+function Age-WorkflowCheckpoint {
+    param([string]$Path, [double]$Days)
+    $js = @'
+const fs = require('node:fs');
+const f = process.argv[2], days = Number(process.argv[3]), tmp = f + '.tmp';
+if (!Number.isFinite(days)) throw Error('Invalid age');
+const text = fs.readFileSync(f, 'utf8');
+const aged = text.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/g,
+  s => new Date(Date.parse(s) - days * 86400000).toISOString());
+JSON.parse(aged);
+fs.writeFileSync(tmp, aged, {encoding: 'utf8', flag: 'wx'});
+fs.renameSync(tmp, f);
+'@
+    $js | node - $Path $Days
+    if ($LASTEXITCODE -ne 0) { throw 'Aging failed; inspect checkpoint/temp file before continuing' }
+}
+New-Item -ItemType File "$wr\$A.cancel" -Force | Out-Null
+$notification = @(Get-ChildItem "$wr\_mailbox\*.json" | Where-Object {
+    [System.IO.File]::ReadAllText($_.FullName).Contains($A)
+} | Select-Object -First 1)
+if ($notification.Count -ne 1) { throw 'No notification for A' }
+$seen = [System.IO.Path]::ChangeExtension($notification[0].FullName, '.seen')
+New-Item -ItemType File $seen -Force | Out-Null
+Get-ChildItem $wr,"$wr\_mailbox"
+Age-WorkflowCheckpoint "$wr\$A.json" 10
+Age-WorkflowCheckpoint "$wr\$C.json" 6
+Age-WorkflowCheckpoint "$wr\$P.json" 10
+(Get-Content "$wr\$A.json" -Raw | ConvertFrom-Json) | Select-Object createdAt,updatedAt
+agav workflows status ($A.Substring(0,8))   # still passed; does not prune
+agav workflows list                       # only C and P; no reconcile warning
+Test-Path "$wr\$A.json"; Test-Path "$wr\$A"; Test-Path "$wr\$A.cancel"; Test-Path $seen
+# All four False; no matching notification:
+Get-ChildItem "$wr\_mailbox\*.json" | Select-String -SimpleMatch $A
+Test-Path "$wr\$C.json"; Test-Path "$wr\$C"; Test-Path "$wr\$P.json"; Test-Path "$wr\$P"
+# All four True; P's inbox decision remains:
+agav workflows inbox
+agav workflows status ($P.Substring(0,8))
+Age-WorkflowCheckpoint "$wr\$C.json" 2
+agav workflows list                       # only P remains
+Test-Path "$wr\$C.json"; Test-Path "$wr\$C"   # both False
+Get-ChildItem "$wr\_mailbox\*.json" | Select-String -SimpleMatch $C   # no matches
+Get-ChildItem "$wr\*.tmp"                  # no leftovers
+```
+
+Confirm P's checkpoint, directory and inbox remain after the boundary check. Cleanup: `agav workflows deny ($P.Substring(0,8)) gate`, delete the finished run in the TUI, then `Remove-Item Function:Age-WorkflowCheckpoint; Remove-Variable A,C,P,wr,notification,seen`. Never age while another writer is active.
+
+#### M13: selected environment names
+
+Set `$env:FAKE_SECRET = 's3cr3t-m13'` (cmd: `set FAKE_SECRET=s3cr3t-m13`). Replace **both** `printenv ...` commands with:
+
+```yaml
+      command: if defined FAKE_SECRET (echo %FAKE_SECRET%) else (echo absent)
+```
+
+For `tool-env` keep this under `input:`; for `job-env` indent at the job's `command:` level. For `hold` use `command: powershell -NoProfile -Command "Start-Sleep -Seconds 90"`. An absent cmd variable can otherwise print literally as `%FAKE_SECRET%`; `if defined` makes observations unambiguous. Record actual tool/job outputs with the selected name and again with `none`; do not infer inheritance from the launching shell. `/proc` runner/hold environment inspection remains **Linux-only**, not verified on Windows.
+
+Scan with `Get-ChildItem "$env:USERPROFILE\.agav" -Recurse -File | Select-String -SimpleMatch 's3cr3t-m13'`. If a node inherits and prints it, outputs/artifacts may persist it: record that result/leak rather than assuming a clean scan. Cancel, inspect only test-owned descendants as in M11, delete runs, then `Remove-Item Env:FAKE_SECRET` (cmd: `set FAKE_SECRET=`).
 
 ### Scenario matrix
 
 | Scenario | Windows | What to do |
 | --- | --- | --- |
-| M1 | BLOCKED (expected) | Do on Linux instead. On Windows the `R` key shows the refusal (W1). |
-| M2 | BLOCKED (expected) | Do on Linux instead. |
-| M3 | Partial | `v` (validate), Tab, footers work (W4). Its sample jobs use POSIX shell; Run, Logs and Re-run are blocked. |
-| M4 | BLOCKED (expected) | Do on Linux instead. |
-| M5, M6 | BLOCKED (expected) | Do on Linux instead. |
-| M7 | Partial | `agav workflows validate` of the A2A workflow works (as W3); the run is blocked. |
-| M8-M11, M13 | BLOCKED (expected) | Do on Linux instead (M13 also needs `/proc`). |
-| M12 | BLOCKED (expected) | Needs aged finished runs; none can be created. Do on Linux. |
-| M14 | **Run it: W1** | The Windows scenario. |
-| M15 | Partial: **W2** | Gates, no-TTY refusal and the unchanged store work; `pgrep` and `ls` need the translations above. |
+| M1 | Run with adaptations | Use `echo hello` for the job; check inputs, consent and output. |
+| M2 | Run with adaptations | Use a PowerShell delay; inspect test-owned processes after cancel (no descendant-cleanup guarantee). |
+| M3 | Run with adaptations | Replace the POSIX loop with a cmd `for /L` loop; validate, edit, logs and re-run are available. |
+| M4 | Run with adaptations | Use a PowerShell delay; set the same test `USERPROFILE` in both terminals. |
+| M5, M6 | Run with credentials | Configure credentials in the isolated profile; translate shell commands. |
+| M7 | Run | Validate and run; retain the documented A2A limitation. |
+| M8-M11 | Run with adaptations | Translate POSIX commands; do not assume Job Object ownership during recovery/cancel. |
+| M12 | Run | Create finished runs first, then test retention. |
+| M13 | Partial | Translate env commands; `/proc` environment inspection remains Linux-only. |
+| M14 | **Run W1 instead** | Missing-helper refusal now applies only to non-Windows hosts. |
+| M15 | **Run W2** | Gates and no-TTY refusal remain unchanged. |
 
-### W1. Refusal before consent (M14 on Windows)
+### W1. Consented background execution (Windows replacement for M14)
 
-**Goal:** `workflows run` is refused before any consent prompt and creates nothing, in the CLI, the slash command and the TUI.
+**Goal:** CLI, slash command and TUI launch a consented background workflow, warn honestly, and respect denial of consent.
 
-**Prerequisites:** setup above, and `.agav\workflows\m14-any.yaml` (the file from M14). Write it without a BOM:
+**Prerequisites:** setup above with `sandboxRequired` unset or false. Save `.agav/workflows/m14-any.yaml` without a BOM:
 
-```powershell
-$y = "version: 1`nname: m14-any`nnodes:`n  - id: hello`n    type: tool`n    tool: run_command`n    input:`n      command: echo hello`n"
-[System.IO.File]::WriteAllText("$PWD\.agav\workflows\m14-any.yaml", $y, (New-Object System.Text.UTF8Encoding $false))
+```yaml
+version: 1
+name: m14-any
+nodes:
+  - id: job
+    type: job
+    command: echo windows-job-ok
+  - id: shell
+    type: tool
+    dependsOn: [job]
+    tool: run_command
+    input:
+      command: echo windows-shell-ok
 ```
 
 **Steps:**
 
 1. - [ ] `agav workflows validate m14-any` prints `Workflow valid.`
-2. - [ ] In the terminal (not piped): `agav workflows run m14-any; "exit=$LASTEXITCODE"` (cmd: `agav workflows run m14-any` then `echo %ERRORLEVEL%`). Stderr starts with `error: Background workflow runs are unavailable on this host: the native process helper is missing`, then the limitation strings in parentheses and a period. `exit=1`. No consent summary, no env checklist, no `Approve this background run?`.
-3. - [ ] Nothing was created: `agav workflows list` prints `No workflow runs.`; `Get-ChildItem $env:USERPROFILE\.agav\workflow-runs` is missing or empty (no `<uuid>.json`, no run directory); `Get-CimInstance Win32_Process | Where-Object CommandLine -like '*internal-workflow-runner*'` prints nothing.
-4. - [ ] Slash command: start `agav`, type `/workflows run m14-any`. The answer is `Workflow error: Background workflow runs are unavailable on this host: the native process helper is missing...` and no consent screen opens.
-5. - [ ] TUI: open the Workflows tab, select `m14-any`, press `R`. The same message (without a prefix) appears in the status line or the input form. No crash, no consent stage.
-6. - [ ] Repeat step 3.
+2. - [ ] In a real terminal: `agav workflows run m14-any --wait`. Before consent, stderr warns that runners and job nodes are unsandboxed, Docker applies only to `run_command`, and Job Object ownership/descendant cleanup are not guaranteed. It must not print a Windows missing-helper refusal.
+3. - [ ] Select `none` for env names and answer `y`. A run id is printed; both `job` and `shell` reach `passed`; `$LASTEXITCODE` is `0`. `agav workflows status <id8>` includes `windows-job-ok` and `windows-shell-ok` in node outputs.
+4. - [ ] Repeat, but answer `n` at final consent. Exit code is `1`; `workflows list` has no new run. A warning alone is not consent.
+5. - [ ] Slash command: start `agav`, type `/workflows run m14-any`. The consent checklist opens; approve it and confirm the run passes in `/workflows status <id8>`.
+6. - [ ] TUI: select `m14-any`, press `R`, approve consent, and watch Runs reach `passed` without manual refresh. Repeat with `n`/ESC at consent and confirm no new run. The warning goes to stderr; check its visibility within the interactive layout manually.
+7. - [ ] Repeat in a test cwd/profile with spaces and Unicode. Confirm checkpoints and output are readable. Record Node build versus standalone binary separately.
+8. - [ ] Policy check: enable `sandboxRequired` in the test config and launch again with consent. The job node must refuse, not silently run unsandboxed. In a separate tool-only workflow, a default `run_command` must refuse; an explicit `sandbox: docker` call may pass only with usable Docker. Restore the config afterwards. Docker does not protect job nodes or the runner.
 
-**Expected:** the refusal before consent, exit code 1, nothing created, no runner process.
+**Expected:** consented execution succeeds with the warning; denial creates nothing; required sandboxing fails closed. Automated Node smoke coverage does not verify the real TUI or Docker.
 
-**Failure signal:** a consent prompt appears first; a run or `<uuid>.json` exists afterwards; a stack trace or unrelated error; exit code `0`.
+**Failure signal:** missing-helper refusal on Windows; execution without consent; missing warning; false sandbox/Job Object guarantees; `sandboxRequired` bypassed; failed nodes reported as passed.
 
-**Cleanup:** none. If a stray run exists, delete it from the TUI.
+**Cleanup:** delete finished runs from the TUI. Cancel only test-owned active runs and inspect their processes before removing the test profile; descendant cleanup is not guaranteed.
 
 ### W2. Gates and no-TTY (M15 on Windows)
 
@@ -224,9 +470,9 @@ $y = "version: 1`nname: m14-any`nnodes:`n  - id: hello`n    type: tool`n    tool
 1. - [ ] `workflowsEnabled:false` (write the config with the `WriteAllText` snippet, no BOM): `agav workflows list`, `run m15-ok` and `validate m15-ok` each print `error: Workflows require backgroundJobsEnabled=true AND workflowsEnabled=true.` and exit `1`.
 2. - [ ] `backgroundJobsEnabled:false`: the same message.
 3. - [ ] Restore with `Copy-Item ...config.json.good ...config.json`; `agav workflows list` works again.
-4. - [ ] `Get-ChildItem $env:USERPROFILE\.agav\workflow-runs -ErrorAction SilentlyContinue > C:\wf-testing\before.txt`, then `'y' | agav workflows run m15-ok; "exit=$LASTEXITCODE"` prints `error: workflow run requires interactive consent` and `exit=1`. (This check comes before the runner refusal.)
+4. - [ ] `Get-ChildItem $env:USERPROFILE\.agav\workflow-runs -ErrorAction SilentlyContinue > C:\wf-testing\before.txt`, then `'y' | agav workflows run m15-ok; "exit=$LASTEXITCODE"` prints `error: workflow run requires interactive consent` and `exit=1`. (The TTY check still comes before availability and consent.)
 5. - [ ] `agav workflows run m15-ok | Out-String` prints the same error and nothing on stdout.
-6. - [ ] Repeat the `Get-ChildItem` into `after.txt`; `Compare-Object (Get-Content C:\wf-testing\before.txt) (Get-Content C:\wf-testing\after.txt)` prints nothing. No `internal-workflow-runner` process (W1 step 3 query).
+6. - [ ] Repeat the `Get-ChildItem` into `after.txt`; `Compare-Object (Get-Content C:\wf-testing\before.txt) (Get-Content C:\wf-testing\after.txt)` prints nothing. No new test-owned `internal-workflow-runner` process (use the process query in Command translation and compare with the baseline).
 7. - [ ] `'y' | agav workflows run x` prints the same `requires interactive consent` error.
 
 **Expected / Failure signal:** as M15. A gate that seems ignored with a BOM config: check the BOM first (setup).
@@ -269,7 +515,7 @@ $json = '{"version":1,"name":"w3-bom-json","nodes":[{"id":"hello","type":"tool",
 **Steps:**
 
 1. - [ ] Resize to 80x24 (conhost: Properties > Layout; Windows Terminal: drag until the size is shown). Start `agav`, open the workflows view. Three tabs render (Workflows, Runs, Inbox) and Tab switches between them.
-2. - [ ] The Workflows tab lists `m14-any`. The Runs tab shows its empty state. The Inbox shows `No pending decisions.`
+2. - [ ] The Workflows tab lists `m14-any`. The Runs tab shows W1 runs, or its empty state if they were deleted. The Inbox shows `No pending decisions.`
 3. - [ ] Footers wrap or truncate without overlapping the list.
 4. - [ ] Glyphs: `✓ ✗ ● ◐ ⊘ ⏱ ↷ …` and the `│` separator are legible. They have no ASCII fallback. Windows Terminal is expected to be fine; `⏱` and `⊘` may render as boxes or `?` in conhost (UNVERIFIED). Record the font and host.
 
@@ -281,7 +527,7 @@ $json = '{"version":1,"name":"w3-bom-json","nodes":[{"id":"hello","type":"tool",
 
 **Steps:**
 
-1. - [ ] With an empty store: `agav workflows list` prints `No workflow runs.`; `agav workflows inbox` prints `No pending workflow decisions.` and exits `0`; `agav workflows status 00000000` fails with an `error:` line (the exact text is UNVERIFIED) and no stack trace.
+1. - [ ] After deleting finished test runs so the store is empty: `agav workflows list` prints `No workflow runs.`; `agav workflows inbox` prints `No pending workflow decisions.` and exits `0`; `agav workflows status 00000000` fails with an `error:` line (the exact text is UNVERIFIED) and no stack trace.
 2. - [ ] `Test-Path $env:USERPROFILE\.agav\background-jobs` is `True` after `list` (it creates the dir; fine). Reconcile problems may print as warnings only.
 3. - [ ] Ctrl+C in the open TUI exits it cleanly: the prompt returns, the cursor is visible and the console is not left in raw mode (typed characters echo again). `Get-CimInstance Win32_Process | Where-Object CommandLine -like '*agav*'` shows no leftover `agav` started by this test (UNVERIFIED on Windows).
 
@@ -291,10 +537,10 @@ $json = '{"version":1,"name":"w3-bom-json","nodes":[{"id":"hello","type":"tool",
 
 ### Windows follow-ups (code)
 
-- The `--foreground` fallback from workflow-plan.md §6 was never built, so workflows cannot run on Windows at all.
+- Native Job Object ownership and reliable descendant cleanup remain unavailable; inspect test-owned processes after cancellation or forced termination.
 - Probable bug: `loadDefinition` does not strip a UTF-8 BOM, so JSON workflows saved by PowerShell 5.1 fail to parse (YAML is fine). Strip `\uFEFF` before `JSON.parse`. The same holds for `config.json` (silently ignored).
-- The example workflows in this doc are POSIX shell (`seq`, `$(...)`, `sleep`, `&&`, `>>`, `printenv`); run_command nodes use `cmd.exe /d /s /c` on win32 and `job` nodes with `command` default to `cmd`. They matter only once a runner exists.
-- There is no sandbox backend on Windows; settings that require a sandbox make `run_command` refuse.
+- The example workflows in this doc are POSIX shell (`seq`, `$(...)`, `sleep`, `&&`, `>>`, `printenv`); run_command nodes use `cmd.exe /d /s /c` on win32 and `job` nodes with `command` default to `cmd`. Translate these commands before running the examples on Windows.
+- Windows has no default OS sandbox. Explicit Docker can sandbox `run_command` only; `sandboxRequired` still refuses unsandboxed calls and fresh job starts.
 - `createExclusive` uses `fs.link` with no `EPERM` retry (unlike `writeAtomic`): it fails closed with storage-unavailable on FAT/exFAT, some ReFS setups and network shares (UNVERIFIED).
 - Checkpoints pin the cwd with strict `!==` after `realpath`; no drive-letter or case normalisation (UNVERIFIED how `realpath` cases on NTFS).
 - Status glyphs have no ASCII fallback (`format.ts`).
@@ -1106,13 +1352,13 @@ Then, in the terminal where you launch the run: `export HOME=/tmp/wf-testing/hom
 
 **Cleanup:** `agav workflows cancel <id8>`, check `ps -eo pid,args | grep '[s]leep 90'` is empty, delete the runs, `unset FAKE_SECRET RUN`.
 
-## M14. Background runs refused on hosts without the native helper (optional)
+## M14. Background runs refused on non-Windows hosts without the native helper (optional)
 
-**Goal:** On Windows, or any host where the background-jobs capabilities report `nativeHelperAvailable: false`, `workflows run` refuses **before** the consent prompt, with a clear message, and creates no run. Skip this scenario on Linux/macOS (the helper is available there and there is no supported switch to turn it off); mark it `n/a` in the log.
+**Goal:** On a **non-Windows** host where the background-jobs capabilities report `nativeHelperAvailable: false`, `workflows run` refuses **before** the consent prompt, with a clear message, and creates no run. Skip this scenario on Linux/macOS (the helper is available there and there is no supported switch to turn it off); mark it `n/a` in the log.
 
-**Windows:** this is the scenario to run there; the translated steps are in **W1** (see Running on Windows).
+**Windows:** do not expect missing-helper refusal. Run **W1** instead: the Windows fallback warns and proceeds to consent.
 
-**Prerequisites:** a Windows host (or another host without the helper), `backgroundJobsEnabled` and `workflowsEnabled` set, and `.agav/workflows/m14-any.yaml`
+**Prerequisites:** a non-Windows host without the helper, `backgroundJobsEnabled` and `workflowsEnabled` set, and `.agav/workflows/m14-any.yaml`
 
 ```yaml
 version: 1
@@ -1195,28 +1441,28 @@ Keep a copy of the good config: `cp $HOME/.agav/config.json $HOME/.agav/config.j
 
 ### Windows results
 
-Fill in on a Windows host. `blocked-as-expected` rows are pre-filled from the code, not from a run: confirm each by seeing the refusal (W1), or leave them as is.
+Fill in on a Windows host. Leave unrun manual checks blank; do not infer a pass from automated coverage. The compiled Node smoke test passes, but real-terminal/TUI, standalone binary and Docker checks are not covered by that test.
 
-| Scenario | Result (pass / fail / blocked-as-expected) | Notes | Date |
+| Scenario | Result (pass / fail / not run / n/a) | Notes | Date |
 | --- | --- | --- | --- |
 | W1 |  |  |  |
 | W2 |  |  |  |
 | W3 |  | BOM JSON fails: expected today |  |
 | W4 |  | host/font: |  |
 | W5 |  |  |  |
-| M1 | blocked-as-expected |  |  |
-| M2 | blocked-as-expected |  |  |
-| M3 | blocked-as-expected | `v`, Tab, footers checked in W4 |  |
-| M4 | blocked-as-expected |  |  |
-| M5 | blocked-as-expected |  |  |
-| M6 | blocked-as-expected |  |  |
-| M7 | blocked-as-expected | `validate` alone works (W3) |  |
-| M8 | blocked-as-expected |  |  |
-| M9 | blocked-as-expected |  |  |
-| M10 | blocked-as-expected |  |  |
-| M11 | blocked-as-expected |  |  |
-| M12 | blocked-as-expected |  |  |
-| M13 | blocked-as-expected | Linux-only (`/proc`) |  |
+| M1 |  |  |  |
+| M2 |  |  |  |
+| M3 |  | `v`, Tab, footers checked in W4 |  |
+| M4 |  |  |  |
+| M5 |  |  |  |
+| M6 |  |  |  |
+| M7 |  | Validate and run; retain A2A limits |  |
+| M8 |  |  |  |
+| M9 |  |  |  |
+| M10 |  |  |  |
+| M11 |  |  |  |
+| M12 |  |  |  |
+| M13 |  | Partial: `/proc` inspection is Linux-only |  |
 
 ## Cleanup
 

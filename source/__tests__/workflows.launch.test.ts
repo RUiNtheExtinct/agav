@@ -1,5 +1,6 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { PlatformCapabilities } from "../background-jobs/types.js";
+import { assertBackgroundRunsAvailable } from "../workflows/background.js";
 import { buildConsent } from "../workflows/grant.js";
 import { getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
 import { launchRun, runnerLaunchSession, runnerStartRequest } from "../workflows/launch.js";
@@ -23,9 +24,9 @@ async function backgroundRun(envNames: string[] = []): Promise<WorkflowRun> {
 }
 
 class CapCoordinator extends FakeCoordinator {
-  constructor(private readonly nativeHelperAvailable = true) { super(); }
+  constructor(private readonly nativeHelperAvailable = true, private readonly hostPlatform: PlatformCapabilities["platform"] = "linux") { super(); }
   async capabilities(): Promise<PlatformCapabilities> {
-    return { platform: "linux", availableIsolationBackends: [], strongestOwnershipScope: "process-group", supportsGracefulApplicationShutdown: true, supportsDelegatedCgroup: false, nativeHelperAvailable: this.nativeHelperAvailable, limitations: this.nativeHelperAvailable ? [] : ["no helper"] } as PlatformCapabilities;
+    return { platform: this.hostPlatform, availableIsolationBackends: [], strongestOwnershipScope: "process-group", supportsGracefulApplicationShutdown: true, supportsDelegatedCgroup: false, nativeHelperAvailable: this.nativeHelperAvailable, limitations: this.nativeHelperAvailable ? [] : ["no helper"] } as PlatformCapabilities;
   }
 }
 
@@ -62,6 +63,21 @@ describe("launchRun", () => {
     await expect(launchRun(store, run.id, { coordinator, cliPath: CLI })).rejects.toThrow(/native process helper is missing/);
     expect(coordinator.starts).toHaveLength(0);
     expect((await store.read(run.id, registry)).status).toBe("pending");
+  });
+
+  it("allows the Windows fallback and warns without claiming sandbox or Job Object protection", async () => {
+    const run = await backgroundRun();
+    const coordinator = new CapCoordinator(false, "win32");
+    const warning = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      await expect(assertBackgroundRunsAvailable(coordinator)).resolves.toBeUndefined();
+      expect((await launchRun(store, run.id, { coordinator, cliPath: CLI })).status).toBe("started");
+      expect(coordinator.starts[0]?.isolation).toEqual({ backend: "none", required: false });
+      const text = warning.mock.calls.map(call => String(call[0])).join("");
+      expect(text).toContain("unsandboxed");
+      expect(text).toContain("Docker");
+      expect(text).toContain("Job Object");
+    } finally { warning.mockRestore(); }
   });
 
   it("refuses a run without consent", async () => {

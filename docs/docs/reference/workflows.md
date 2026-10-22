@@ -205,7 +205,7 @@ The consent (definition hash, cwd, permission mode, capabilities, env names) is 
 
 Consent for a tool name never covers an agent's sub-tool calls.
 
-The run is created only after consent. Its runner is launched as a supervised background job (`wf-run-<runId>-<attempt>`) that runs `agav --internal-workflow-runner <runId>`. At most `maxConcurrentWorkflowRuns` runners (default 2, separate from the background-job pool) execute at once; further runs wait as `queued` and are admitted first-in, first-out. Hosts without the native process helper (Windows) refuse to launch.
+The run is created only after consent. Its runner is launched as a supervised background job (`wf-run-<runId>-<attempt>`) that runs `agav --internal-workflow-runner <runId>`. At most `maxConcurrentWorkflowRuns` runners (default 2, separate from the background-job pool) execute at once; further runs wait as `queued` and are admitted first-in, first-out. Non-Windows hosts without the native process helper refuse to launch. Windows uses the background-jobs fallback with a warning: runners and job nodes run unsandboxed, with no guaranteed Job Object ownership or descendant cleanup.
 
 ### Run and node states
 
@@ -332,6 +332,10 @@ The runner uses the consent's permission mode, narrowed by `policies.permissionM
 - Approval nodes and inbox decisions wait forever: there is no decision timeout or expiry. `maxRuntimeSeconds` still applies while the runner is live.
 - An agent sub-tool consent is awaited in-process by the live runner. The agent's conversation is not checkpointed while it waits.
 - `policies.maxConcurrency` is stored but ignored: nodes execute one at a time in dependency order.
-- Background runs are unsupported on Windows (no native process helper), so launches are refused there.
+- Windows background runs use an unsandboxed fallback; no native Job Object helper is bundled, so process-tree ownership and descendant cleanup are not guaranteed. Docker is the only supported Windows sandbox override for explicit `run_command` calls (`sandbox: docker`), not for runners or job nodes. Consent and `sandboxRequired` remain enforced: fresh job starts refuse under `sandboxRequired`, and unsandboxed `run_command` calls refuse.
 - Interrupted tool nodes are never replayed automatically. Decide their `uncertain_tool` decision after you have inspected any external effects.
 - Terminal runs cannot be resumed or rewound. Use re-run (TUI `R`) or a new `run`.
+
+## Shared job capacity and uncertain jobs
+
+Workflow runners share background-job capacity with independent jobs. For operator-only abandonment of permanently uncertain jobs, see [Recovery guidance](/reference/job-recovery). It releases capacity without proving termination; it does not automatically resume workflows or retry uncertain children.

@@ -9,6 +9,8 @@ export interface ResourceItem {
   removable?: boolean;
   /** Offered the job "Stop" action (live jobs only). */
   stoppable?: boolean;
+  /** Offered explicit unverified abandonment (uncertain, not already abandoned jobs only). */
+  abandonable?: boolean;
   values?: Record<string, string>;
 }
 

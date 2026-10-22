@@ -105,7 +105,7 @@ Final verification:
 ## 6. Deviations from the plan
 
 User answers that changed the design (plan §7):
-1. Runs are **background only**. There is no user-facing `--foreground`. The ForegroundHost exists only for internal use and tests. Background runs are refused when the native helper is unavailable (Windows).
+1. Runs are **background only**. There is no user-facing `--foreground`. The ForegroundHost exists only for internal use and tests. Non-Windows background runs are refused when the native helper is unavailable. Windows now uses the background-jobs unsandboxed fallback with a warning; Job Object ownership and descendant cleanup are not guaranteed.
 2. **Consent is asked on every invocation** and stored on the run, bound to the definition hash and cwd. Relaunches reuse it. Nothing is reused across separate invocations, and the `workflow-run` GrantAction is never checked.
 3. The env-var checklist stores **names only**. Values pass to the runner through a channel that is never written to disk. This applies to all background jobs.
 4. Approvals wait forever. There is no `approvalTimeoutSeconds` and no `expired` state.

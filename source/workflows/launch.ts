@@ -9,8 +9,25 @@ import { runnerRequestId, type WorkflowRun, type WorkflowStore } from "./store.j
 export const DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS = 2;
 const TERMINAL_RUN = new Set(["passed", "failed", "cancelled", "timed_out"]);
 
-/** `capabilities` is optional so minimal clients still work; when present, a missing native helper refuses the launch. */
+/** Optional capabilities preserve minimal clients; Windows supports an explicitly unverified fallback. */
 export type RunnerCoordinator = Pick<CoordinatorClient, "start" | "poll" | "stop" | "findByRequestId"> & Partial<Pick<CoordinatorClient, "capabilities">>;
+const warnedWindowsCoordinators = new WeakSet<RunnerCoordinator>();
+
+/** Share the availability policy between consent preflight and every launch/relaunch. */
+export async function assertBackgroundRunsAvailable(coordinator: RunnerCoordinator): Promise<void> {
+  const capabilities = await coordinator.capabilities?.();
+  if (capabilities?.platform === "win32") {
+    if (!warnedWindowsCoordinators.has(coordinator)) {
+      process.stderr.write("Warning: Windows workflow runners and job nodes run unsandboxed. Docker is the only supported Windows sandbox override for run_command; it does not sandbox the workflow runner or job nodes. No native Job Object helper is bundled: process-tree ownership and descendant cleanup are not guaranteed. sandboxRequired remains enforced.\n");
+      warnedWindowsCoordinators.add(coordinator);
+    }
+    return;
+  }
+  if (capabilities?.nativeHelperAvailable === false) {
+    throw new Error(`Background workflow runs are unavailable on this host: the native process helper is missing${capabilities.limitations.length ? ` (${capabilities.limitations.join("; ")})` : ""}.`);
+  }
+}
+
 export interface LaunchDeps {
   coordinator: RunnerCoordinator;
   /** Session for the runner `start`; defaults to `runnerLaunchSession()`. */
@@ -101,10 +118,7 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
   // A finished attempt of a parked/interrupted run: the next launch is a new attempt (requestIds are never reused).
   const nextAttempt = existing ? run.runner!.attempt + 1 : undefined;
 
-  const capabilities = await deps.coordinator.capabilities?.();
-  if (capabilities && capabilities.nativeHelperAvailable === false) {
-    throw new Error(`Background workflow runs are unavailable on this host: the native process helper is missing${capabilities.limitations.length ? ` (${capabilities.limitations.join("; ")})` : ""}.`);
-  }
+  await assertBackgroundRunsAvailable(deps.coordinator);
 
   const max = deps.maxConcurrentWorkflowRuns ?? DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS;
   const full = await liveRunnerCount(store, deps.coordinator, registry, deps.exitingRunId ? [runId, deps.exitingRunId] : runId) >= max;

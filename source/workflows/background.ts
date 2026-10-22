@@ -24,13 +24,7 @@ export async function cliEntryPath(argv1: string | undefined = process.argv[1]):
   return realpath(path).catch(() => path);
 }
 
-/** Refuses up front (before any prompt) when the host cannot supervise background runners. */
-export async function assertBackgroundRunsAvailable(coordinator: RunnerCoordinator): Promise<void> {
-  const capabilities = await coordinator.capabilities?.();
-  if (capabilities && capabilities.nativeHelperAvailable === false) {
-    throw new Error(`Background workflow runs are unavailable on this host: the native process helper is missing${capabilities.limitations.length ? ` (${capabilities.limitations.join("; ")})` : ""}.`);
-  }
-}
+export { assertBackgroundRunsAvailable } from "./launch.js";
 
 export interface PreparedLaunch { definition: WorkflowDefinition; inputs: Record<string, unknown>; cwd: string; request: ConsentRequest }
 

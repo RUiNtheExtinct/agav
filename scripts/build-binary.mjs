@@ -156,7 +156,15 @@ try {
     buildArgs.push(`--target=bun-${target}`);
   }
   buildArgs.push("--outfile", output);
-  run(bun, buildArgs);
+  try {
+    run(bun, buildArgs);
+  } catch (error) {
+    if (process.platform === "win32") {
+      console.error(`Binary compilation failed; expected output: ${output}`);
+      console.error("If Bun reported EPERM while moving the executable, Windows may have the target locked. Close Agav sessions and background supervisors running from this path, then retry from a separate terminal. If nothing is using it, check file/directory permissions and antivirus protection. No processes were stopped and the output path was not changed.");
+    }
+    throw error;
+  }
   console.log(`Built: dist/${outputName} (${formatSize(statSync(output).size)})`);
 } finally {
   cpSync(originalBundle, bundle);

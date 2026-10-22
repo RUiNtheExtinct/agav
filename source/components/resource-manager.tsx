@@ -281,7 +281,7 @@ export function ResourceManager({ adapter, onExit, actions = [], onBusyChange, h
         if (result && typeof result === "object" && mounted.current) {
           // A report, not the item itself: never offer delete/stop on it, and never refresh it.
           live.current.detailFromGet = false;
-          setDetail({ ...(item ?? { id: "", title: "", description: "" }), detail: result.detail, removable: false, stoppable: false });
+          setDetail({ ...(item ?? { id: "", title: "", description: "" }), detail: result.detail, removable: false, stoppable: false, abandonable: false });
           setScrollOffset(Number.POSITIVE_INFINITY);
           setView("detail");
         } else if (typeof result === "string" && mounted.current) {
