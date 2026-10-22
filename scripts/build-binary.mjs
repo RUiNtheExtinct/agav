@@ -2,7 +2,7 @@
 import { accessSync, constants, cpSync, mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -12,6 +12,7 @@ const [, , ...args] = process.argv;
 let target = "native";
 let withVoice = false;
 let allFeatures = false;
+let forceKillWorkers = false;
 let targetSet = false;
 
 for (const arg of args) {
@@ -22,12 +23,16 @@ for (const arg of args) {
     case "--all-features":
       allFeatures = true;
       break;
+    case "--force-kill-workers":
+      forceKillWorkers = true;
+      break;
     case "--":
       break;
     case "--help":
     case "-h":
-      console.log("Usage: node scripts/build-binary.mjs [native|all|darwin-arm64|darwin-x64|linux-x64|linux-arm64|windows-x64|windows-x64-baseline] [--voice|--all-features]");
+      console.log("Usage: node scripts/build-binary.mjs [native|all|darwin-arm64|darwin-x64|linux-x64|linux-arm64|windows-x64|windows-x64-baseline] [--voice|--all-features] [--force-kill-workers]");
       console.log("Default builds omit native features. --voice enables voice; all enables every feature on every target.");
+      console.log("--force-kill-workers (Windows only) forcibly stops job/workflow workers running from the exact output executable before compiling. Running work is interrupted.");
       process.exit(0);
     default:
       if (targetSet) throw new Error(`Unexpected build argument: ${arg}`);
@@ -38,6 +43,12 @@ for (const arg of args) {
 
 if (target === "all") allFeatures = true;
 if (allFeatures) withVoice = true;
+if (forceKillWorkers && process.platform !== "win32") {
+  throw new Error("--force-kill-workers is only supported on Windows.");
+}
+if (forceKillWorkers && target === "all") {
+  throw new Error("--force-kill-workers requires a single output target, not all.");
+}
 
 const supportedTargets = new Set([
   "native", "darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64",
@@ -76,6 +87,37 @@ function runCapture(command, commandArgs, options = {}) {
   const result = spawnSync(command, commandArgs, { encoding: "utf8", shell: false, ...options });
   if (result.error) throw result.error;
   return result;
+}
+
+function forceKillOutputWorkers(output) {
+  // Only the binary about to be replaced, and only its private background worker modes.
+  // Query and stop in one PowerShell invocation; fail closed if enumeration or stopping fails.
+  const quotedOutput = output.replaceAll("'", "''");
+  const name = basename(output).replaceAll("'", "''");
+  const script = `
+$ErrorActionPreference = 'Stop'
+$target = '${quotedOutput}'
+$flags = @('--internal-background-jobs-supervisor', '--internal-background-jobs-tick', '--internal-workflow-runner')
+$workers = @(Get-CimInstance Win32_Process -Filter "name = '${name}'" | Where-Object {
+  $candidate = $_
+  [string]::Equals($candidate.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -and
+  @($flags | Where-Object { $candidate.CommandLine -match ('(^|\\s)' + [regex]::Escape($_) + '(\\s|$)') }).Count -gt 0
+})
+foreach ($worker in $workers) {
+  $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($worker.ProcessId)"
+  if ($null -eq $current) { continue }
+  if ($current.CreationDate -ne $worker.CreationDate -or
+      -not [string]::Equals($current.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -or
+      -not ($flags | Where-Object { $current.CommandLine -match ('(^|\\s)' + [regex]::Escape($_) + '(\\s|$)') }).Count) {
+    throw "Worker PID $($worker.ProcessId) changed identity; refusing to stop it."
+  }
+  Stop-Process -Id $worker.ProcessId -Force -ErrorAction Stop
+  Write-Output "Stopped background worker PID $($worker.ProcessId)"
+}
+`;
+  const result = runCapture("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")]);
+  if (result.status !== 0) throw new Error(`Failed to stop background workers for ${output}: ${result.stderr?.trim() || result.error?.message || result.status}.`);
+  if (result.stdout?.trim()) console.log(result.stdout.trim());
 }
 
 function formatSize(bytes) {
@@ -151,6 +193,7 @@ try {
   console.log(`Building for ${target} (native voice: ${withVoice})...`);
 
   const output = join(root, "dist", outputName);
+  if (forceKillWorkers) forceKillOutputWorkers(output);
   const buildArgs = ["build", "source/cli.tsx", "--compile"];
   if (!(target === "native" || (host === "win32-x64" && voiceTarget === host))) {
     buildArgs.push(`--target=bun-${target}`);
@@ -161,7 +204,9 @@ try {
   } catch (error) {
     if (process.platform === "win32") {
       console.error(`Binary compilation failed; expected output: ${output}`);
-      console.error("If Bun reported EPERM while moving the executable, Windows may have the target locked. Close Agav sessions and background supervisors running from this path, then retry from a separate terminal. If nothing is using it, check file/directory permissions and antivirus protection. No processes were stopped and the output path was not changed.");
+      console.error(forceKillWorkers
+        ? "If Bun reported EPERM, --force-kill-workers only stops background workers running from this exact path. Other Agav sessions or programs may still have the executable open. Close them and retry from a separate terminal; otherwise check file/directory permissions and antivirus protection."
+        : "If Bun reported EPERM while moving the executable, Windows may have the target locked. Close Agav sessions and background supervisors running from this path, then retry from a separate terminal. If nothing is using it, check file/directory permissions and antivirus protection. No processes were stopped and the output path was not changed.");
     }
     throw error;
   }
