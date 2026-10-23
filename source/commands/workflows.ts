@@ -75,7 +75,8 @@ export const workflowsCommand: SlashCommand = {
       const store = new WorkflowStore();
       // Every run-id operand accepts a unique prefix (≥4 chars) or the full UUID (U4).
       if (target && action !== "validate" && action !== "run") target = await resolveRunId(store, target);
-      const launchDeps = async () => ({ coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: context.config.maxConcurrentWorkflowRuns, registry });
+      const sandboxRequired = context.config.sandboxRequired === true || isSandboxRequired();
+      const launchDeps = async () => ({ coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: context.config.maxConcurrentWorkflowRuns, registry, sandboxRequired });
       const warnings: string[] = [];
       const warn = (text: string): void => { warnings.push(`warning: ${text}`); };
       if (action === "validate") { await loadDefinition((await resolveWorkflow(target, process.cwd())).path, registry); return message("Workflow valid."); }
@@ -91,7 +92,7 @@ export const workflowsCommand: SlashCommand = {
         return message(decisionSummary(await decideRunDecision(store, target, pending.decisionId, action === "approve", { registry, note: note?.trim(), launch: await launchDeps() })));
       }
       if (action === "cancel") {
-        const run = await cancelRun(store, target, registry, undefined, cancelJobDeps(await store.read(target, registry), getSharedCoordinator, isSandboxRequired(), context.config.permissionMode));
+        const run = await cancelRun(store, target, registry, undefined, cancelJobDeps(await store.read(target, registry), getSharedCoordinator, sandboxRequired, context.config.permissionMode));
         return message(`Workflow run ${run.id}: ${run.status}`);
       }
       if (action === "resume") return message(launchSummary(await launchRun(store, target, await launchDeps()), "/workflows"));

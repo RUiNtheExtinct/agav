@@ -43,6 +43,8 @@ export interface LaunchDeps {
   force?: boolean;
   /** A run whose runner is exiting (settled/parked, lock released): its still-live job does not hold a pool slot. */
   exitingRunId?: string;
+  /** The caller's effective sandboxRequired; it can only strengthen the run's persisted requirement (never read from process state: a runner admitting another run must not leak its own). */
+  sandboxRequired?: boolean;
 }
 export interface LaunchResult { status: "started" | "attached" | "queued"; run: WorkflowRun; job?: JobSummary }
 
@@ -100,6 +102,19 @@ export async function updateRun(store: WorkflowStore, id: string, registry: Tool
 }
 
 /**
+ * Records the caller's stricter requirement on a run that is being reattached instead of (re)launched, so a later
+ * relaunch enforces it. Fails closed: if it cannot be persisted (lock held, disk error) the error propagates rather
+ * than reporting an attach that silently dropped the requirement. Never weakens; a run already strict is untouched.
+ */
+async function strengthenRequirement(store: WorkflowStore, run: WorkflowRun, deps: LaunchDeps, registry: ToolRegistry): Promise<WorkflowRun> {
+  if (deps.sandboxRequired !== true || run.sandboxRequired === true) return run;
+  return updateRun(store, run.id, registry, current => {
+    if (TERMINAL_RUN.has(current.status) || current.sandboxRequired === true) return false;
+    current.sandboxRequired = true;
+  });
+}
+
+/**
  * Ensures the run's current runner attempt exists. Idempotent: an existing runner job (found by its deterministic
  * requestId) is reattached, never started twice. A full workflow-runner pool leaves the run `queued`, never failed.
  */
@@ -110,7 +125,7 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
   if (TERMINAL_RUN.has(run.status)) return { status: "attached", run };
   const existing = await findRunnerJob(deps.coordinator, run);
   // A live attempt, or a dead one while the run still claims running/queued (reconcile decides those), is reattached.
-  if (existing && (isLiveLifecycle(existing.state) || ["running", "queued"].includes(run.status))) return { status: "attached", run, job: existing };
+  if (existing && (isLiveLifecycle(existing.state) || ["running", "queued"].includes(run.status))) return { status: "attached", run: await strengthenRequirement(store, run, deps, registry), job: existing };
   // An uncertain runner (unknown/recovery-required) may still be executing: a second one would race it.
   if (existing && !isTerminalLifecycle(existing.state) && deps.force !== true) {
     throw new Error(`Workflow run ${runId}: runner job ${existing.jobId} is ${existing.state} and may still be running; refusing to start another runner. Verify it has stopped, then retry with force.`);
@@ -130,6 +145,8 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
     current.runner ??= { attempt: 1, requestId: runnerRequestId(runId, 1), relaunches: 0 };
     if (current.runner.jobId === undefined) delete current.runner.jobId;
     current.status = "queued";
+    // Persist the stricter requirement so the detached runner enforces it on this and every later attempt; never weakened.
+    if (deps.sandboxRequired === true) current.sandboxRequired = true;
   });
   if (TERMINAL_RUN.has(run.status)) return { status: "attached", run };
   if (previous !== "queued") await appendEvent(store, runId, { type: "run_status", status: "queued", ...(full ? { reason: "workflow runner pool full" } : {}) });

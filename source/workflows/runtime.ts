@@ -3,8 +3,9 @@ import { realpath } from "node:fs/promises";
 import type { AgavConfig, PermissionMode } from "../config/config.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { WorkflowExecutionHost } from "./gated-tools.js";
-import { definitionHash, scopedCheckpoints, toleratedFailure, type JobScope, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
-import type { JobNodeDeps } from "./job-node.js";
+import { definitionHash, jobRequestId, scopedCheckpoints, toleratedFailure, visitJobScope, type JobScope, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
+import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, type JobNodeDeps } from "./job-node.js";
+import { settleParkedBody } from "./loop-node.js";
 import { narrowPermissionMode, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { getNodeExecutor, retriesOnResume, type NodeResult } from "./executors.js";
 import { type AgentNodeDeps } from "./agent-node.js";
@@ -219,6 +220,43 @@ async function runSubScope(spec: ScopeSpec, env: ScopeEnv, options: { resume?: N
   finally { if (sub.capExceeded) env.capExceeded = true; }
 }
 
+/**
+ * Before a resumed run is made terminal without scheduling anything (an earlier denial/failure stops it), stops every
+ * job still running (top level or inside loop bodies) and settles the enclosing loops, so terminalizing never leaves a
+ * live workload behind a terminal run (a later cancel skips terminal runs). Mirrors cancelRun: a stop that is not
+ * confirmed throws `JobCancellationIncompleteError` and leaves the run non-terminal with its job linkage so resume or
+ * cancel can retry; without job support nothing is claimed stopped either.
+ */
+async function stopLiveJobsBeforeTerminal(store: WorkflowStore, run: WorkflowRun, jobDeps: JobNodeDeps | undefined): Promise<void> {
+  const visits = scopedCheckpoints(run);
+  const live = visits.filter(visit => visit.cp.status === "running" && visit.node.type === "job");
+  for (const visit of live) {
+    const { cp } = visit;
+    const requestId = cp.job?.requestId ?? jobRequestId(run.id, cp.id, cp.attempt ?? 1, visitJobScope(visit));
+    if (!jobDeps) throw new Error(`Job nodes unavailable: node ${cp.id} has a running job (${requestId}) and this run is ending; resume with background-job support to stop it.`);
+    const outcome = await stopJobNodeOutcome(jobDeps, { requestId, jobId: cp.job?.jobId });
+    applyJobOutcome(cp, outcome);
+    await store.save(run); // The real outcome (or the kept linkage/reason) is durable first.
+    if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
+  }
+  if (live.length === 0) return;
+  // Settle running or parked loops (innermost first): the current iteration has no work left in progress.
+  const now = new Date().toISOString();
+  for (const visit of [...visits].reverse()) {
+    const loop = visit.cp as LoopNodeCheckpoint;
+    if (visit.node.type !== "loop" || (loop.status !== "running" && loop.status !== "waiting_approval")) continue;
+    const current = loop.iterations?.[loop.iterations.length - 1];
+    if (current && !["passed", "failed", "cancelled", "timed_out", "skipped"].includes(current.status)) {
+      await settleParkedBody(store, run.id, current.nodes, now);
+      const failed = visit.node.body?.some(n => { const c = current.nodes[n.id]!; return (c.status === "failed" || c.status === "timed_out") && !toleratedFailure(n, c); });
+      current.status = failed ? "failed" : "cancelled"; current.endedAt = now;
+    }
+    loop.status = current?.status === "failed" ? "failed" : "cancelled"; loop.endedAt = now;
+    if (loop.status === "failed") loop.error = `iteration ${current!.index} failed`;
+  }
+  await store.save(run);
+}
+
 /** Sequential DAG execution; the exclusive run lock spans work and shutdown settlement. */
 export async function executeRun(store: WorkflowStore, id: string, registry: ToolRegistry, sessionConfig: AgavConfig, signal?: AbortSignal, host?: WorkflowExecutionHost, sessionJobDeps?: JobNodeDeps, agentDeps?: AgentNodeDeps): Promise<WorkflowRun> {
   return store.lock(id, async () => {
@@ -258,6 +296,7 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
     // (with stopOnFailure:false a failed/timed-out node only skips its dependents).
     const stopped = run.nodes.find((node, i) => node.status === "cancelled" || (stopOnFailure && (node.status === "failed" || node.status === "timed_out") && !toleratedFailure(run.definition.nodes[i], node)));
     if (stopped) {
+      await stopLiveJobsBeforeTerminal(store, run, jobDeps);
       run.status = stopped.status as RunStatus;
       await store.save(run);
       await appendEvent(store, id, { type: "run_status", status: run.status });

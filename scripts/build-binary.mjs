@@ -94,21 +94,87 @@ function forceKillOutputWorkers(output) {
   // Query and stop in one PowerShell invocation; fail closed if enumeration or stopping fails.
   const quotedOutput = output.replaceAll("'", "''");
   const name = basename(output).replaceAll("'", "''");
+  // No backslashes, backticks or `${` below: this text is a JS template literal and the PowerShell
+  // must see characters like quotes and backslashes only via [char] codes.
   const script = `
 $ErrorActionPreference = 'Stop'
 $target = '${quotedOutput}'
 $flags = @('--internal-background-jobs-supervisor', '--internal-background-jobs-tick', '--internal-workflow-runner')
+$bs = [char]92
+$q = [char]34
+$tab = [char]9
+
+# First argument after the executable, parsed with the Windows CRT command-line rules (what the
+# process itself sees as argv[1]): the executable token is taken literally (quoted, or the exact
+# target path, or up to the first space/tab); arguments split on unquoted space/tab; 2n backslashes
+# before a quote give n backslashes and toggle quoting, 2n+1 give n backslashes and a literal quote.
+function Get-FirstArgument([string]$CommandLine) {
+  if ([string]::IsNullOrEmpty($CommandLine)) { return $null }
+  $n = $CommandLine.Length
+  $i = 0
+  $quotedTarget = [string]$q + $target + $q
+  if ($CommandLine.StartsWith($quotedTarget, [StringComparison]::OrdinalIgnoreCase)) {
+    $i = $quotedTarget.Length
+  } elseif ($CommandLine.StartsWith($target, [StringComparison]::OrdinalIgnoreCase) -and
+            ($CommandLine.Length -eq $target.Length -or $CommandLine[$target.Length] -eq ' ' -or $CommandLine[$target.Length] -eq $tab)) {
+    $i = $target.Length
+  } elseif ($CommandLine[0] -eq $q) {
+    $end = $CommandLine.IndexOf($q, 1)
+    if ($end -lt 0) { return $null }
+    $i = $end + 1
+  } else {
+    while ($i -lt $n -and $CommandLine[$i] -ne ' ' -and $CommandLine[$i] -ne $tab) { $i++ }
+  }
+  while ($i -lt $n -and ($CommandLine[$i] -eq ' ' -or $CommandLine[$i] -eq $tab)) { $i++ }
+  if ($i -ge $n) { return $null }
+  $arg = New-Object System.Text.StringBuilder
+  $inQuotes = $false
+  while ($i -lt $n) {
+    $c = $CommandLine[$i]
+    if ($c -eq $bs) {
+      $count = 0
+      while ($i -lt $n -and $CommandLine[$i] -eq $bs) { $count++; $i++ }
+      if ($i -lt $n -and $CommandLine[$i] -eq $q) {
+        [void]$arg.Append($bs, [int][math]::Floor($count / 2))
+        if ($count % 2 -eq 1) { [void]$arg.Append($q); $i++ }
+      } else {
+        [void]$arg.Append($bs, $count)
+      }
+      continue
+    }
+    if ($c -eq $q) {
+      if ($inQuotes -and ($i + 1) -lt $n -and $CommandLine[$i + 1] -eq $q) { [void]$arg.Append($q); $i += 2; continue }
+      $inQuotes = -not $inQuotes
+      $i++
+      continue
+    }
+    if (-not $inQuotes -and ($c -eq ' ' -or $c -eq $tab)) { break }
+    [void]$arg.Append($c)
+    $i++
+  }
+  return $arg.ToString()
+}
+
+# Exact (ordinal, case-sensitive like cli.tsx) match of the first argument against a worker mode.
+function Test-WorkerMode($process) {
+  $first = Get-FirstArgument $process.CommandLine
+  if ($null -eq $first) { return $false }
+  foreach ($flag in $flags) { if ([string]::Equals($first, $flag, [StringComparison]::Ordinal)) { return $true } }
+  return $false
+}
+
 $workers = @(Get-CimInstance Win32_Process -Filter "name = '${name}'" | Where-Object {
   $candidate = $_
   [string]::Equals($candidate.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -and
-  @($flags | Where-Object { $candidate.CommandLine -match ('(^|\\s)' + [regex]::Escape($_) + '(\\s|$)') }).Count -gt 0
+  (Test-WorkerMode $candidate)
 })
 foreach ($worker in $workers) {
   $current = Get-CimInstance Win32_Process -Filter "ProcessId = $($worker.ProcessId)"
   if ($null -eq $current) { continue }
   if ($current.CreationDate -ne $worker.CreationDate -or
       -not [string]::Equals($current.ExecutablePath, $target, [StringComparison]::OrdinalIgnoreCase) -or
-      -not ($flags | Where-Object { $current.CommandLine -match ('(^|\\s)' + [regex]::Escape($_) + '(\\s|$)') }).Count) {
+      -not [string]::Equals($current.CommandLine, $worker.CommandLine, [StringComparison]::Ordinal) -or
+      -not (Test-WorkerMode $current)) {
     throw "Worker PID $($worker.ProcessId) changed identity; refusing to stop it."
   }
   Stop-Process -Id $worker.ProcessId -Force -ErrorAction Stop

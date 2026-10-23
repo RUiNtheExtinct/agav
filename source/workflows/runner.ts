@@ -15,6 +15,7 @@ import { createDefaultAgentInvoker, type AgentInvoker } from "./agent-invoker.js
 import type { AgentNodeDeps } from "./agent-node.js";
 import { WorkflowStore, type WorkflowRun } from "./store.js";
 import type { LaunchDeps } from "./launch.js";
+import { updateRun } from "./launch.js";
 import { admitQueuedRuns } from "./reconcile.js";
 
 /** SIGTERM must checkpoint within this window, under the supervisor's 5 s SIGKILL grace. */
@@ -88,7 +89,14 @@ export function startRunner(runId: string, ctx: RunnerContext): RunnerHandle {
     if (!consent) throw new Error(`Workflow run ${runId} has no background consent; refusing to execute.`);
     // The consent's permission mode applies, never a looser one from the runner's own config.
     const config: AgavConfig = { ...ctx.config, permissionMode: consent.permissionMode };
-    const jobDeps = runnerJobDeps(consent, ctx.getCoordinator, ctx.sandboxRequired ?? false, ctx.jobDepsOverrides);
+    // The run's persisted requirement (from the launching process) can only be strengthened by this process's config/flags, never weakened.
+    const sandboxRequired = run.sandboxRequired === true || ctx.sandboxRequired === true || ctx.config.sandboxRequired === true || isSandboxRequired();
+    if (sandboxRequired) {
+      setSandboxRequired(true); // run_command in this process
+      // Fail closed: if the requirement cannot be made durable, nothing executes (a relaunch would otherwise lose it).
+      if (run.sandboxRequired !== true) await updateRun(ctx.store, runId, ctx.registry, current => { current.sandboxRequired = true; });
+    }
+    const jobDeps = runnerJobDeps(consent, ctx.getCoordinator, sandboxRequired, ctx.jobDepsOverrides);
     // Parks (waiting_approval) or finishes, then the runner exits; deciding a parked run relaunches it.
     const settled = await executeRun(ctx.store, runId, ctx.registry, config, controller.signal, createBackgroundHost(consent, { store: ctx.store, runId }), jobDeps, ctx.agentDeps ?? defaultAgentNodeDeps());
     await postRunNotification(ctx.store, settled);

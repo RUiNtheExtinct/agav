@@ -24,7 +24,7 @@ export interface WorkflowResourceDeps {
   cwd: string;
   /** Override for `~/.agav/workflows` (tests). */
   userDir?: string;
-  config: Pick<AgavConfig, "permissionMode" | "maxConcurrentWorkflowRuns">;
+  config: Pick<AgavConfig, "permissionMode" | "maxConcurrentWorkflowRuns" | "sandboxRequired">;
   getCoordinator(): Promise<JobCoordinatorLike & LaunchDeps["coordinator"]>;
   cliPath(): Promise<string>;
   sandboxRequired?: boolean;
@@ -227,8 +227,13 @@ export function parseInputValues(definition: WorkflowDefinition, values: Record<
 
 // ── Launch / control actions ─────────────────────────────────────────────────
 
+/** Config or the caller's process policy (captured in `deps.sandboxRequired`); a launch can only strengthen a run. */
+function effectiveSandboxRequired(deps: WorkflowResourceDeps): boolean {
+  return deps.sandboxRequired === true || deps.config.sandboxRequired === true;
+}
+
 async function launchDeps(deps: WorkflowResourceDeps): Promise<LaunchDeps & { registry: ToolRegistry }> {
-  return { coordinator: await deps.getCoordinator(), cliPath: await deps.cliPath(), maxConcurrentWorkflowRuns: deps.config.maxConcurrentWorkflowRuns, registry: deps.registry };
+  return { coordinator: await deps.getCoordinator(), cliPath: await deps.cliPath(), maxConcurrentWorkflowRuns: deps.config.maxConcurrentWorkflowRuns, registry: deps.registry, sandboxRequired: effectiveSandboxRequired(deps) };
 }
 
 /** Validates inputs and checks the host before the consent prompt; nothing is persisted. */
@@ -246,7 +251,7 @@ export async function startWorkflowRun(deps: WorkflowResourceDeps, prepared: Pre
 
 export async function cancelWorkflowRun(deps: WorkflowResourceDeps, runId: string): Promise<string> {
   const run = await deps.store.read(runId, deps.registry);
-  const result = await cancelRun(deps.store, runId, deps.registry, undefined, cancelJobDeps(run, deps.getCoordinator, deps.sandboxRequired ?? false, deps.config.permissionMode));
+  const result = await cancelRun(deps.store, runId, deps.registry, undefined, cancelJobDeps(run, deps.getCoordinator, effectiveSandboxRequired(deps), deps.config.permissionMode));
   return `Workflow run ${shortId(result.id)}: ${result.status}`;
 }
 

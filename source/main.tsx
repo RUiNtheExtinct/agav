@@ -1149,7 +1149,7 @@ export async function main() {
     // Never block startup on changelog/launch-state failures.
   }
 
-  const instance = render(<App config={config} keybindings={keybindings} resumeMessages={resumeMessages} resumeSessionId={resumeSessionId} resumeTokenUsage={resumeTokenUsage} resumeCompacted={resumeCompacted} resumeSessionName={initialSessionName} repoBranch={gitContext?.branch} enhancedKeyboard={enhancedKeyboard} shutdownRef={shutdownRef} />, {
+  const instance = render(<App config={config} keybindings={keybindings} resumeMessages={resumeMessages} resumeSessionId={resumeSessionId} resumeTokenUsage={resumeTokenUsage} resumeCompacted={resumeCompacted} resumeSessionName={initialSessionName} repoBranch={gitContext?.branch} enhancedKeyboard={enhancedKeyboard} showChangelogOnLaunch={showChangelogOnLaunch} shutdownRef={shutdownRef} />, {
     // App owns Ctrl+C so foreground workflows can abort and checkpoint before exit.
     exitOnCtrlC: false,
     // Alt-screen keeps the UI self-contained (no scrollback pollution, no

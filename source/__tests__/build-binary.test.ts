@@ -8,8 +8,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
-function fixture(platform = 'win32', failure = true, args: string[] = [], powershellFailure = false, realPowerShell = false) {
-  const root = mkdtempSync(join(tmpdir(), 'agav-build-diagnostic-'));
+function fixture(platform = 'win32', failure = true, args: string[] = [], powershellFailure = false, realPowerShell = false, spacedRoot = false) {
+  const root = mkdtempSync(join(tmpdir(), spacedRoot ? 'agav build diagnostic ' : 'agav-build-diagnostic-'));
   roots.push(root);
   for (const dir of ['scripts', 'source/voice']) mkdirSync(join(root, dir), { recursive: true });
   copyFileSync('scripts/build-binary.mjs', join(root, 'scripts/build-binary.mjs'));
@@ -77,28 +77,107 @@ describe('binary build failure diagnostics', () => {
     expect(script).toContain('$current.CreationDate -ne $worker.CreationDate');
   });
 
-  it.skipIf(process.platform !== 'win32')('selects only the exact executable and worker flag with real PowerShell (without stopping processes)', () => {
-    const { root } = fixture('win32', false, ['--force-kill-workers']);
+  it('matches the first argument exactly instead of searching the whole command line', () => {
+    const { root, result } = fixture('win32', false, ['--force-kill-workers']);
+    expect(result.status, result.stderr).toBe(0);
     const script = readFileSync(join(root, 'powershell-script.txt'), 'utf8');
-    const target = join(root, 'dist/agav.exe').replaceAll("'", "''");
-    const stub = `
+    expect(script).toContain('function Get-FirstArgument');
+    expect(script).toContain('[string]::Equals($first, $flag, [StringComparison]::Ordinal)');
+    expect(script).not.toMatch(/-match|-like\s+['"]\*/);
+    // Identity recheck repeats the executable, command line and CreationDate checks, failing closed.
+    expect(script).toContain('-not (Test-WorkerMode $current)');
+    expect(script).toContain('[string]::Equals($current.CommandLine, $worker.CommandLine');
+    expect(script).toContain('$current.CreationDate -ne $worker.CreationDate');
+    expect(script).toContain('[string]::Equals($current.ExecutablePath, $target');
+    expect(script).toContain('refusing to stop it');
+  });
+
+  describe.skipIf(process.platform !== 'win32')('real PowerShell worker selection (processes are mocked, nothing is stopped)', () => {
+    type Proc = { id: number; path?: string; line: string; created?: string };
+    const psq = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
+    function runSelection(spaced: boolean, build: (target: string) => Proc[], recheck: (target: string) => Record<number, Partial<Proc>> = () => ({})) {
+      const { root, result: buildResult } = fixture('win32', false, ['--force-kill-workers'], false, false, spaced);
+      expect(buildResult.status, buildResult.stderr).toBe(0);
+      const script = readFileSync(join(root, 'powershell-script.txt'), 'utf8');
+      const target = join(root, 'dist/agav.exe');
+      const items = build(target).map(p => `[pscustomobject]@{ ProcessId = ${p.id}; ExecutablePath = ${psq(p.path ?? target)}; CommandLine = ${psq(p.line)}; CreationDate = ${psq(p.created ?? 'created-1')} }`);
+      const changes = Object.entries(recheck(target)).map(([id, p]) => `${id} = [pscustomobject]@{ ProcessId = ${id}; ExecutablePath = ${psq(p.path ?? target)}; CommandLine = ${psq(p.line ?? build(target).find(x => x.id === Number(id))!.line)}; CreationDate = ${psq(p.created ?? 'created-1')} }`);
+      const stub = `
+$script:items = @(${items.join(',\n')})
+$script:changed = @{ ${changes.join('; ')} }
 function Get-CimInstance {
   param($Class, $Filter)
-  $items = @(
-    [pscustomobject]@{ ProcessId = 101; ExecutablePath = '${target}'; CommandLine = '"${target}" --internal-background-jobs-supervisor id'; CreationDate = 'now' },
-    [pscustomobject]@{ ProcessId = 102; ExecutablePath = '${target}'; CommandLine = '"${target}" --version'; CreationDate = 'now' },
-    [pscustomobject]@{ ProcessId = 103; ExecutablePath = 'C:\\other\\agav.exe'; CommandLine = 'agav.exe --internal-background-jobs-tick'; CreationDate = 'now' }
-  )
-  if ($Filter -like 'ProcessId*') { return $items | Where-Object ProcessId -eq ([int]($Filter -split ' = ')[1]) }
-  return $items
+  if ($Filter -like 'ProcessId*') {
+    $id = [int]($Filter -split ' = ')[1]
+    if ($script:changed.ContainsKey($id)) { return $script:changed[$id] }
+    return $script:items | Where-Object ProcessId -eq $id
+  }
+  return $script:items
 }
 function Stop-Process { param($Id, [switch]$Force, $ErrorAction); Write-Output "mock stop $Id" }
 `;
-    const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(stub + script, 'utf16le').toString('base64')], { encoding: 'utf8' });
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain('mock stop 101');
-    expect(result.stdout).not.toContain('mock stop 102');
-    expect(result.stdout).not.toContain('mock stop 103');
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(stub + script, 'utf16le').toString('base64')], { encoding: 'utf8' });
+      const stopped = [...result.stdout.matchAll(/mock stop (\d+)/g)].map(m => Number(m[1]));
+      return { result, stopped, target };
+    }
+
+    const modes = ['--internal-background-jobs-supervisor', '--internal-background-jobs-tick', '--internal-workflow-runner'];
+
+    for (const spaced of [false, true]) {
+      const label = spaced ? ' (executable path with spaces)' : '';
+
+      it(`selects real workers and never foreground commands that merely mention a worker flag${label}`, () => {
+        const { result, stopped } = runSelection(spaced, t => [
+          { id: 101, line: `"${t}" ${modes[0]} id` },
+          { id: 102, line: `"${t}" ${modes[1]}` },
+          { id: 103, line: `"${t}" ${modes[2]} run-1` },
+          { id: 104, line: `"${t}"\t${modes[2]}\trun-2` },
+          { id: 105, line: `"${t}"   "${modes[2]}" run-3` },
+          { id: 106, line: `${t} ${modes[0]} id` },
+          { id: 107, line: `"${t}" run "please debug --internal-workflow-runner today"` },
+          { id: 108, line: `"${t}" run please debug ${modes[2]} today` },
+          { id: 109, line: `"${t}" run ${modes[0]}` },
+          { id: 110, line: `"${t}" "${modes[2]} today"` },
+          { id: 111, line: `"${t}" ${modes[2]}-extra` },
+          { id: 112, line: `"${t}" --INTERNAL-WORKFLOW-RUNNER x` },
+          { id: 113, line: `"${t}" \\"${modes[2]}\\" x` },
+          { id: 114, line: `"${t}" "\\"${modes[2]}" x` },
+          { id: 115, line: `"${t}" --version` },
+          { id: 116, line: `"${t}"` },
+          { id: 117, line: `"${t}" "" ${modes[1]}` },
+          { id: 118, line: `agav.exe run "please debug --internal-workflow-runner today"` },
+          { id: 119, path: 'C:\\other\\agav.exe', line: `"C:\\other\\agav.exe" ${modes[1]}` },
+        ]);
+        expect(result.status, result.stderr).toBe(0);
+        // 106 is unquoted: with spaces in the path only the exact-target prefix may identify the executable.
+        expect(stopped).toEqual([101, 102, 103, 104, 105, 106]);
+      });
+
+      it(`does not stop the foreground prompt example from the review${label}`, () => {
+        const { result, stopped } = runSelection(spaced, t => [
+          { id: 201, line: `"${t}" run "please debug --internal-workflow-runner today"` },
+        ]);
+        expect(result.status, result.stderr).toBe(0);
+        expect(stopped).toEqual([]);
+      });
+
+      it(`fails closed if a selected worker changes identity before it is stopped${label}`, () => {
+        const worker = (t: string): Proc[] => [{ id: 301, line: `"${t}" ${modes[2]} run-1` }];
+        const cases: Record<string, (t: string) => Partial<Proc>> = {
+          'CreationDate': () => ({ created: 'created-2' }),
+          'foreground command line': t => ({ line: `"${t}" run "please debug --internal-workflow-runner today"` }),
+          'different command line': t => ({ line: `"${t}" ${modes[2]} run-2` }),
+          'executable path': () => ({ path: 'C:\\other\\agav.exe' }),
+        };
+        for (const [name, change] of Object.entries(cases)) {
+          const { result, stopped } = runSelection(spaced, worker, t => ({ 301: change(t) }));
+          expect(result.status, name).not.toBe(0);
+          expect(result.stderr, name).toContain('changed identity');
+          expect(stopped, name).toEqual([]);
+        }
+      });
+    }
   });
 
   it.skipIf(process.platform !== 'win32')('runs the real PowerShell worker query for an isolated output path', () => {

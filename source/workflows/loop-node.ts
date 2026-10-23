@@ -1,9 +1,10 @@
 import type { WorkflowNode } from "./definition.js";
+import { decide, readDecision } from "./decisions.js";
 import { appendEvent } from "./events.js";
 import { evaluateCondition } from "./expr.js";
 import { getNodeExecutor, retriesOnResume, type NodeExecutionContext, type NodeExecutor, type NodeResult } from "./executors.js";
 import type { TemplateContext } from "./interpolate.js";
-import { MAX_INLINE_OUTPUT_BYTES, toleratedFailure, type LoopIterationCheckpoint, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus } from "./store.js";
+import { MAX_INLINE_OUTPUT_BYTES, toleratedFailure, type LoopIterationCheckpoint, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus, type WorkflowStore } from "./store.js";
 
 const DEFAULT_HISTORY_LIMIT = 5;
 const TERMINAL = new Set<NodeStatus>(["passed", "failed", "cancelled", "timed_out", "skipped"]);
@@ -53,6 +54,49 @@ function normalizeResumedBody(body: WorkflowNode[], cps: Record<string, NodeChec
     cp.error = `uncertain: interrupted ${child.tool ?? child.type} node ${child.id} inside a loop has an unknown outcome; not replayed.`;
   }
   return resume;
+}
+
+/** Decision ids of body checkpoints parked on a decision, in the iterations `settleParkedBody` would terminalize. */
+function parkedDecisionIds(nodes: Record<string, NodeCheckpoint>): string[] {
+  const ids: string[] = [];
+  for (const cp of Object.values(nodes)) {
+    for (const it of (cp as LoopNodeCheckpoint).iterations ?? []) if (!TERMINAL.has(it.status)) ids.push(...parkedDecisionIds(it.nodes));
+    if (cp.status === "waiting_approval" && cp.decisionId) ids.push(cp.decisionId);
+  }
+  return ids;
+}
+
+/**
+ * Settles body work parked on a decision (approvals, tool consent, nested loops waiting inside the body) once its
+ * iteration reached a terminal state for another reason (an independent node failed or was cancelled): nobody can
+ * decide it any more, and a terminal iteration may not hold a `waiting_approval` checkpoint (`store.read` rejects it).
+ * Only the decisions of the settled checkpoints are durably denied (so `listPendingDecisions` stops surfacing them);
+ * decisions of still-live parked work are untouched. The inbox writes come first: if one fails this throws before any
+ * checkpoint is mutated, so the checkpoint stays readable and the decisions stay retryable.
+ */
+export async function settleParkedBody(store: WorkflowStore, runId: string, nodes: Record<string, NodeCheckpoint>, now: string): Promise<void> {
+  for (const decisionId of parkedDecisionIds(nodes)) {
+    // A missing record (crash between writes, older checkpoints) has nothing to settle; an already decided one stays as decided.
+    if (!(await readDecision(store, runId, decisionId))) continue;
+    await decide(store, runId, decisionId, false, "workflow-runtime", "Settled: the enclosing scope ended before this was decided.");
+  }
+  applyParkedSettlement(nodes, now);
+}
+
+function applyParkedSettlement(nodes: Record<string, NodeCheckpoint>, now: string): void {
+  for (const cp of Object.values(nodes)) {
+    const loop = cp as LoopNodeCheckpoint;
+    if (loop.iterations) {
+      for (const it of loop.iterations) {
+        if (TERMINAL.has(it.status)) continue;
+        applyParkedSettlement(it.nodes, now);
+        it.status = "cancelled"; it.endedAt = now;
+      }
+    }
+    if (cp.status !== "waiting_approval") continue;
+    cp.status = "cancelled"; cp.endedAt = now; cp.error = "Cancelled while waiting for a decision.";
+    delete cp.decisionId;
+  }
 }
 
 /**
@@ -121,6 +165,8 @@ async function executeLoop(ctx: NodeExecutionContext): Promise<NodeResult> {
           outerNodes: { ...(ctx.scopeNodes ?? Object.fromEntries(run.nodes.map(n => [n.id, n]))) },
         }, { signal: child.signal, ...(resume ? { resume } : {}) });
         if (status === "waiting_approval") { it.status = "waiting_approval"; return await settle("waiting_approval"); }
+        // Inbox decisions are settled before the iteration turns terminal; a failed write leaves it non-terminal and readable.
+        await settleParkedBody(store, run.id, it.nodes, new Date().toISOString());
         it.status = timedOut && (status === "cancelled" || status === "timed_out") ? "timed_out" : status;
         it.endedAt = new Date().toISOString();
         await save();
