@@ -23,8 +23,14 @@ export interface DecideResult {
   pending: PendingDecision;
   run: WorkflowRun;
   /** `live`: the runner is still executing and applies the decision in-process. */
-  relaunch?: LaunchResult | "live";
+  relaunch?: LaunchResult | ManualResumeRequired | "live";
 }
+/**
+ * The decision is recorded but the run (e.g. `interrupted`, never revisited by automatic reconcile) was NOT launched
+ * or queued: nothing will start it until someone resumes it from a context with the selected environment.
+ * Discriminate on `manualResumeRequired`/`status`; `run` and `reason` mirror `LaunchResult` for existing consumers.
+ */
+export interface ManualResumeRequired { status: "manual-resume-required"; manualResumeRequired: true; run: WorkflowRun; reason: string }
 
 const TERMINAL = ["passed", "failed", "cancelled", "timed_out"];
 
@@ -66,9 +72,10 @@ export async function decideRunDecision(store: WorkflowStore, runId: string, dec
   }
   if (TERMINAL.includes(run.status)) return { ...result, run };
   // The decision is recorded above regardless: a context lacking the selected env defers the relaunch instead of failing the approval.
-  let relaunch: LaunchResult;
+  let relaunch: LaunchResult | ManualResumeRequired;
+  // LaunchEnvironmentError means launchRun left the run untouched and un-queued (state e.g. `interrupted`; only a stricter sandboxRequired is persisted first), so never report it as queued.
   try { relaunch = await launchRun(store, runId, { registry: opts.registry, ...opts.launch }); }
-  catch (error) { if (!(error instanceof LaunchEnvironmentError)) throw error; relaunch = { status: "queued", run: await store.read(runId, opts.registry), reason: error.reason }; }
+  catch (error) { if (!(error instanceof LaunchEnvironmentError)) throw error; relaunch = { status: "manual-resume-required", manualResumeRequired: true, run: await store.read(runId, opts.registry), reason: error.reason }; }
   return { ...result, run: relaunch.run, relaunch };
 }
 
@@ -83,7 +90,9 @@ export function decisionSummary(result: DecideResult): string {
   const { pending, record } = result;
   const verb = record.decision === "approve" ? "approved" : "denied";
   if (!result.won) return `Decision ${pending.decisionId} (${pending.kind} on ${pending.nodeId}) was already ${verb} by ${record.decidedBy} at ${record.decidedAt}.`;
-  const follow = result.relaunch === undefined ? "" : result.relaunch === "live" ? "; the live runner applies it" : `; runner ${result.relaunch.status} (attempt ${result.relaunch.run.runner?.attempt ?? 1})${result.relaunch.reason ? `: ${result.relaunch.reason}` : ""}`;
+  const follow = result.relaunch === undefined ? "" : result.relaunch === "live" ? "; the live runner applies it"
+    : result.relaunch.status === "manual-resume-required" ? `; decision recorded but the run is ${result.relaunch.run.status} and was not launched or queued: ${result.relaunch.reason}; manual resume required: agav workflows resume ${result.run.id}`
+    : `; runner ${result.relaunch.status} (attempt ${result.relaunch.run.runner?.attempt ?? 1})${result.relaunch.reason ? `: ${result.relaunch.reason}` : ""}`;
   return `${pending.kind} on ${pending.nodeId} ${verb} (${pending.decisionId}) in run ${result.run.id}${follow}.`;
 }
 

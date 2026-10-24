@@ -253,7 +253,10 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
     const jobDeps = narrowJobDeps(sessionJobDeps, policies.permissionMode);
     await store.hydrateOutputs(run); // Executors interpolate real outputs, never artifact references.
     // Tool nodes are never replayed. A running job node is instead reattached below via its durable requestId.
-    const resumedJob = run.nodes.find(cp => cp.status === "running" && getNodeExecutor(run.definition.nodes.find(node => node.id === cp.id)!.type).resumable === true);
+    // The slot goes to a running job before any running loop: the scheduler re-enters a running loop by itself, but nothing
+    // re-enters a running job. A loop is the fallback target (reattached even at the execution cap) when no job is running.
+    const resumables = run.nodes.map(cp => ({ cp, type: run.definition.nodes.find(node => node.id === cp.id)!.type })).filter(({ cp, type }) => cp.status === "running" && getNodeExecutor(type).resumable === true);
+    const resumedJob = (resumables.find(({ type }) => type !== "loop") ?? resumables[0])?.cp;
     // A retry-safe agent/prompt node (retrySafe !== false) is simply dispatched again from scratch.
     // Body checkpoints of loop iterations follow the same rules (the running loop itself is re-entered).
     let dirty = false;

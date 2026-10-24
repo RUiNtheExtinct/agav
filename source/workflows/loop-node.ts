@@ -37,18 +37,22 @@ export function loopContext(node: WorkflowNode, iterations: LoopIterationCheckpo
 
 /**
  * On resume of a running iteration, normalizes interrupted body work like `executeRun` does at the top level:
- * the first running job (or nested loop) is reattached, further running nested loops stay running for the scheduler to re-enter, a retry-safe agent/prompt is re-dispatched, and any other
- * interrupted node (tool, retrySafe:false agent) is failed closed, never replayed.
+ * a running job is reattached through the single resume slot (it owns a workload only a reattach can observe or stop), running
+ * nested loops stay running for the scheduler to re-enter (the loop takes the slot only when no job is running), a retry-safe
+ * agent/prompt is re-dispatched, and any other interrupted node (tool, retrySafe:false agent) is failed closed, never replayed.
  */
 function normalizeResumedBody(body: WorkflowNode[], cps: Record<string, NodeCheckpoint>): NodeCheckpoint | undefined {
-  let resume: NodeCheckpoint | undefined;
+  // The slot goes to the first running job, whatever its position relative to running nested loops: the scheduler re-enters
+  // a running loop by itself, but nothing re-enters a running job, so a loop holding the slot would fail it as uncertain.
+  let resume = body.map(child => ({ child, cp: cps[child.id]! })).find(({ child, cp }) => cp.status === "running" && child.type !== "loop" && getNodeExecutor(child.type).resumable === true)?.cp;
   for (const child of body) {
     const cp = cps[child.id]!;
-    if (cp.status !== "running") continue;
-    if (getNodeExecutor(child.type).resumable === true && resume === undefined) { resume = cp; continue; }
-    // Further running loops stay running: the scheduler re-enters a running loop, so each continues its own iteration
-    // (a second running job stays fail-closed below: only one job is reattached per scope).
-    if (child.type === "loop") continue;
+    if (cp.status !== "running" || cp === resume) continue;
+    if (child.type === "loop") {
+      // Only the loop's own iteration continues; with no job running the first one is the reattach target.
+      resume ??= cp;
+      continue;
+    }
     if (retriesOnResume(child)) {
       cp.status = "pending";
       for (const key of ["output", "error", "startedAt", "endedAt", "usage", "model", "durationMs"] as const) delete cp[key];

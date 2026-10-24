@@ -133,10 +133,37 @@ describe("launch boundary enforces the selected environment (P2)", () => {
     const coordinator = new FakeCoordinator();
     const run = await interruptedRun(coordinator);
     const result = await decideApproval(store, run.id, "gate", true, { registry, by: "u@h", launch: { coordinator, cliPath: CLI, admissionEnv: {}, sandboxRequired: true } });
-    expect(result.relaunch).toMatchObject({ status: "queued", reason: expect.stringContaining("L_TOKEN") });
-    expect((await read(run.id)).sandboxRequired).toBe(true);
+    expect(result.won).toBe(true);
+    expect(result.relaunch).toMatchObject({ status: "manual-resume-required", manualResumeRequired: true, reason: expect.stringContaining("L_TOKEN") });
+    expect(result.run.status).toBe("interrupted");
+    const summary = decisionSummary(result);
+    expect(summary).toContain("L_TOKEN");
+    expect(summary).toContain("manual resume required");
+    expect(summary).toContain(`agav workflows resume ${run.id}`);
+    expect(summary).not.toMatch(/runner queued/);
+    expect(summary).toContain("not launched or queued");
+    const after = await read(run.id);
+    expect(after.status).toBe("interrupted");
+    expect(after.sandboxRequired).toBe(true);
+    expect(coordinator.starts).toHaveLength(1);
+    // The decision stays recorded, and automatic reconcile never revisits (launches) an interrupted run, even from a capable context.
+    expect(await listPendingDecisions(store, run.id)).toEqual([]);
+    expect(await reconcileRun(store, run.id, { coordinator, cliPath: CLI, admissionEnv: { L_TOKEN: SECRET } })).toMatchObject({ action: "none" });
+    expect(coordinator.starts).toHaveLength(1);
+    expect((await read(run.id)).status).toBe("interrupted");
+    // Only the manual resume from a capable context launches it (new attempt), still enforcing the persisted requirement.
     expect((await launchRun(store, run.id, { coordinator, cliPath: CLI, admissionEnv: { L_TOKEN: SECRET }, sandboxRequired: false })).status).toBe("started");
+    expect(coordinator.starts).toHaveLength(2);
     expect((await read(run.id)).sandboxRequired).toBe(true);
+  });
+
+  it("a deferred relaunch of a parked (non-interrupted) run is still reported as queued", async () => {
+    const coordinator = new FakeCoordinator();
+    const run = await parked(coordinator);
+    const result = await decideApproval(store, run.id, "gate", true, { registry, by: "u@h", launch: { coordinator, cliPath: CLI, admissionEnv: {} } });
+    expect(result.relaunch).toMatchObject({ status: "queued" });
+    expect((result.relaunch as { manualResumeRequired?: boolean }).manualResumeRequired).toBeUndefined();
+    expect(decisionSummary(result)).toContain("runner queued");
   });
 
   it("fails closed when the stricter requirement cannot be persisted: the write error propagates, no safe deferral", async () => {

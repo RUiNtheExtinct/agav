@@ -175,11 +175,21 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
     const reason = deferredReason(missing);
     if (run.status === "pending") {
       run = await updateRun(store, runId, registry, current => {
-        if (current.status !== "pending") return false;
+        // A concurrent writer may have moved the run on since the snapshot: never touch its status/runner then, but
+        // still persist the stricter requirement (a terminal run is left alone), so the early exit cannot drop it.
+        if (current.status !== "pending") {
+          if (deps.sandboxRequired !== true || current.sandboxRequired === true || TERMINAL_RUN.has(current.status)) return false;
+          current.sandboxRequired = true;
+          return;
+        }
         current.runner ??= { attempt: 1, requestId: runnerRequestId(runId, 1), relaunches: 0 };
         current.status = "queued";
         if (deps.sandboxRequired === true) current.sandboxRequired = true;
       });
+      // Settled or already being run/cancelled by another writer: nothing to defer (the requirement is persisted above).
+      if (TERMINAL_RUN.has(run.status) || run.status === "running" || run.status === "cancelling") return { status: "attached", run };
+      // Moved to a state that automatic reconcile never revisits (interrupted): refuse like the non-pending path.
+      if (run.status !== "queued" && run.status !== "waiting_approval") throw new LaunchEnvironmentError(runId, reason);
     } else if (run.status === "queued" || run.status === "waiting_approval") run = await strengthenRequirement(store, run, deps, registry);
     // Automatic reconcile only revisits pending/queued/parked runs; anything else (interrupted…) would be stranded behind a "queued" answer.
     else {
