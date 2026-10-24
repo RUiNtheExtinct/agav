@@ -180,7 +180,7 @@ describe("queued admission and selected environment (issue 4)", () => {
   it("a dead runner is not relaunched from a context lacking the selected env, and is left for a capable one", async () => {
     const coordinator = new FakeCoordinator();
     const run = await consented(jobDef, "ask", ["B_TOKEN"]);
-    await launchRun(store, run.id, { coordinator, cliPath: CLI });
+    await launchRun(store, run.id, { coordinator, cliPath: CLI, admissionEnv: { B_TOKEN: SECRET } });
     const running = await store.read(run.id, registry);
     running.status = "running";
     await store.lock(run.id, () => store.save(running));

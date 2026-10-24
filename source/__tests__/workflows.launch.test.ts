@@ -36,7 +36,7 @@ describe("launchRun", () => {
   it("starts one supervised runner job with the expected request", async () => {
     const run = await backgroundRun(["OPENAI_API_KEY"]);
     const coordinator = new CapCoordinator();
-    const result = await launchRun(store, run.id, { coordinator, cliPath: CLI });
+    const result = await launchRun(store, run.id, { coordinator, cliPath: CLI, admissionEnv: { OPENAI_API_KEY: "x" } });
     expect(result.status).toBe("started");
     expect(coordinator.starts).toHaveLength(1);
     expect(coordinator.starts[0]).toEqual({

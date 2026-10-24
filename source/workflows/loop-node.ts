@@ -4,7 +4,8 @@ import { appendEvent } from "./events.js";
 import { evaluateCondition } from "./expr.js";
 import { getNodeExecutor, retriesOnResume, type NodeExecutionContext, type NodeExecutor, type NodeResult } from "./executors.js";
 import type { TemplateContext } from "./interpolate.js";
-import { MAX_INLINE_OUTPUT_BYTES, toleratedFailure, type LoopIterationCheckpoint, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus, type WorkflowStore } from "./store.js";
+import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, type JobNodeDeps } from "./job-node.js";
+import { jobRequestId, MAX_INLINE_OUTPUT_BYTES, scopedCheckpoints, toleratedFailure, visitJobScope, type CheckpointVisit, type LoopIterationCheckpoint, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus, type WorkflowRun, type WorkflowStore } from "./store.js";
 
 const DEFAULT_HISTORY_LIMIT = 5;
 const TERMINAL = new Set<NodeStatus>(["passed", "failed", "cancelled", "timed_out", "skipped"]);
@@ -36,7 +37,7 @@ export function loopContext(node: WorkflowNode, iterations: LoopIterationCheckpo
 
 /**
  * On resume of a running iteration, normalizes interrupted body work like `executeRun` does at the top level:
- * a running job (or nested loop) is reattached, a retry-safe agent/prompt is re-dispatched, and any other
+ * the first running job (or nested loop) is reattached, further running nested loops stay running for the scheduler to re-enter, a retry-safe agent/prompt is re-dispatched, and any other
  * interrupted node (tool, retrySafe:false agent) is failed closed, never replayed.
  */
 function normalizeResumedBody(body: WorkflowNode[], cps: Record<string, NodeCheckpoint>): NodeCheckpoint | undefined {
@@ -45,6 +46,9 @@ function normalizeResumedBody(body: WorkflowNode[], cps: Record<string, NodeChec
     const cp = cps[child.id]!;
     if (cp.status !== "running") continue;
     if (getNodeExecutor(child.type).resumable === true && resume === undefined) { resume = cp; continue; }
+    // Further running loops stay running: the scheduler re-enters a running loop, so each continues its own iteration
+    // (a second running job stays fail-closed below: only one job is reattached per scope).
+    if (child.type === "loop") continue;
     if (retriesOnResume(child)) {
       cp.status = "pending";
       for (const key of ["output", "error", "startedAt", "endedAt", "usage", "model", "durationMs"] as const) delete cp[key];
@@ -81,6 +85,54 @@ export async function settleParkedBody(store: WorkflowStore, runId: string, node
     await decide(store, runId, decisionId, false, "workflow-runtime", "Settled: the enclosing scope ended before this was decided.");
   }
   applyParkedSettlement(nodes, now);
+}
+
+/**
+ * Stops the jobs still running in `visits` (confirmed, fail closed): the real outcome, or the kept linkage and reason,
+ * is saved first and an unconfirmed stop throws `JobCancellationIncompleteError`, so the scope is never terminalized
+ * with a live workload behind it. Without job support nothing is claimed stopped.
+ */
+export async function stopLiveJobs(store: WorkflowStore, run: WorkflowRun, jobDeps: JobNodeDeps | undefined, visits: CheckpointVisit[]): Promise<void> {
+  for (const visit of visits.filter(v => v.cp.status === "running" && v.node.type === "job")) {
+    const { cp } = visit;
+    const requestId = cp.job?.requestId ?? jobRequestId(run.id, cp.id, cp.attempt ?? 1, visitJobScope(visit));
+    if (!jobDeps) throw new Error(`Job nodes unavailable: node ${cp.id} has a running job (${requestId}) and this run is ending; resume with background-job support to stop it.`);
+    const outcome = await stopJobNodeOutcome(jobDeps, { requestId, jobId: cp.job?.jobId });
+    applyJobOutcome(cp, outcome);
+    await store.save(run); // The real outcome (or the kept linkage/reason) is durable first.
+    if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
+  }
+}
+
+/**
+ * Settles the running or parked loops among `visits` (innermost first, as `scopedCheckpoints` is depth-first): the
+ * current iteration has no work left in progress. Only the given loops are touched, never their enclosing ones.
+ */
+export async function settleLoopVisits(store: WorkflowStore, run: WorkflowRun, visits: CheckpointVisit[], now: string): Promise<void> {
+  for (const visit of [...visits].reverse()) {
+    const loop = visit.cp as LoopNodeCheckpoint;
+    if (visit.node.type !== "loop" || (loop.status !== "running" && loop.status !== "waiting_approval")) continue;
+    const current = loop.iterations?.[loop.iterations.length - 1];
+    if (current && !TERMINAL.has(current.status)) {
+      await settleParkedBody(store, run.id, current.nodes, now);
+      const failed = visit.node.body?.some(n => { const c = current.nodes[n.id]!; return (c.status === "failed" || c.status === "timed_out") && !toleratedFailure(n, c); });
+      current.status = failed ? "failed" : "cancelled"; current.endedAt = now;
+    }
+    loop.status = current?.status === "failed" ? "failed" : "cancelled"; loop.endedAt = now;
+    if (loop.status === "failed") loop.error = `iteration ${current!.index} failed`;
+  }
+}
+
+/**
+ * Before an iteration turns terminal for a reason other than parking: stops the live jobs and settles the nested loops
+ * still running inside it (a sibling nested loop the scheduler never re-entered, e.g. after an earlier sibling failed
+ * under stopOnFailure). Scoped to the iteration's own subtree: the current (outer) loop is left to its executor.
+ */
+async function settleIterationSubtree(store: WorkflowStore, run: WorkflowRun, jobDeps: JobNodeDeps | undefined, it: LoopIterationCheckpoint): Promise<void> {
+  const inside = scopedCheckpoints(run).filter(visit => visit.loops.some(entry => entry.iteration === it));
+  if (!inside.some(visit => visit.cp.status === "running" || visit.cp.status === "waiting_approval")) return;
+  await stopLiveJobs(store, run, jobDeps, inside);
+  await settleLoopVisits(store, run, inside, new Date().toISOString());
 }
 
 function applyParkedSettlement(nodes: Record<string, NodeCheckpoint>, now: string): void {
@@ -165,6 +217,9 @@ async function executeLoop(ctx: NodeExecutionContext): Promise<NodeResult> {
           outerNodes: { ...(ctx.scopeNodes ?? Object.fromEntries(run.nodes.map(n => [n.id, n]))) },
         }, { signal: child.signal, ...(resume ? { resume } : {}) });
         if (status === "waiting_approval") { it.status = "waiting_approval"; return await settle("waiting_approval"); }
+        // Live jobs are stopped (confirmed) and unvisited nested loops settled first: an unconfirmed stop throws here, leaving
+        // the iteration, its loop and the job linkage non-terminal and readable.
+        await settleIterationSubtree(store, run, ctx.jobDeps, it);
         // Inbox decisions are settled before the iteration turns terminal; a failed write leaves it non-terminal and readable.
         await settleParkedBody(store, run.id, it.nodes, new Date().toISOString());
         it.status = timedOut && (status === "cancelled" || status === "timed_out") ? "timed_out" : status;

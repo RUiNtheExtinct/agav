@@ -3,7 +3,7 @@ import { getNodeEntryLoaderArgs, getWorkflowRunnerArgs, isStandaloneBinary } fro
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
-import { appendEvent } from "./events.js";
+import { appendEvent, readEvents } from "./events.js";
 import { runnerRequestId, type WorkflowRun, type WorkflowStore } from "./store.js";
 
 export const DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS = 2;
@@ -28,6 +28,11 @@ export async function assertBackgroundRunsAvailable(coordinator: RunnerCoordinat
   }
 }
 
+/** A launch that cannot proceed from this context for lack of the selected environment, and has no queue to wait in (state untouched). */
+export class LaunchEnvironmentError extends Error {
+  constructor(readonly runId: string, readonly reason: string) { super(`Workflow run ${runId} was not launched: ${reason}. It was not started (only a stricter sandboxRequired is recorded); resume it from a context that has them.`); this.name = "LaunchEnvironmentError"; }
+}
+
 export interface LaunchDeps {
   coordinator: RunnerCoordinator;
   /** Session for the runner `start`; defaults to `runnerLaunchSession()`. */
@@ -45,8 +50,32 @@ export interface LaunchDeps {
   exitingRunId?: string;
   /** The caller's effective sandboxRequired; it can only strengthen the run's persisted requirement (never read from process state: a runner admitting another run must not leak its own). */
   sandboxRequired?: boolean;
+  /**
+   * Environment capability of the process doing the launching. The coordinator resolves a run's selected `envInherit`
+   * names from ITS process environment, so a restricted context (e.g. a finishing runner, which only holds its own run's
+   * selected names) cannot start a run that selected others: the values would be silently dropped. Defaults to
+   * `process.env` (what the coordinator reads). Only checked for the presence of the consent's selected names; values are
+   * never read, passed to the coordinator, logged or stored.
+   */
+  admissionEnv?: Readonly<Record<string, string | undefined>>;
 }
-export interface LaunchResult { status: "started" | "attached" | "queued"; run: WorkflowRun; job?: JobSummary }
+/** `queued` carries a `reason` when the run is deferred for a launch-context reason (missing selected env), not a full pool. */
+export interface LaunchResult { status: "started" | "attached" | "queued"; run: WorkflowRun; job?: JobSummary; reason?: string }
+
+/** Names the run's consent selected that this context cannot resolve (names only; never values). */
+export function missingEnvNames(run: WorkflowRun, deps: Pick<LaunchDeps, "admissionEnv">): string[] {
+  const env = deps.admissionEnv ?? process.env;
+  return (run.consent?.envNames ?? []).filter(name => env[name] === undefined);
+}
+export function deferredReason(missing: string[]): string {
+  return `waiting for a launch context that has the selected environment variable(s): ${missing.join(", ")}`;
+}
+/** Records why a run could not be started here, once per distinct reason (reconcile runs repeatedly). */
+export async function noteDeferred(store: WorkflowStore, run: WorkflowRun, reason: string): Promise<void> {
+  const last = (await readEvents(store, run.id).catch(() => [])).filter(event => event.type === "run_status").at(-1);
+  if (last?.type === "run_status" && last.status === run.status && last.reason === reason) return;
+  await appendEvent(store, run.id, { type: "run_status", status: run.status, reason });
+}
 
 /**
  * Headless snapshot for launching a run's own runner. The run's per-invocation consent (`run.consent`) is the
@@ -116,7 +145,12 @@ async function strengthenRequirement(store: WorkflowStore, run: WorkflowRun, dep
 
 /**
  * Ensures the run's current runner attempt exists. Idempotent: an existing runner job (found by its deterministic
- * requestId) is reattached, never started twice. A full workflow-runner pool leaves the run `queued`, never failed.
+ * requestId) is reattached, never started twice (no environment needed: nothing is started). A full workflow-runner pool
+ * leaves the run `queued`, never failed. Likewise a context lacking the consent's selected environment variables never
+ * starts the runner (the values would be silently dropped): it returns `queued` with a `reason` and leaves a parked /
+ * queued run and its runner attempt untouched (a never-launched `pending` run becomes `queued` so a capable context
+ * admits it), for a capable context to launch later. An `interrupted` run (never revisited automatically) is refused with
+ * `LaunchEnvironmentError` (state untouched apart from a stricter sandboxRequired, persisted first).
  */
 export async function launchRun(store: WorkflowStore, runId: string, deps: LaunchDeps): Promise<LaunchResult> {
   const registry = deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS);
@@ -134,6 +168,28 @@ export async function launchRun(store: WorkflowStore, runId: string, deps: Launc
   const nextAttempt = existing ? run.runner!.attempt + 1 : undefined;
 
   await assertBackgroundRunsAvailable(deps.coordinator);
+
+  // Enforced here, at the one boundary every start passes (initial, resume, approval relaunch, reconcile), before any durable intent or start.
+  const missing = missingEnvNames(run, deps);
+  if (missing.length > 0) {
+    const reason = deferredReason(missing);
+    if (run.status === "pending") {
+      run = await updateRun(store, runId, registry, current => {
+        if (current.status !== "pending") return false;
+        current.runner ??= { attempt: 1, requestId: runnerRequestId(runId, 1), relaunches: 0 };
+        current.status = "queued";
+        if (deps.sandboxRequired === true) current.sandboxRequired = true;
+      });
+    } else if (run.status === "queued" || run.status === "waiting_approval") run = await strengthenRequirement(store, run, deps, registry);
+    // Automatic reconcile only revisits pending/queued/parked runs; anything else (interrupted…) would be stranded behind a "queued" answer.
+    else {
+      // Still record the stricter requirement (fail closed: a save error propagates instead of a "safe" deferral), so a later capable context enforces it.
+      await strengthenRequirement(store, run, deps, registry);
+      throw new LaunchEnvironmentError(runId, reason);
+    }
+    if (!TERMINAL_RUN.has(run.status)) await noteDeferred(store, run, reason);
+    return { status: "queued", run, reason };
+  }
 
   const max = deps.maxConcurrentWorkflowRuns ?? DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS;
   const full = await liveRunnerCount(store, deps.coordinator, registry, deps.exitingRunId ? [runId, deps.exitingRunId] : runId) >= max;

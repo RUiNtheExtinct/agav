@@ -130,3 +130,110 @@ describe("execution cap on a resumed loop with live work", () => {
     expect(loopCp(read, "second").iterations![0]!.nodes.build!.status).toBe("running");
   });
 });
+
+describe("resume with several running loops nested in one loop body", () => {
+  it("re-enters the second inner loop and reattaches its live job instead of failing it as uncertain", async () => {
+    const coordinator = new FakeCoordinator();
+    const definition: WorkflowDefinition = def([
+      { id: "outer", type: "loop", maxIterations: 1, onExhausted: "continue", body: [
+        { id: "innerA", type: "loop", maxIterations: 1, onExhausted: "continue", body: [{ id: "gate", type: "approval", prompt: "go?" }] },
+        { id: "innerB", type: "loop", maxIterations: 1, onExhausted: "continue", body: [{ id: "build", type: "job", command: "sleep 100" }] },
+      ] },
+    ]);
+    const run = await createRun(store, validateDefinition(definition, registry), {});
+    const raw = await rawRun(run.id);
+    const t = new Date().toISOString();
+    const requestId = jobRequestId(run.id, "build", 1, { loopPath: [{ loopId: "outer", iteration: 0 }, { loopId: "innerB", iteration: 0 }] });
+    coordinator.jobs.set("job-9", summary(requestId, "job-9", "running"));
+    coordinator.pollStates = ["running", "completed"];
+    const { decisionId } = await createPendingDecision(store, run.id, { kind: "approval", nodeId: "gate", iteration: [0, 0], summary: "go?" });
+    await decide(store, run.id, decisionId, true, "tester");
+    const innerA: LoopNodeCheckpoint = { id: "innerA", status: "running", startedAt: t, iteration: 0, iterations: [
+      { index: 0, status: "running", startedAt: t, nodes: { gate: { id: "gate", status: "waiting_approval", decisionId, startedAt: t } } },
+    ] };
+    const innerB: LoopNodeCheckpoint = { id: "innerB", status: "running", startedAt: t, iteration: 0, iterations: [
+      { index: 0, status: "running", startedAt: t, nodes: { build: { id: "build", status: "running", startedAt: t, job: { requestId, jobId: "job-9", state: "running" } } } },
+    ] };
+    raw.status = "running";
+    raw.nodes[0] = { id: "outer", status: "running", startedAt: t, iteration: 0, iterations: [
+      { index: 0, status: "running", startedAt: t, nodes: { innerA, innerB } },
+    ] } as LoopNodeCheckpoint;
+    await writeRaw(raw);
+
+    const done = await executeRun(store, run.id, registry, config, undefined, fakeHost(), jobDeps(coordinator));
+    expect(coordinator.starts).toHaveLength(0);
+    expect(coordinator.stops).toEqual([]);
+    expect(done.status).toBe("passed");
+    const read = await store.read(run.id, registry);
+    const outer = loopCp(read, "outer").iterations![0]!;
+    expect(outer.nodes.innerA).toMatchObject({ status: "passed" });
+    expect(outer.nodes.innerB).toMatchObject({ status: "passed" });
+    expect((outer.nodes.innerB as LoopNodeCheckpoint).iterations![0]!.nodes.build).toMatchObject({ status: "passed", job: { jobId: "job-9" } });
+  });
+});
+
+describe("resume where the first nested loop fails while a second nested loop owns a live job", () => {
+  /** `outer` body: `innerA` (gate with a denied decision, fails on resume) then `innerB` (live job); both were running at the crash. */
+  async function seedNested(coordinator: FakeCoordinator): Promise<{ run: WorkflowRun; gateDecision: string }> {
+    const definition: WorkflowDefinition = def([
+      { id: "outer", type: "loop", maxIterations: 1, onExhausted: "continue", body: [
+        { id: "innerA", type: "loop", maxIterations: 1, onExhausted: "continue", body: [{ id: "gate", type: "approval", prompt: "go?" }] },
+        { id: "innerB", type: "loop", maxIterations: 1, onExhausted: "continue", body: [{ id: "build", type: "job", command: "sleep 100" }] },
+      ] },
+    ]);
+    const run = await createRun(store, validateDefinition(definition, registry), {});
+    const raw = await rawRun(run.id);
+    const t = new Date().toISOString();
+    const requestId = jobRequestId(run.id, "build", 1, { loopPath: [{ loopId: "outer", iteration: 0 }, { loopId: "innerB", iteration: 0 }] });
+    coordinator.jobs.set("job-9", summary(requestId, "job-9", "running"));
+    coordinator.pollStates = ["running"];
+    const { decisionId } = await createPendingDecision(store, run.id, { kind: "approval", nodeId: "gate", iteration: [0, 0], summary: "go?" });
+    await decide(store, run.id, decisionId, false, "tester");
+    const innerA: LoopNodeCheckpoint = { id: "innerA", status: "running", startedAt: t, iteration: 0, iterations: [
+      { index: 0, status: "running", startedAt: t, nodes: { gate: { id: "gate", status: "waiting_approval", decisionId, startedAt: t } } },
+    ] };
+    const innerB: LoopNodeCheckpoint = { id: "innerB", status: "running", startedAt: t, iteration: 0, iterations: [
+      { index: 0, status: "running", startedAt: t, nodes: { build: { id: "build", status: "running", startedAt: t, job: { requestId, jobId: "job-9", state: "running" } } } },
+    ] };
+    raw.status = "running";
+    raw.nodes[0] = { id: "outer", status: "running", startedAt: t, iteration: 0, iterations: [
+      { index: 0, status: "running", startedAt: t, nodes: { innerA, innerB } },
+    ] } as LoopNodeCheckpoint;
+    await writeRaw(raw);
+    return { run, gateDecision: decisionId };
+  }
+
+  it("stops the second loop's live job (confirmed) before the outer loop and run turn terminal", async () => {
+    const coordinator = new FakeCoordinator();
+    const { run } = await seedNested(coordinator);
+    const done = await executeRun(store, run.id, registry, config, undefined, fakeHost(), jobDeps(coordinator));
+    expect(done.status).toBe("failed");
+    expect(coordinator.starts).toHaveLength(0);
+    expect(coordinator.stops).toEqual(["job-9"]);
+    const read = await store.read(run.id, registry); // used to reject: failed iteration holding a running nested loop
+    const outer = loopCp(read, "outer");
+    expect(outer.status).toBe("failed");
+    const it = outer.iterations![0]!;
+    expect(it.status).toBe("failed");
+    expect(it.nodes.innerA).toMatchObject({ status: "failed" });
+    const innerB = it.nodes.innerB as LoopNodeCheckpoint;
+    expect(["cancelled", "failed"]).toContain(innerB.status);
+    expect(["cancelled", "failed"]).toContain(innerB.iterations![0]!.status);
+    expect(innerB.iterations![0]!.nodes.build!.status).not.toBe("running");
+  });
+
+  it("keeps the run non-terminal and the job linkage when the stop is not confirmed", async () => {
+    const coordinator = new FakeCoordinator();
+    const { run } = await seedNested(coordinator);
+    coordinator.stop = async () => { throw new Error("stop denied"); };
+    await expect(executeRun(store, run.id, registry, config, undefined, fakeHost(), jobDeps(coordinator))).rejects.toBeInstanceOf(JobCancellationIncompleteError);
+    const read = await store.read(run.id, registry); // must stay readable
+    expect(read.status).not.toBe("failed");
+    const outer = loopCp(read, "outer");
+    expect(outer.status).toBe("running");
+    expect(outer.iterations![0]!.status).toBe("running");
+    const innerB = outer.iterations![0]!.nodes.innerB as LoopNodeCheckpoint;
+    expect(innerB.status).toBe("running");
+    expect(innerB.iterations![0]!.nodes.build).toMatchObject({ status: "running", job: { jobId: "job-9" } });
+  });
+});

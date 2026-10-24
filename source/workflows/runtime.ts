@@ -3,9 +3,9 @@ import { realpath } from "node:fs/promises";
 import type { AgavConfig, PermissionMode } from "../config/config.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import type { WorkflowExecutionHost } from "./gated-tools.js";
-import { definitionHash, jobRequestId, scopedCheckpoints, toleratedFailure, visitJobScope, type JobScope, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
-import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, type JobNodeDeps } from "./job-node.js";
-import { settleParkedBody } from "./loop-node.js";
+import { definitionHash, scopedCheckpoints, toleratedFailure, type JobScope, type LoopNodeCheckpoint, type NodeCheckpoint, type NodeStatus, type RunHost, type RunStatus, type WorkflowRun, WorkflowStore } from "./store.js";
+import { type JobNodeDeps } from "./job-node.js";
+import { settleLoopVisits, settleParkedBody, stopLiveJobs } from "./loop-node.js";
 import { narrowPermissionMode, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { getNodeExecutor, retriesOnResume, type NodeResult } from "./executors.js";
 import { type AgentNodeDeps } from "./agent-node.js";
@@ -235,30 +235,8 @@ async function runSubScope(spec: ScopeSpec, env: ScopeEnv, options: { resume?: N
  */
 async function stopLiveJobsBeforeTerminal(store: WorkflowStore, run: WorkflowRun, jobDeps: JobNodeDeps | undefined): Promise<void> {
   const visits = scopedCheckpoints(run);
-  const live = visits.filter(visit => visit.cp.status === "running" && visit.node.type === "job");
-  for (const visit of live) {
-    const { cp } = visit;
-    const requestId = cp.job?.requestId ?? jobRequestId(run.id, cp.id, cp.attempt ?? 1, visitJobScope(visit));
-    if (!jobDeps) throw new Error(`Job nodes unavailable: node ${cp.id} has a running job (${requestId}) and this run is ending; resume with background-job support to stop it.`);
-    const outcome = await stopJobNodeOutcome(jobDeps, { requestId, jobId: cp.job?.jobId });
-    applyJobOutcome(cp, outcome);
-    await store.save(run); // The real outcome (or the kept linkage/reason) is durable first.
-    if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
-  }
-  // Settle running or parked loops (innermost first): the current iteration has no work left in progress.
-  const now = new Date().toISOString();
-  for (const visit of [...visits].reverse()) {
-    const loop = visit.cp as LoopNodeCheckpoint;
-    if (visit.node.type !== "loop" || (loop.status !== "running" && loop.status !== "waiting_approval")) continue;
-    const current = loop.iterations?.[loop.iterations.length - 1];
-    if (current && !["passed", "failed", "cancelled", "timed_out", "skipped"].includes(current.status)) {
-      await settleParkedBody(store, run.id, current.nodes, now);
-      const failed = visit.node.body?.some(n => { const c = current.nodes[n.id]!; return (c.status === "failed" || c.status === "timed_out") && !toleratedFailure(n, c); });
-      current.status = failed ? "failed" : "cancelled"; current.endedAt = now;
-    }
-    loop.status = current?.status === "failed" ? "failed" : "cancelled"; loop.endedAt = now;
-    if (loop.status === "failed") loop.error = `iteration ${current!.index} failed`;
-  }
+  await stopLiveJobs(store, run, jobDeps, visits);
+  await settleLoopVisits(store, run, visits, new Date().toISOString());
   await store.save(run);
 }
 

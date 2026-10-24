@@ -52,7 +52,7 @@ export async function startBackgroundRun(store: WorkflowStore, prepared: Prepare
 /** One-line launch summary with the follow-up hints. */
 export function launchSummary(result: LaunchResult, prefix = "agav workflows"): string {
   const id = result.run.id, short = shortId(id);
-  const state = result.status === "queued" ? "queued (workflow runner pool full)" : result.status;
+  const state = result.status === "queued" ? `queued (${result.reason ?? "workflow runner pool full"})` : result.status;
   return `Workflow run ${id} (${result.run.definition.name}) ${state} · status: ${prefix} status ${short} · cancel: ${prefix} cancel ${short}`;
 }
 

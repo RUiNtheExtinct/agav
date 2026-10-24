@@ -3,7 +3,7 @@ import { BackgroundJobError, isLiveLifecycle } from "../background-jobs/types.js
 import { jobRequestId, scopedCheckpoints, visitJobScope, WorkflowStore, type LoopNodeCheckpoint, type WorkflowRun } from "./store.js";
 import { applyJobOutcome, JobCancellationIncompleteError, stopJobNodeOutcome, type JobNodeDeps } from "./job-node.js";
 import { decide, defaultDecider, isDecisionId, listPendingDecisions, readDecision, type DecidedRecord, type DecisionKind, type PendingDecision } from "./decisions.js";
-import { findRunnerJob, launchRun, type LaunchDeps, type LaunchResult } from "./launch.js";
+import { findRunnerJob, launchRun, LaunchEnvironmentError, type LaunchDeps, type LaunchResult } from "./launch.js";
 import { postRunNotification } from "./notify.js";
 import { retriesOnResume } from "./executors.js";
 
@@ -65,7 +65,10 @@ export async function decideRunDecision(store: WorkflowStore, runId: string, dec
     run = await store.read(runId, opts.registry);
   }
   if (TERMINAL.includes(run.status)) return { ...result, run };
-  const relaunch = await launchRun(store, runId, { registry: opts.registry, ...opts.launch });
+  // The decision is recorded above regardless: a context lacking the selected env defers the relaunch instead of failing the approval.
+  let relaunch: LaunchResult;
+  try { relaunch = await launchRun(store, runId, { registry: opts.registry, ...opts.launch }); }
+  catch (error) { if (!(error instanceof LaunchEnvironmentError)) throw error; relaunch = { status: "queued", run: await store.read(runId, opts.registry), reason: error.reason }; }
   return { ...result, run: relaunch.run, relaunch };
 }
 
@@ -80,7 +83,7 @@ export function decisionSummary(result: DecideResult): string {
   const { pending, record } = result;
   const verb = record.decision === "approve" ? "approved" : "denied";
   if (!result.won) return `Decision ${pending.decisionId} (${pending.kind} on ${pending.nodeId}) was already ${verb} by ${record.decidedBy} at ${record.decidedAt}.`;
-  const follow = result.relaunch === undefined ? "" : result.relaunch === "live" ? "; the live runner applies it" : `; runner ${result.relaunch.status} (attempt ${result.relaunch.run.runner?.attempt ?? 1})`;
+  const follow = result.relaunch === undefined ? "" : result.relaunch === "live" ? "; the live runner applies it" : `; runner ${result.relaunch.status} (attempt ${result.relaunch.run.runner?.attempt ?? 1})${result.relaunch.reason ? `: ${result.relaunch.reason}` : ""}`;
   return `${pending.kind} on ${pending.nodeId} ${verb} (${pending.decisionId}) in run ${result.run.id}${follow}.`;
 }
 

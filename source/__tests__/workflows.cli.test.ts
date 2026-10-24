@@ -60,6 +60,9 @@ describe("agav workflows run", () => {
 
   it("with consent, creates a background run whose consent records only the selected env names", async () => {
     const dir = await mkdtemp(join(tmpdir(), "agav-wf-cli-"));
+    // The launch boundary requires the selected name in the launching process (what the coordinator resolves it from).
+    const priorBbb = process.env.BBB;
+    process.env.BBB = "secret-b";
     try {
       await mkdir(join(dir, "w"), { recursive: true });
       const file = join(dir, "w", "wf.json");
@@ -81,7 +84,7 @@ describe("agav workflows run", () => {
       expect(stdout.text()).toContain("echo hi");
       expect(stdout.text()).toMatch(new RegExp(`Workflow run ${id} \\(test\\) started`));
       expect(stdout.text()).toContain(`agav workflows cancel ${id!.slice(0, 8)}`);
-    } finally { await rm(dir, { recursive: true, force: true }); }
+    } finally { if (priorBbb === undefined) delete process.env.BBB; else process.env.BBB = priorBbb; await rm(dir, { recursive: true, force: true }); }
   });
 });
 
