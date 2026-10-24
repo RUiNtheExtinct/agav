@@ -1,5 +1,5 @@
 import { isLiveLifecycle, isTerminalLifecycle, type CoordinatorClient, type JobSummary, type SessionPolicySnapshot, type StartJobRequest } from "../background-jobs/types.js";
-import { getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
+import { getNodeEntryLoaderArgs, getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
@@ -62,7 +62,7 @@ export function runnerStartRequest(run: WorkflowRun, cliPath: string, standalone
   if (!run.consent) throw new Error(`Workflow run ${run.id} has no background consent; refusing to launch.`);
   return {
     requestId: run.runner.requestId,
-    invocation: { mode: "direct", executable: process.execPath, args: getWorkflowRunnerArgs(run.id, standalone ? undefined : cliPath) },
+    invocation: { mode: "direct", executable: process.execPath, args: getWorkflowRunnerArgs(run.id, standalone ? undefined : cliPath, standalone ? [] : getNodeEntryLoaderArgs(cliPath)) },
     cwd: run.cwd,
     envInherit: [...run.consent.envNames],
     isolation: { backend: "none", required: false },

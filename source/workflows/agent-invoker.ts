@@ -5,7 +5,7 @@ import type { LLMProvider } from "../providers/types.js";
 import type { ConfirmResult } from "../agent/loop.js";
 import type { AgentDefinition } from "../agents/types.js";
 import { executeA2AAgent, executeNativeAgent } from "../agents/executor.js";
-import { SAFE_TOOLS } from "./gated-tools.js";
+import { agentToolVerdict, SAFE_TOOLS } from "./gated-tools.js";
 
 /** One isolated agent call from a workflow node. `task` is the whole user message: no conversation history. */
 export interface AgentInvokeRequest {
@@ -91,12 +91,26 @@ export function createDefaultAgentInvoker(deps: { provider: LLMProvider; config:
       if (type !== "native") throw new Error(`Unsupported agent type: ${String(type)}`);
       const agent = withOverrides(base, req);
       const budget = req.maxIterations ?? deps.config.maxIterations;
+      const mode = req.permissionMode ?? deps.config.permissionMode ?? "ask";
+      const gateConfig: AgavConfig = { ...deps.config, permissionMode: mode };
+      // Independent gate: refusals (destructive, deny-writes, config allowedTools incl. path rules) never reach the
+      // caller's confirm and so cannot be overridden by it; everything else is still decided by req.confirmTool.
+      const confirmTool: AgentInvokeRequest["confirmTool"] = async (toolName, input) => {
+        const args = input && typeof input === "object" && !Array.isArray(input) ? input as Record<string, unknown> : {};
+        const verdict = agentToolVerdict(toolName, args, gateConfig);
+        if (verdict === "deny") return false;
+        // Auto-accept approves what passed the gate itself, as the loop would have without the "ask" downgrade.
+        if (mode === "auto-accept" && verdict === "allow") return true;
+        return req.confirmTool(toolName, input);
+      };
       const text = await executeNativeAgent(agent, req.task, {
         provider: deps.provider,
         config: deps.config,
         signal: req.signal,
-        confirmTool: adaptConfirmTool(req.confirmTool),
-        permissionMode: req.permissionMode ?? deps.config.permissionMode ?? "ask",
+        confirmTool: adaptConfirmTool(confirmTool),
+        // The loop skips confirmation entirely under auto-accept, which would bypass the gate above; run it in
+        // "ask" so every non-SAFE call reaches confirmTool (the caller's confirm applies auto-accept itself).
+        permissionMode: mode === "auto-accept" ? "ask" : mode,
         // Tool lists only restrict; every non-SAFE sub-tool call goes through confirmTool.
         toolGate: { safeTools: SAFE_TOOLS },
         iterationsBudget: { remaining: budget, total: budget },

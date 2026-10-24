@@ -178,6 +178,12 @@ export async function runScope(spec: ScopeSpec, env: ScopeEnv): Promise<ScopeSta
       // A reattached job is counted but never failed by the cap (its workload may be live).
       if ((run.executionCount ?? 0) >= MAX_EXECUTIONS && !(resuming && first)) {
         env.capExceeded = true;
+        // A loop may still own live jobs, running iterations and parked decisions: stop and settle them first (fail closed:
+        // an unconfirmed stop throws and leaves the run non-terminal), or the failed loop would be unreadable / leak a workload.
+        if (node.type === "loop") {
+          await stopLiveJobsBeforeTerminal(store, run, env.jobDeps);
+          await settleParkedBody(store, run.id, { [cp.id]: cp }, new Date().toISOString());
+        }
         cp.status = "failed"; cp.error = CAP_ERROR; cp.endedAt = new Date().toISOString();
         await env.save();
         await appendEvent(store, run.id, { type: "node_completed", nodeId: node.id, status: cp.status, error: cp.error });
@@ -239,7 +245,6 @@ async function stopLiveJobsBeforeTerminal(store: WorkflowStore, run: WorkflowRun
     await store.save(run); // The real outcome (or the kept linkage/reason) is durable first.
     if (outcome.status === "incomplete") throw new JobCancellationIncompleteError(cp.id, outcome.error ?? "termination not confirmed");
   }
-  if (live.length === 0) return;
   // Settle running or parked loops (innermost first): the current iteration has no work left in progress.
   const now = new Date().toISOString();
   for (const visit of [...visits].reverse()) {
@@ -350,6 +355,7 @@ export async function executeRun(store: WorkflowStore, id: string, registry: Too
         await appendEvent(store, id, { type: "run_status", status: "running" });
         const scopeStatus = await runScope({ nodes: run.definition.nodes, checkpoints: Object.fromEntries(run.nodes.map(cp => [cp.id, cp])) }, env);
         if (pollingError) throw pollingError;
+        if (env.capExceeded) await stopLiveJobsBeforeTerminal(store, run, jobDeps);
         run.status = scopeStatus;
         await store.save(run);
         await appendEvent(store, id, { type: "run_status", status: run.status, ...(deadlineHit ? { reason: "run deadline exceeded" } : env.capExceeded ? { reason: CAP_ERROR } : {}) });

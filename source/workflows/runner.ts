@@ -1,11 +1,11 @@
 import { BackgroundJobError, type StartJobRequest } from "../background-jobs/types.js";
-import { loadConfig, type AgavConfig } from "../config/config.js";
+import { loadConfig, type AgavConfig, type PermissionMode } from "../config/config.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import type { ToolRegistry } from "../tools/registry.js";
 import { applySandboxRequiredPolicy } from "../utils/sandbox-startup.js";
 import { detectSandboxBackend, isSandboxRequired, setSandboxRequired } from "../utils/sandbox.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
-import { consentCoversJob, consentSession, type WorkflowConsent } from "./grant.js";
+import { clampConsent, consentCoversJob, consentSession, effectivePermissionMode, type WorkflowConsent } from "./grant.js";
 import { createBackgroundHost } from "./hosts.js";
 import type { JobCoordinatorLike, JobNodeDeps } from "./job-node.js";
 import { postRunNotification } from "./notify.js";
@@ -16,7 +16,7 @@ import type { AgentNodeDeps } from "./agent-node.js";
 import { WorkflowStore, type WorkflowRun } from "./store.js";
 import type { LaunchDeps } from "./launch.js";
 import { updateRun } from "./launch.js";
-import { admitQueuedRuns } from "./reconcile.js";
+import { admitQueuedRuns, type ReconcileDeps } from "./reconcile.js";
 
 /** SIGTERM must checkpoint within this window, under the supervisor's 5 s SIGKILL grace. */
 export const RUNNER_SHUTDOWN_GRACE_MS = 4000;
@@ -25,7 +25,7 @@ export const RUNNER_SHUTDOWN_GRACE_MS = 4000;
  * Headless job deps for the runner: only literal job commands covered by the consent may start, and the
  * `stop` deadlines fit inside the shutdown grace so a SIGTERM can still checkpoint `cancelled`.
  */
-export function runnerJobDeps(consent: WorkflowConsent, getCoordinator: () => Promise<JobCoordinatorLike>, sandboxRequired: boolean, overrides: Partial<JobNodeDeps> = {}): JobNodeDeps {
+export function runnerJobDeps(consent: WorkflowConsent, getCoordinator: () => Promise<JobCoordinatorLike>, sandboxRequired: boolean, overrides: Partial<JobNodeDeps> = {}, orgPermissionFloor?: PermissionMode): JobNodeDeps {
   const guarded = async (): Promise<JobCoordinatorLike> => {
     const coordinator = await getCoordinator();
     return {
@@ -34,7 +34,7 @@ export function runnerJobDeps(consent: WorkflowConsent, getCoordinator: () => Pr
       stop: (id, session) => coordinator.stop(id, session),
       ...(coordinator.findByRequestId ? { findByRequestId: (requestId: string) => coordinator.findByRequestId!(requestId) } : {}),
       start: async (request: StartJobRequest, session) => {
-        if (request.invocation.mode !== "shell" || !consentCoversJob(consent, request.invocation.commandText)) {
+        if (request.invocation.mode !== "shell" || !consentCoversJob(clampConsent(consent, orgPermissionFloor), request.invocation.commandText)) {
           throw new BackgroundJobError("authorization-denied", "Job command is not covered by this workflow run's consent.");
         }
         return coordinator.start(request, session);
@@ -43,7 +43,7 @@ export function runnerJobDeps(consent: WorkflowConsent, getCoordinator: () => Pr
   };
   return {
     getCoordinator: guarded,
-    session: () => consentSession(consent, ["start", "stop"]),
+    session: () => consentSession(consent, ["start", "stop"], undefined, orgPermissionFloor),
     sandboxRequired,
     headless: true,
     stopDeadlineMs: 2500,
@@ -65,8 +65,10 @@ export interface RunnerContext {
   /**
    * Launch deps for admitting the oldest queued runs once this runner has settled/parked and released the run
    * lock (its own still-exiting job does not count toward the pool). Omitted: no admission.
+   * A queued run whose consent selected env names this process cannot resolve (the runner's environment holds
+   * only its own run's selected names) stays `queued` with an explicit reason for a capable parent/tick/TUI.
    */
-  admitQueued?: Omit<LaunchDeps, "registry" | "exitingRunId">;
+  admitQueued?: Omit<ReconcileDeps, "registry" | "exitingRunId">;
 }
 
 /** Real agent deps: the invoker (and its provider, via the app's `createProvider`) is built on first use from the run's effective config. */
@@ -85,10 +87,12 @@ export function startRunner(runId: string, ctx: RunnerContext): RunnerHandle {
   const controller = new AbortController();
   const done = (async () => {
     const run = await ctx.store.read(runId, ctx.registry);
-    const consent = run.consent;
-    if (!consent) throw new Error(`Workflow run ${runId} has no background consent; refusing to execute.`);
-    // The consent's permission mode applies, never a looser one from the runner's own config.
-    const config: AgavConfig = { ...ctx.config, permissionMode: consent.permissionMode };
+    if (!run.consent) throw new Error(`Workflow run ${runId} has no background consent; refusing to execute.`);
+    // The stored mode applies (never a looser one from the runner's own config), clamped to this process's org floor:
+    // a floor tightened since consent (or on this host) wins, and a tightened floor voids the stored coverage.
+    const floor = ctx.config.orgPermissionFloor;
+    const consent = clampConsent(run.consent, floor);
+    const config: AgavConfig = { ...ctx.config, permissionMode: effectivePermissionMode(run.consent, floor) };
     // The run's persisted requirement (from the launching process) can only be strengthened by this process's config/flags, never weakened.
     const sandboxRequired = run.sandboxRequired === true || ctx.sandboxRequired === true || ctx.config.sandboxRequired === true || isSandboxRequired();
     if (sandboxRequired) {
@@ -96,7 +100,7 @@ export function startRunner(runId: string, ctx: RunnerContext): RunnerHandle {
       // Fail closed: if the requirement cannot be made durable, nothing executes (a relaunch would otherwise lose it).
       if (run.sandboxRequired !== true) await updateRun(ctx.store, runId, ctx.registry, current => { current.sandboxRequired = true; });
     }
-    const jobDeps = runnerJobDeps(consent, ctx.getCoordinator, sandboxRequired, ctx.jobDepsOverrides);
+    const jobDeps = runnerJobDeps(run.consent, ctx.getCoordinator, sandboxRequired, ctx.jobDepsOverrides, floor);
     // Parks (waiting_approval) or finishes, then the runner exits; deciding a parked run relaunches it.
     const settled = await executeRun(ctx.store, runId, ctx.registry, config, controller.signal, createBackgroundHost(consent, { store: ctx.store, runId }), jobDeps, ctx.agentDeps ?? defaultAgentNodeDeps());
     await postRunNotification(ctx.store, settled);
@@ -134,7 +138,11 @@ export async function runWorkflowRunner(runId: string | undefined): Promise<numb
     config,
     getCoordinator: getSharedCoordinator,
     sandboxRequired: isSandboxRequired(),
-    admitQueued: { coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns },
+    // The runner's environment holds only ITS run's selected names (the supervisor's restricted env), so it must not
+    // resolve another run's selection: even a same-named variable could carry a different account's secret. An empty
+    // admissionEnv defers every queued run that selected env names (still `queued`, with a reason) to a parent CLI /
+    // schedule tick / TUI whose environment can resolve them; runs that selected none are admitted as before.
+    admitQueued: { coordinator: await getSharedCoordinator(), cliPath: await cliEntryPath(), maxConcurrentWorkflowRuns: config.maxConcurrentWorkflowRuns, admissionEnv: {} },
   });
   const onSignal = (): void => { void handle.shutdown(); };
   process.on("SIGTERM", onSignal); process.on("SIGINT", onSignal);

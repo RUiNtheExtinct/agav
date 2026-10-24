@@ -1,5 +1,6 @@
 import type { PermissionMode } from "../config/config.js";
 import type { GrantAction, SessionPolicySnapshot } from "../background-jobs/types.js";
+import { clampPermissionMode } from "../config/org-config.js";
 import { walkNodes, type WorkflowDefinition, type WorkflowNode } from "./definition.js";
 import { definitionHash } from "./store.js";
 
@@ -44,13 +45,30 @@ export function buildConsent(definition: WorkflowDefinition, cwd: string, permis
 export function consentCoversJob(consent: WorkflowConsent, command: string): boolean { return consent.capabilities.jobCommands.includes(command); }
 export function consentCoversTool(consent: WorkflowConsent, name: string): boolean { return consent.capabilities.tools.includes(name); }
 
+/** The consent's mode after the org floor: a stored consent can never run looser than the managed floor of the process executing it. */
+export function effectivePermissionMode(consent: WorkflowConsent, floor?: PermissionMode): PermissionMode { return clampPermissionMode(consent.permissionMode, floor); }
+
+/**
+ * The consent as honored under `floor`. When the floor tightens the stored mode, the approval it recorded (given
+ * under the looser mode) no longer stands in for a prompt: nothing is covered, so tool calls ask (park on a
+ * decision) and job starts are refused. Unchanged when the floor does not tighten it.
+ */
+export function clampConsent(consent: WorkflowConsent, floor?: PermissionMode): WorkflowConsent {
+  const permissionMode = effectivePermissionMode(consent, floor);
+  return permissionMode === consent.permissionMode ? consent : { ...consent, permissionMode, capabilities: { tools: [], jobCommands: [] } };
+}
+
 /**
  * Headless session for work the consent covers. The headless gate stays explicit (`actions`), deny-writes is kept,
  * and otherwise the interactive per-invocation consent stands in for the prompt no detached process can show.
  * Callers must only hand this to requests the consent covers (the runner launch, literal job commands).
+ * Under an org `floor` that tightens the stored mode the stored approval is void: `start` is dropped from the
+ * approved actions (only `stop` remains so cleanup and cancellation still work) and deny-writes is applied.
  */
-export function consentSession(consent: WorkflowConsent, actions: GrantAction[], signal?: AbortSignal): SessionPolicySnapshot {
-  return { permissionMode: consent.permissionMode === "deny-writes" ? "deny-writes" : "auto-accept", headlessApprovedActions: [...actions], ...(signal ? { signal } : {}) };
+export function consentSession(consent: WorkflowConsent, actions: GrantAction[], signal?: AbortSignal, floor?: PermissionMode): SessionPolicySnapshot {
+  const effective = effectivePermissionMode(consent, floor);
+  const approved = effective === consent.permissionMode ? actions : actions.filter(action => action !== "start");
+  return { permissionMode: effective === "deny-writes" ? "deny-writes" : "auto-accept", headlessApprovedActions: [...approved], ...(signal ? { signal } : {}) };
 }
 
 function stringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === "string"); }

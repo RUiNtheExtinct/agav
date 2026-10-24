@@ -1,3 +1,7 @@
+import { createRequire } from "node:module";
+import { extname } from "node:path";
+import { pathToFileURL } from "node:url";
+
 /** `minNodeVersion` mirrors `engines.node` in package.json; the supervisor runs on the same Node binary as the CLI. */
 export const SUPERVISOR_RUNTIME = {
   kind: "node" as const,
@@ -53,13 +57,33 @@ export function getBackgroundTickArgs(cliEntryPath?: string): string[] {
   return cliEntryPath ? [cliEntryPath, BACKGROUND_TICK_INTERNAL_FLAG] : [BACKGROUND_TICK_INTERNAL_FLAG];
 }
 
+/** Entry extensions bare Node cannot load (the `pnpm start`/`dev` source entry runs under tsx). */
+const SOURCE_ENTRY_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
+
 /**
- * Arguments that make the current executable run one headless workflow runner (`[<cli>] <flag> <runId>`).
- * Standalone binaries reexec themselves directly (their `process.argv[1]` is a virtual, non-executable path);
- * Node installs must prepend the CLI entry script. Pass `cliEntryPath` only for Node installs.
+ * Node arguments a re-executed child needs to load `entry`. Compiled `.js` entries need none. A TypeScript source
+ * entry gets exactly one trusted loader: the `tsx` package resolved from this installation. The parent's
+ * `process.execArgv` is never forwarded (it may carry arbitrary inspector/permission/preload flags).
  */
-export function getWorkflowRunnerArgs(runId: string, cliEntryPath?: string): string[] {
-  return cliEntryPath ? [cliEntryPath, WORKFLOW_RUNNER_INTERNAL_FLAG, runId] : [WORKFLOW_RUNNER_INTERNAL_FLAG, runId];
+export function getNodeEntryLoaderArgs(entry: string, resolveLoader: () => string = () => createRequire(import.meta.url).resolve("tsx")): string[] {
+  if (!SOURCE_ENTRY_EXTENSIONS.has(extname(entry).toLowerCase())) return [];
+  let loader: string;
+  try {
+    loader = resolveLoader();
+  } catch (error) {
+    throw new Error(`Cannot re-execute the TypeScript entry ${entry}: the tsx loader is not installed (${error instanceof Error ? error.message : String(error)}). Run the compiled build (build/cli.js) instead.`);
+  }
+  return ["--import", pathToFileURL(loader).href];
+}
+
+/**
+ * Arguments that make the current executable run one headless workflow runner (`[<loader args>] [<cli>] <flag> <runId>`).
+ * Standalone binaries reexec themselves directly (their `process.argv[1]` is a virtual, non-executable path);
+ * Node installs must prepend the CLI entry script. Pass `cliEntryPath` only for Node installs;
+ * `nodeArgs` (see `getNodeEntryLoaderArgs`) precede the entry and are ignored without one.
+ */
+export function getWorkflowRunnerArgs(runId: string, cliEntryPath?: string, nodeArgs: readonly string[] = []): string[] {
+  return cliEntryPath ? [...nodeArgs, cliEntryPath, WORKFLOW_RUNNER_INTERNAL_FLAG, runId] : [WORKFLOW_RUNNER_INTERNAL_FLAG, runId];
 }
 
 /** Bun standalone module URLs are virtual, not externally executable JS files. */

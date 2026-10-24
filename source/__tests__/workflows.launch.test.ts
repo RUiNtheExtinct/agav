@@ -1,8 +1,10 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import type { PlatformCapabilities } from "../background-jobs/types.js";
 import { assertBackgroundRunsAvailable } from "../workflows/background.js";
 import { buildConsent } from "../workflows/grant.js";
-import { getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
+import { getNodeEntryLoaderArgs, getWorkflowRunnerArgs, isStandaloneBinary } from "../background-jobs/packaging/manifest.js";
 import { launchRun, runnerLaunchSession, runnerStartRequest } from "../workflows/launch.js";
 import { reconcileRuns } from "../workflows/reconcile.js";
 import { createRun } from "../workflows/runtime.js";
@@ -143,4 +145,39 @@ describe("runner invocation args", () => {
     expect(request.invocation).toEqual({ mode: "direct", executable: process.execPath, args: ["--internal-workflow-runner", run.id] });
     expect(request.requestId).toBe(`wf-run-${run.id}-1`);
   });
+
+  it("TypeScript source entry: prepends only the resolved tsx loader, never the parent's execArgv", async () => {
+    const run = await backgroundRun();
+    run.runner = { attempt: 1, requestId: runnerRequestId(run.id, 1), relaunches: 0 };
+    const original = process.execArgv;
+    process.execArgv = ["--inspect=0", "--require", "/evil.cjs"];
+    try {
+      const { invocation } = runnerStartRequest(run, "/repo/source/cli.tsx", false);
+      if (invocation.mode !== "direct") throw new Error("expected direct invocation");
+      expect(invocation.args).toHaveLength(5);
+      expect(invocation.args.slice(0, 1)).toEqual(["--import"]);
+      expect(invocation.args[1]).toMatch(/^file:\/\/.*tsx/);
+      expect(invocation.args.slice(2)).toEqual(["/repo/source/cli.tsx", "--internal-workflow-runner", run.id]);
+      expect(invocation.args.join(" ")).not.toMatch(/evil|inspect/);
+    } finally { process.execArgv = original; }
+  });
+
+  it("compiled entries and standalone binaries get no loader args", () => {
+    expect(getNodeEntryLoaderArgs("/opt/agav/build/cli.js")).toEqual([]);
+    expect(getNodeEntryLoaderArgs("C:\\agav\\build\\cli.mjs")).toEqual([]);
+    expect(getNodeEntryLoaderArgs("/x/cli.tsx", () => "/nm/tsx/dist/loader.mjs")).toEqual(["--import", pathToFileURL("/nm/tsx/dist/loader.mjs").href]);
+    expect(() => getNodeEntryLoaderArgs("/x/cli.tsx", () => { throw new Error("nope"); })).toThrow(/tsx loader is not installed/);
+  });
+
+  it("the source entry request loads under a real node child (no ERR_UNKNOWN_FILE_EXTENSION)", async () => {
+    const run = await backgroundRun();
+    run.runner = { attempt: 1, requestId: runnerRequestId(run.id, 1), relaunches: 0 };
+    const sourceEntry = fileURLToPath(new URL("../cli.tsx", import.meta.url));
+    const { invocation } = runnerStartRequest(run, sourceEntry, false);
+    if (invocation.mode !== "direct") throw new Error("expected direct invocation");
+    const child = spawnSync(invocation.executable, invocation.args.map(arg => arg === run.id ? "no-such-run-id" : arg), { cwd: run.cwd, encoding: "utf8", timeout: 60_000, env: { ...process.env, AGAV_HOME: run.cwd } });
+    const output = `${child.stderr}${child.stdout}`;
+    expect(output).not.toContain("ERR_UNKNOWN_FILE_EXTENSION");
+    expect(output).toContain("workflow runner failed"); // reached cli.tsx's runner branch, not a loader failure
+  }, 90_000);
 });

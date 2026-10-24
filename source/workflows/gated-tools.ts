@@ -53,11 +53,21 @@ export async function gatedToolExecute(registry: ToolRegistry, name: string, inp
  */
 export async function confirmAgentTool(name: string, input: Record<string, unknown>, config: AgavConfig, signal: AbortSignal, host: WorkflowExecutionHost | undefined, callContext: ToolCallContext): Promise<boolean> {
   if (signal.aborted) return false;
-  if (SAFE_TOOLS.has(name)) return true;
-  if (name === "run_command" && isDestructiveCommand(String(input.command ?? ""))) return false;
-  if (config.permissionMode === "deny-writes") return false;
-  if (config.allowedTools?.length && !allowed(name, input, config.allowedTools)) return false;
-  if (config.permissionMode === "auto-accept" || allowed(name, input, config.allowedTools)) return true;
+  const verdict = agentToolVerdict(name, input, config);
+  if (verdict !== "ask") return verdict === "allow";
   if (!host) return false;
   return host.confirmTool(name, input, signal, { ...callContext, kind: "agent_tool_consent" });
+}
+
+/**
+ * Host-independent part of `confirmAgentTool`: `deny` (destructive command, deny-writes, or outside the config's
+ * allowedTools incl. path-scoped rules), `allow` (SAFE tool, auto-accept or allowlisted) or `ask` the host.
+ */
+export function agentToolVerdict(name: string, input: Record<string, unknown>, config: AgavConfig): "allow" | "deny" | "ask" {
+  if (SAFE_TOOLS.has(name)) return "allow";
+  if (name === "run_command" && isDestructiveCommand(String(input.command ?? ""))) return "deny";
+  if (config.permissionMode === "deny-writes") return "deny";
+  if (config.allowedTools?.length && !allowed(name, input, config.allowedTools)) return "deny";
+  if (config.permissionMode === "auto-accept" || allowed(name, input, config.allowedTools)) return "allow";
+  return "ask";
 }

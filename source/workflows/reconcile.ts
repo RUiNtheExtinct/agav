@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { isLiveLifecycle, isTerminalLifecycle, BackgroundJobError, DEFAULT_RESOURCE_LIMITS } from "../background-jobs/types.js";
 import { createBuiltinToolRegistry } from "../tools/registry-factory.js";
 import { WORKFLOW_TOOLS } from "./definition.js";
-import { appendEvent } from "./events.js";
+import { appendEvent, readEvents } from "./events.js";
 import { getNodeExecutor, retriesOnResume } from "./executors.js";
 import { findRunnerJob, launchRun, liveRunnerCount, updateRun, DEFAULT_MAX_CONCURRENT_WORKFLOW_RUNS, type LaunchDeps } from "./launch.js";
 import { runnerRequestId, scopedCheckpoints, type WorkflowRun, type WorkflowStore } from "./store.js";
@@ -24,6 +24,16 @@ export type ReconcileAction =
   | "timed_out" // parked run whose deadlineAt passed with no live runner
   | "pruned" // terminal run older than the retention window: checkpoint and run files deleted
   | "busy"; // run lock held: a live writer owns it
+
+/**
+ * Launch deps plus the environment capability of the process doing the admitting. The coordinator resolves a run's
+ * selected `envInherit` names from ITS process environment, so a restricted context (a finishing runner only holds
+ * its own run's selected names) cannot start a run that selected others: the values would be silently dropped.
+ */
+export interface ReconcileDeps extends LaunchDeps {
+  /** Environment the launched runner's selected names are resolved from; defaults to `process.env` (what the coordinator reads). Values are only checked for presence, never stored. */
+  admissionEnv?: Readonly<Record<string, string | undefined>>;
+}
 
 export interface ReconcileResult { runId: string; action: ReconcileAction; reason?: string }
 
@@ -49,7 +59,22 @@ function hasUncertainNode(run: WorkflowRun): boolean {
 
 function isLockHeld(error: unknown): boolean { return error instanceof BackgroundJobError && error.code === "lock-held"; }
 
-async function markInterrupted(store: WorkflowStore, deps: LaunchDeps, runId: string, requestId: string, relaunch: boolean, reason: string): Promise<WorkflowRun | undefined> {
+/** Names the run's consent selected that this context cannot resolve (names only; never values). */
+function missingEnvNames(run: WorkflowRun, deps: ReconcileDeps): string[] {
+  const env = deps.admissionEnv ?? process.env;
+  return (run.consent?.envNames ?? []).filter(name => env[name] === undefined);
+}
+function deferredReason(missing: string[]): string {
+  return `waiting for a launch context that has the selected environment variable(s): ${missing.join(", ")}`;
+}
+/** Records why a run could not be started here, once per distinct reason (reconcile runs repeatedly). */
+async function noteDeferred(store: WorkflowStore, run: WorkflowRun, reason: string): Promise<void> {
+  const last = (await readEvents(store, run.id).catch(() => [])).filter(event => event.type === "run_status").at(-1);
+  if (last?.type === "run_status" && last.status === run.status && last.reason === reason) return;
+  await appendEvent(store, run.id, { type: "run_status", status: run.status, reason });
+}
+
+async function markInterrupted(store: WorkflowStore, deps: ReconcileDeps, runId: string, requestId: string, relaunch: boolean, reason: string): Promise<WorkflowRun | undefined> {
   let changed = false;
   const run = await updateRun(store, runId, deps.registry!, current => {
     // Only act on the snapshot we judged: same attempt, still non-terminal and not parked.
@@ -67,7 +92,7 @@ async function markInterrupted(store: WorkflowStore, deps: LaunchDeps, runId: st
 }
 
 /** The runner is dead, so this lock holder is the single writer: park interrupted tool nodes on inbox decisions. */
-async function parkUncertain(store: WorkflowStore, deps: LaunchDeps, runId: string, requestId: string, reason: string): Promise<WorkflowRun | undefined> {
+async function parkUncertain(store: WorkflowStore, deps: ReconcileDeps, runId: string, requestId: string, reason: string): Promise<WorkflowRun | undefined> {
   const run = await store.lock(runId, async () => {
     const current = await store.read(runId, deps.registry!);
     if (current.runner?.requestId !== requestId || !["running", "queued"].includes(current.status)) return undefined;
@@ -83,13 +108,15 @@ async function parkUncertain(store: WorkflowStore, deps: LaunchDeps, runId: stri
 }
 
 /** Applies the reconcile decision table to one run. */
-export async function reconcileRun(store: WorkflowStore, runId: string, deps: LaunchDeps): Promise<ReconcileResult> {
-  const full: LaunchDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
+export async function reconcileRun(store: WorkflowStore, runId: string, deps: ReconcileDeps): Promise<ReconcileResult> {
+  const full: ReconcileDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
   const run = await store.read(runId, full.registry!);
   if (run.runner && run.consent && run.status === "waiting_approval" && await hasUnappliedDecision(store, run)) {
     // A decision landed while the parking runner was still exiting: relaunch so it is applied (idempotent).
     const job = await findRunnerJob(full.coordinator, run);
     if (job && isLiveLifecycle(job.state)) return { runId, action: "none" };
+    const missing = missingEnvNames(run, full);
+    if (missing.length > 0) { await noteDeferred(store, run, deferredReason(missing)); return { runId, action: "none", reason: deferredReason(missing) }; } // stays parked; a capable context relaunches it
     try { await launchRun(store, runId, full); } catch (error) { if (isLockHeld(error)) return { runId, action: "busy" }; throw error; }
     return { runId, action: "relaunched", reason: "decided while parked" };
   }
@@ -104,6 +131,12 @@ export async function reconcileRun(store: WorkflowStore, runId: string, deps: La
       return { runId, action: marked ? "interrupted-unknown" : "none", reason: `runner ${job.state}` };
     }
     const reason = job ? `runner job ${job.jobId} ${job.state}` : "runner job not found";
+    const missing = missingEnvNames(run, full);
+    if (missing.length > 0 && !hasUncertainNode(run)) {
+      // Untouched (not interrupted: a non-running/queued run is never reconciled again): a capable context relaunches it.
+      await noteDeferred(store, run, deferredReason(missing));
+      return { runId, action: "none", reason: `${deferredReason(missing)} (${reason})` };
+    }
     if (hasUncertainNode(run)) {
       // Never replayed: the run parks on an `uncertain_tool` decision; deciding it relaunches the runner.
       const parked = await parkUncertain(store, full, runId, run.runner.requestId, reason);
@@ -121,7 +154,15 @@ export async function reconcileRun(store: WorkflowStore, runId: string, deps: La
   return { runId, action: "relaunched" };
 }
 
-async function admit(store: WorkflowStore, runId: string, deps: LaunchDeps): Promise<ReconcileResult> {
+async function admit(store: WorkflowStore, runId: string, deps: ReconcileDeps): Promise<ReconcileResult> {
+  const run = await store.read(runId, deps.registry!);
+  const missing = missingEnvNames(run, deps);
+  if (missing.length > 0) {
+    // Never start with the selected env silently dropped: stay queued, for a context that can resolve it.
+    const reason = deferredReason(missing);
+    await noteDeferred(store, run, reason);
+    return { runId, action: "queued", reason };
+  }
   try {
     const result = await launchRun(store, runId, deps);
     return { runId, action: result.status === "queued" ? "queued" : "admitted" };
@@ -208,8 +249,8 @@ async function pruneRun(store: WorkflowStore, runId: string, deps: LaunchDeps, c
  * Admits queued runs FIFO by `createdAt` while the workflow-runner pool has room. `deps.exitingRunId` names a
  * runner that has settled and released its lock but whose process is still alive: it does not hold a slot.
  */
-export async function admitQueuedRuns(store: WorkflowStore, deps: LaunchDeps): Promise<ReconcileResult[]> {
-  const full: LaunchDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
+export async function admitQueuedRuns(store: WorkflowStore, deps: ReconcileDeps): Promise<ReconcileResult[]> {
+  const full: ReconcileDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
   const queued: WorkflowRun[] = [];
   for (const id of await store.listIds()) {
     const run = await store.read(id, full.registry!).catch(() => undefined);
@@ -231,8 +272,8 @@ export async function admitQueuedRuns(store: WorkflowStore, deps: LaunchDeps): P
  * runs past the retention window are pruned. Per-run errors are reported, never thrown, so one bad run cannot
  * block others.
  */
-export async function reconcileRuns(store: WorkflowStore, deps: LaunchDeps, opts: ReconcileOptions = {}): Promise<ReconcileResult[]> {
-  const full: LaunchDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
+export async function reconcileRuns(store: WorkflowStore, deps: ReconcileDeps, opts: ReconcileOptions = {}): Promise<ReconcileResult[]> {
+  const full: ReconcileDeps = { ...deps, registry: deps.registry ?? createBuiltinToolRegistry(WORKFLOW_TOOLS) };
   const now = opts.now ?? Date.now();
   const runs: WorkflowRun[] = [];
   const terminal: WorkflowRun[] = [];

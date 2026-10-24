@@ -141,7 +141,6 @@ async function executeLoop(ctx: NodeExecutionContext): Promise<NodeResult> {
     if (remaining <= 0) fire(); else timer = setTimeout(fire, remaining);
   }
   const timeoutError = `Loop timed out after ${node.timeoutSeconds}s.`;
-  let resuming = ctx.resuming;
   try {
     for (let i = cp.iteration ?? 0; i < max; i++) {
       let it = cp.iterations[i];
@@ -154,9 +153,10 @@ async function executeLoop(ctx: NodeExecutionContext): Promise<NodeResult> {
       }
       const loop = loopContext(node, cp.iterations, i);
       if (!TERMINAL.has(it.status)) {
-        // Resumed (or re-dispatched after waiting) iteration: continue it in place.
-        const resume = resuming ? normalizeResumedBody(body, it.nodes) : undefined;
-        resuming = false;
+        // Re-entered iteration (resume, or re-dispatch after waiting): continue it in place. Interrupted body work is
+        // normalized on every re-entry, not only for the loop `env.resume` selected: with several running root loops
+        // only one is the resume target, and a running child left unnormalized in the others would be stranded.
+        const resume = normalizeResumedBody(body, it.nodes);
         it.status = "running";
         await save();
         const status = await ctx.runSubScope({
