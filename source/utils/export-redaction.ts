@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from "node:util";
 
 const REDACTED = "***REDACTED***";
 const CREDENTIAL_KEY = /^(?:[a-z0-9]+_)*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|client[_-]?secret|authorization)$/i;
-const CREDENTIAL_ASSIGNMENT = /(\b(?:[a-z0-9]+_)*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|client[_-]?secret|authorization)\b["']?\s*[:=]\s*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|Bearer[ \t]+[a-z0-9._~+\/-]+=*|[^\s,;}\])"'`]+)/gi;
+const CREDENTIAL_ASSIGNMENT = /(\b(?:[a-z0-9]+_)*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|client[_-]?secret|authorization)\b["']?[ \t]*[:=][ \t]*)("(?:\\.|[^"\\\r\n])*"|'(?:\\.|[^'\\\r\n])*'|Bearer[ \t]+[a-z0-9._~+\/-]+=*|[^\s,;}\])"'`]+)/gi;
 
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

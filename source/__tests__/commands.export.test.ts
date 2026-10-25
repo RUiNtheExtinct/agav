@@ -177,6 +177,21 @@ describe("export command", () => {
     expect(input[2].content[0].toolResult).toContain("sk-abcdefgh");
   });
 
+  it.each(["sanitize", "json sanitize"])("redacts credentials after empty assignments in messages and tool output (%s)", async (args) => {
+    const input = messages();
+    input[0].content[0].text = 'OPENAI_API_KEY=\nCLIENT_SECRET = "ordinary-secret-value"';
+    input[2].content[0].toolResult = "api_key:\r\npassword: ordinary-secret-value";
+    await exportCommand.execute(args, context(input));
+    expect(output()).not.toContain("ordinary-secret-value");
+    if (args.includes("json")) {
+      expect(json().messages[0].content[0].text).toBe('OPENAI_API_KEY=\nCLIENT_SECRET = "***REDACTED***"');
+      expect(json().messages[2].content[0].toolResult).toBe("api_key:\r\npassword: ***REDACTED***");
+    } else {
+      expect(output()).toContain('OPENAI_API_KEY=\nCLIENT_SECRET = "***REDACTED***"');
+      expect(output()).toContain("api_key:\r\npassword: ***REDACTED***");
+    }
+  });
+
   it.each([false, true])("handles images and opaque provider state (sanitized=%s)", async (sanitize) => {
     const image = { type: "image" as const, imageData: "c2VjcmV0", imageMediaType: "image/png", imageWidth: 20, imageHeight: 10 };
     const input: Message[] = [{ role: "user", content: [

@@ -27,6 +27,17 @@ describe("export redaction", () => {
     expect(redactor.text("\x1b]8;;https://example.test/?token=hidden\x1b\\label\x1b]8;;\x1b\\")).toBe("label");
   });
 
+  it.each(["\n", "\r\n"])("keeps empty assignments on their own line (%j)", (newline) => {
+    expect(redactor.text(`OPENAI_API_KEY=${newline}CLIENT_SECRET = "ordinary-secret-value"`))
+      .toBe(`OPENAI_API_KEY=${newline}CLIENT_SECRET = "${MASK}"`);
+    expect(redactor.text(`api_key:${newline}password: ordinary-secret-value`))
+      .toBe(`api_key:${newline}password: ${MASK}`);
+    expect(redactor.text(`api_key: \t${newline}${newline}\tpassword\t: \tordinary-secret-value`))
+      .toBe(`api_key: \t${newline}${newline}\tpassword\t: \t${MASK}`);
+    expect(redactor.text(`api_key${newline}: public text${newline}password: ordinary-secret-value`))
+      .toBe(`api_key${newline}: public text${newline}password: ${MASK}`);
+  });
+
   it("keeps authorization output readable with one replacement per credential", () => {
     expect(redactor.text("Authorization: Bearer abc.def/ghi==")).toBe(`Authorization: ${MASK}`);
     expect(redactor.text('"Authorization": "Bearer abc.def/ghi=="')).toBe(`"Authorization": "${MASK}"`);
