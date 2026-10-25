@@ -82,7 +82,8 @@ describe("worker Git integration", () => {
     const tree = await worker();
     expect(tree.parentPath).toBe(git(repo, "rev-parse", "--show-toplevel"));
     expect(tree.baseCommit).toBe(git(repo, "rev-parse", "HEAD"));
-    expect(tree.path).toBe(join(tree.parentPath, ".agav-worktrees", "test"));
+    expect(dirname(tree.path)).toBe(join(tree.parentPath, ".agav-worktrees"));
+    expect(tree.branchName).toMatch(/^agav-sa-test-[0-9a-f-]{36}$/);
   });
 
   it.each(["clean", "ignored-only"])("treats a %s worker as a no-op", async (kind) => {
@@ -154,7 +155,7 @@ describe("worker Git integration", () => {
     expectParentClean();
   });
 
-  it("aborts a conflicting merge without leaving partial files or conflict state", async () => {
+  it("rejects a conflicting merge before leaving partial files or conflict state", async () => {
     const tree = await worker();
     write(tree.path, "existing.txt", "worker\n");
     write(tree.path, "sentinel.txt");
@@ -244,6 +245,89 @@ describe("worker Git integration", () => {
     expect(result.error).toContain("still has uncommitted changes");
     expect(readFileSync(join(tree.path, "existing.txt"), "utf8")).toBe("hook edit\n");
     expectParentClean(tree.baseCommit);
+  });
+
+  it.each(["default", "true"])("protects local output at a directory-rename destination (%s)", async (setting) => {
+    write(repo, ".gitignore", ".agav-worktrees/\n*.local\n");
+    write(repo, "old/tracked.txt", "rename anchor\n");
+    commit(repo, "rename base");
+    const tree = await worker();
+    git(repo, "mv", "old", "new");
+    const parent = commit(repo, "parent directory rename");
+    write(repo, "new/output.local", "parent-only sentinel\n");
+    write(tree.path, "old/output.local", "worker output\n");
+    git(tree.path, "add", "-f", "old/output.local");
+    commit(tree.path);
+    if (setting !== "default") git(repo, "config", "merge.directoryRenames", setting);
+    const result = await worktrees.applyWorktreeChanges(tree);
+    expect(readFileSync(join(repo, "new/output.local"), "utf8")).toBe("parent-only sentinel\n");
+    expect(result.applied).toBe(false);
+    expectParentClean(parent);
+    expect(git(repo, "show", `${tree.branchName}:old/output.local`)).toBe("worker output");
+  });
+
+  it.for([
+    ["output.local", "OUTPUT.LOCAL"],
+    ["outpút.local", "OUTPÚT.LOCAL"],
+    ["fólder/output.local", "FÓLDER/OUTPUT.LOCAL"],
+    ["folder/output.local", "FOLDER/OUTPUT.LOCAL"],
+    ["folder", "FOLDER/output.local"],
+    ["folder/output.local", "FOLDER"],
+  ])("protects case-equivalent local paths: %s vs %s", async ([local, incoming], context) => {
+    write(repo, "case-probe", "probe");
+    const insensitive = existsSync(join(repo, "CASE-PROBE"));
+    rmSync(join(repo, "case-probe"));
+    if (!insensitive) context.skip();
+    write(repo, ".gitignore", ".agav-worktrees/\n*.local\nfolder\nFOLDER\n");
+    commit(repo, "ignore local output");
+    const tree = await worker();
+    write(tree.path, incoming, "worker output\n");
+    git(tree.path, "add", "-f", incoming);
+    commit(tree.path);
+    write(repo, local, "parent-only sentinel\n");
+    const result = await worktrees.applyWorktreeChanges(tree);
+    expect(readFileSync(join(repo, local), "utf8")).toBe("parent-only sentinel\n");
+    expect(result.applied).toBe(false);
+    expectParentClean(tree.baseCommit);
+  });
+
+  it("allows distinct case-only paths on a case-sensitive filesystem", async (context) => {
+    write(repo, "case-probe", "probe");
+    const insensitive = existsSync(join(repo, "CASE-PROBE"));
+    rmSync(join(repo, "case-probe"));
+    if (insensitive) context.skip();
+    write(repo, ".gitignore", ".agav-worktrees/\noutput.local\n");
+    commit(repo, "ignore local output");
+    const tree = await worker();
+    write(tree.path, "OUTPUT.LOCAL", "worker output\n");
+    commit(tree.path);
+    write(repo, "output.local", "parent-only sentinel\n");
+    expect(await worktrees.applyWorktreeChanges(tree)).toEqual({ applied: true });
+    expect(readFileSync(join(repo, "output.local"), "utf8")).toBe("parent-only sentinel\n");
+    expect(readFileSync(join(repo, "OUTPUT.LOCAL"), "utf8")).toBe("worker output\n");
+    expectParentClean();
+  });
+
+  it("distinguishes a non-Git directory from a repository without a readable HEAD", async () => {
+    const empty = mkdtempSync(join(tmpdir(), "agav-not-git-"));
+    try {
+      process.chdir(empty);
+      expect(await worktrees.createWorktree("test")).toBeNull();
+      git(empty, "init", "-b", "parent");
+      await expect(worktrees.createWorktree("test")).rejects.toThrow("without a readable HEAD");
+    } finally {
+      process.chdir(repo);
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+
+  it("allocates different worktrees when a later session reuses the same worker ID", async () => {
+    const retained = await worker("sa-1");
+    write(retained.path, "retained.txt");
+    const next = await worker("sa-1");
+    expect(next.path).not.toBe(retained.path);
+    expect(next.branchName).not.toBe(retained.branchName);
+    expect(readFileSync(join(retained.path, "retained.txt"), "utf8")).toBe("worker sentinel\n");
   });
 
   it("leaves an existing parent merge alone", async () => {
@@ -393,12 +477,18 @@ function loopWith(work: () => void): void {
 describe("subagent completion with real worktrees", () => {
   it("delivers new files before cleaning only its own worktree and branch", async () => {
     const other = await worker("other");
-    loopWith(() => write(process.cwd(), "nested/new file.txt"));
+    let workerPath = "";
+    let workerBranch = "";
+    loopWith(() => {
+      workerPath = process.cwd();
+      workerBranch = git(workerPath, "symbolic-ref", "--short", "HEAD");
+      write(workerPath, "nested/new file.txt");
+    });
     const result = await createSubagentTool(deps()).execute({ title: "Create", task: "create a file" });
     expect(result).toEqual({ output: "Worker finished.", isError: false });
     expect(existsSync(join(repo, "nested/new file.txt"))).toBe(true);
-    expect(existsSync(join(repo, ".agav-worktrees", "sa-1"))).toBe(false);
-    expect(git(repo, "branch", "--list", "agav-sa-sa-1")).toBe("");
+    expect(existsSync(workerPath)).toBe(false);
+    expect(git(repo, "branch", "--list", workerBranch)).toBe("");
     expect(existsSync(other.path)).toBe(true);
     expect(git(repo, "branch", "--list", other.branchName)).toContain(other.branchName);
     expectParentClean();
@@ -408,8 +498,10 @@ describe("subagent completion with real worktrees", () => {
     const base = git(repo, "rev-parse", "HEAD");
     let parentHead = base;
     let retainedPath = "";
+    let retainedBranch = "";
     loopWith(() => {
       retainedPath = process.cwd();
+      retainedBranch = git(retainedPath, "symbolic-ref", "--short", "HEAD");
       write(retainedPath, "sentinel.txt");
       if (failure === "conflict") {
         write(retainedPath, "existing.txt", "worker\n");
@@ -426,11 +518,11 @@ describe("subagent completion with real worktrees", () => {
     expect(result.output).toContain("Worker finished.");
     expect(result.output).toContain("automatic integration failed");
     expect(result.output).toContain(retainedPath);
-    expect(result.output).toContain("Branch: agav-sa-sa-1");
+    expect(result.output).toContain(`Branch: ${retainedBranch}`);
     expect(readFileSync(join(retainedPath, "sentinel.txt"), "utf8")).toBe("worker sentinel\n");
-    expect(git(repo, "branch", "--list", "agav-sa-sa-1")).toContain("agav-sa-sa-1");
+    expect(git(repo, "branch", "--list", retainedBranch)).toContain(retainedBranch);
     if (failure === "conflict" || failure === "integration-commit") {
-      expect(git(repo, "show", "agav-sa-sa-1:sentinel.txt")).toBe("worker sentinel");
+      expect(git(repo, "show", `${retainedBranch}:sentinel.txt`)).toBe("worker sentinel");
     }
     const updates = vi.mocked(config.onProgressUpdate).mock.calls.flatMap(([items]) => items);
     expect(updates.at(-1)?.status).toBe("error");
@@ -439,10 +531,59 @@ describe("subagent completion with real worktrees", () => {
     expectParentClean(parentHead);
   });
 
+  it("keeps a recreated tool isolated while an earlier worker is retained", async () => {
+    const base = git(repo, "rev-parse", "HEAD");
+    let retainedPath = "";
+    let retainedBranch = "";
+    loopWith(() => {
+      retainedPath = process.cwd();
+      retainedBranch = git(retainedPath, "symbolic-ref", "--short", "HEAD");
+      write(retainedPath, "retained.txt");
+      hook("pre-commit", "exit 1");
+    });
+    const failed = await createSubagentTool(deps()).execute({ title: "First", task: "create a file" });
+    expect(failed.isError).toBe(true);
+    rmSync(join(hooks, "pre-commit"));
+
+    const controller = new AbortController();
+    let nextPath = "";
+    let nextBranch = "";
+    loopWith(() => {
+      nextPath = process.cwd();
+      nextBranch = git(nextPath, "symbolic-ref", "--short", "HEAD");
+      write(nextPath, "cancelled.txt");
+      controller.abort();
+    });
+    const cancelled = await createSubagentTool(deps(controller.signal)).execute({ title: "Next", task: "create a file" });
+    expect(cancelled).toEqual({ output: "Subagent cancelled.", isError: true });
+    expect(nextPath).not.toBe(retainedPath);
+    expect(existsSync(nextPath)).toBe(false);
+    expect(git(repo, "branch", "--list", nextBranch)).toBe("");
+    expect(readFileSync(join(retainedPath, "retained.txt"), "utf8")).toBe("worker sentinel\n");
+    expect(git(repo, "branch", "--list", retainedBranch)).toContain(retainedBranch);
+    expect(existsSync(join(repo, "cancelled.txt"))).toBe(false);
+    expectParentClean(base);
+  });
+
+  it("stops before running the worker if Git cannot create an isolated worktree", async () => {
+    write(repo, ".git/worktrees", "block Git worktree metadata\n");
+    const run = vi.mocked(runAgentLoop);
+    run.mockClear();
+    loopWith(() => write(process.cwd(), "should-not-exist.txt"));
+    const result = await createSubagentTool(deps()).execute({ title: "Create", task: "create a file" });
+    expect(result.isError).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+    expect(existsSync(join(repo, "should-not-exist.txt"))).toBe(false);
+  });
+
   it("discards cancelled committed and untracked work without merging", async () => {
     const base = git(repo, "rev-parse", "HEAD");
     const controller = new AbortController();
+    let workerPath = "";
+    let workerBranch = "";
     loopWith(() => {
+      workerPath = process.cwd();
+      workerBranch = git(workerPath, "symbolic-ref", "--short", "HEAD");
       write(process.cwd(), "committed.txt");
       commit(process.cwd());
       write(process.cwd(), "untracked.txt");
@@ -453,7 +594,7 @@ describe("subagent completion with real worktrees", () => {
     expectParentClean(base);
     expect(existsSync(join(repo, "committed.txt"))).toBe(false);
     expect(existsSync(join(repo, "untracked.txt"))).toBe(false);
-    expect(existsSync(join(repo, ".agav-worktrees", "sa-1"))).toBe(false);
-    expect(git(repo, "branch", "--list", "agav-sa-sa-1")).toBe("");
+    expect(existsSync(workerPath)).toBe(false);
+    expect(git(repo, "branch", "--list", workerBranch)).toBe("");
   });
 });

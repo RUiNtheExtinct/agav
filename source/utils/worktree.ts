@@ -1,10 +1,11 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 function run(args: string[], cwd: string, trimOutput = true): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve) => {
-    execFile("git", args, { timeout: 15000, cwd }, (err, stdout, stderr) => {
+    execFile("git", args, { timeout: 15000, cwd, env: { ...process.env, LC_ALL: "C" } }, (err, stdout, stderr) => {
       resolve({
         stdout: trimOutput ? (stdout ?? "").trim() : (stdout ?? ""),
         stderr: (stderr ?? "").trim(),
@@ -31,20 +32,27 @@ export interface WorktreeIntegrationResult {
 export async function createWorktree(name: string): Promise<WorkerWorktree | null> {
   const cwd = process.cwd();
   const root = await run(["rev-parse", "--show-toplevel"], cwd);
-  if (root.exitCode !== 0) return null;
+  if (root.exitCode !== 0) {
+    if (root.stderr.includes("not a git repository")) return null;
+    throw new Error(`Cannot inspect repository for an isolated worker: ${root.stderr}`);
+  }
   const base = await run(["rev-parse", "HEAD"], root.stdout);
-  if (base.exitCode !== 0) return null;
+  if (base.exitCode !== 0) throw new Error(`Cannot create an isolated worker without a readable HEAD: ${base.stderr}`);
 
+  // Tool IDs restart at sa-1 in a new session. Retained recovery trees must not
+  // collide with later workers, even when the tool instance is recreated.
+  const uniqueName = `${name}-${randomUUID()}`;
   const worktree: WorkerWorktree = {
-    path: join(root.stdout, ".agav-worktrees", name),
-    branchName: `agav-sa-${name}`,
+    path: join(root.stdout, ".agav-worktrees", uniqueName),
+    branchName: `agav-sa-${uniqueName}`,
     parentPath: root.stdout,
     baseCommit: base.stdout,
   };
   const result = await run([
     "worktree", "add", worktree.path, "-b", worktree.branchName, worktree.baseCommit,
   ], worktree.parentPath);
-  return result.exitCode === 0 ? worktree : null;
+  if (result.exitCode !== 0) throw new Error(`Cannot create an isolated worker worktree: ${result.stderr}`);
+  return worktree;
 }
 
 export async function removeWorktree(worktree: WorkerWorktree): Promise<void> {
@@ -131,33 +139,66 @@ export async function applyWorktreeChanges(
   }
   const parentHead = await run(["rev-parse", "HEAD"], parentPath);
   if (parentHead.exitCode !== 0) return failure("Failed to read parent commit", parentHead.stderr);
-  // Git's merge strategies can overwrite ignored files even with
-  // --no-overwrite-ignore. Check new paths and file/directory collisions against
-  // all local untracked files, including ignored files, before touching the parent.
+  // Preview with the same ort strategy used below, without changing the parent
+  // index or worktree. A direct tip-to-tip diff misses rename-derived destinations.
+  // Conflicts are rejected here: even merge --abort can delete ignored local files.
+  const preview = await run([
+    "merge-tree", "--write-tree", "--no-messages", parentHead.stdout, tip.stdout,
+  ], parentPath);
+  if (preview.exitCode === 1) return failure("Worker branch conflicts with the parent");
+  if (preview.exitCode !== 0) return failure("Cannot preview worker merge; Git with merge-tree --write-tree support is required", preview.stderr);
   const added = await run([
-    "diff", "--no-renames", "--name-only", "--diff-filter=A", "-z", parentHead.stdout, tip.stdout, "--",
+    "diff", "--no-renames", "--name-only", "--diff-filter=A", "-z", parentHead.stdout, preview.stdout, "--",
   ], parentPath, false);
   if (added.exitCode !== 0) return failure("Failed to inspect incoming paths", added.stderr);
   const addedPaths = added.stdout.split("\0").filter(Boolean);
   if (addedPaths.length > 0) {
-    const scopes = new Set<string>();
-    for (const file of addedPaths) {
+    const prefixes = (file: string): string[] => {
       const parts = file.split("/");
-      for (let i = 1; i <= parts.length; i++) scopes.add(parts.slice(0, i).join("/"));
+      return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+    };
+    const identities = new Map<string, string | undefined>();
+    const identity = (file: string): string | undefined => {
+      if (!identities.has(file)) {
+        let value: string | undefined;
+        try {
+          const stat = lstatSync(join(parentPath, file), { bigint: true });
+          value = `${stat.dev}:${stat.ino}`;
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
+        }
+        identities.set(file, value);
+      }
+      return identities.get(file);
+    };
+    const samePath = (a: string, b: string): boolean =>
+      a === b || (identity(a) !== undefined && identity(a) === identity(b));
+    // Resolve top-level scopes through the filesystem, not Git's ASCII-only
+    // case folding. Listing their descendants also covers aliases deeper in a
+    // directory, without scanning unrelated ignored trees such as node_modules.
+    const scopes = new Set(addedPaths.map((file) => file.split("/")[0]));
+    const rootIdentities = new Set([...scopes].map(identity).filter((value) => value !== undefined));
+    for (const entry of readdirSync(parentPath)) {
+      const value = identity(entry);
+      if (value !== undefined && rootIdentities.has(value)) scopes.add(entry);
     }
     const local = await run([
       "--literal-pathspecs", "ls-files", "--others", "-z", "--", ...scopes,
     ], parentPath, false);
     if (local.exitCode !== 0) return failure("Failed to inspect parent untracked files", local.stderr);
     const collision = local.stdout.split("\0").filter(Boolean).find((file) =>
-      addedPaths.some((addedPath) => file === addedPath || file.startsWith(`${addedPath}/`) || addedPath.startsWith(`${file}/`)),
+      addedPaths.some((addedPath) =>
+        prefixes(addedPath).some((ancestor) => samePath(file, ancestor)) ||
+        prefixes(file).some((ancestor) => samePath(addedPath, ancestor)),
+      ),
     );
     if (collision) return failure("Integration would overwrite a parent untracked or ignored file", collision);
   }
   if (signal?.aborted) return cancelled();
 
   const merged = await run([
-    "merge", "--no-ff", "--no-edit", "--no-stat", "--no-autostash", "--no-overwrite-ignore", tip.stdout,
+    "merge", "--strategy=ort", "--no-ff", "--no-edit", "--no-stat", "--no-autostash", "--no-overwrite-ignore", tip.stdout,
   ], parentPath);
   if (merged.exitCode !== 0) {
     if (await hasGitState(parentPath, "MERGE_HEAD")) {
