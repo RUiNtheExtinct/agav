@@ -139,11 +139,21 @@ export async function applyWorktreeChanges(
   }
   const parentHead = await run(["rev-parse", "HEAD"], parentPath);
   if (parentHead.exitCode !== 0) return failure("Failed to read parent commit", parentHead.stderr);
+  const parentBranch = await run(["symbolic-ref", "--quiet", "HEAD"], parentPath);
+  if (parentBranch.exitCode !== 0 && parentBranch.exitCode !== 1) {
+    return failure("Failed to inspect parent branch", parentBranch.stderr);
+  }
+  // merge reads branch.<name>.mergeOptions but merge-tree does not. Override it
+  // for these commands only, so configured -X options cannot change destinations
+  // after collision checks. A detached HEAD has no branch options to neutralize.
+  const mergeConfig = parentBranch.exitCode === 0
+    ? ["-c", `branch.${parentBranch.stdout.replace(/^refs\/heads\//, "")}.mergeOptions=`]
+    : [];
   // Preview with the same ort strategy used below, without changing the parent
   // index or worktree. A direct tip-to-tip diff misses rename-derived destinations.
   // Conflicts are rejected here: even merge --abort can delete ignored local files.
   const preview = await run([
-    "merge-tree", "--write-tree", "--no-messages", parentHead.stdout, tip.stdout,
+    ...mergeConfig, "merge-tree", "--write-tree", "--no-messages", parentHead.stdout, tip.stdout,
   ], parentPath);
   if (preview.exitCode === 1) return failure("Worker branch conflicts with the parent");
   if (preview.exitCode !== 0) return failure("Cannot preview worker merge; Git with merge-tree --write-tree support is required", preview.stderr);
@@ -198,7 +208,7 @@ export async function applyWorktreeChanges(
   if (signal?.aborted) return cancelled();
 
   const merged = await run([
-    "merge", "--strategy=ort", "--no-ff", "--no-edit", "--no-stat", "--no-autostash", "--no-overwrite-ignore", tip.stdout,
+    ...mergeConfig, "merge", "--strategy=ort", "--no-ff", "--no-edit", "--no-stat", "--no-autostash", "--no-overwrite-ignore", tip.stdout,
   ], parentPath);
   if (merged.exitCode !== 0) {
     if (await hasGitState(parentPath, "MERGE_HEAD")) {

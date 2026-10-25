@@ -266,6 +266,41 @@ describe("worker Git integration", () => {
     expect(git(repo, "show", `${tree.branchName}:old/output.local`)).toBe("worker output");
   });
 
+  it.each(["parent", "feature/nested.branch"])("keeps preview and execution consistent with %s merge options", async (branch) => {
+    if (branch !== "parent") git(repo, "branch", "-m", branch);
+    write(repo, ".gitignore", ".agav-worktrees/\n*.local\n");
+    write(repo, "old/tracked.txt", "rename anchor\n");
+    commit(repo, "rename base");
+    const tree = await worker();
+    git(repo, "mv", "old", "new");
+    commit(repo, "parent directory rename");
+    write(repo, "old/output.local", "parent-only sentinel\n");
+    write(tree.path, "old/output.local", "worker output\n");
+    git(tree.path, "add", "-f", "old/output.local");
+    commit(tree.path);
+    git(repo, "config", "merge.directoryRenames", "true");
+    const optionsKey = `branch.${branch}.mergeOptions`;
+    git(repo, "config", optionsKey, "-Xno-renames");
+
+    const result = await worktrees.applyWorktreeChanges(tree);
+    expect(readFileSync(join(repo, "old/output.local"), "utf8")).toBe("parent-only sentinel\n");
+    expect(result).toEqual({ applied: true });
+    expect(readFileSync(join(repo, "new/output.local"), "utf8")).toBe("worker output\n");
+    expect(git(repo, "config", "--get", optionsKey)).toBe("-Xno-renames");
+    expectParentClean();
+  });
+
+  it("integrates into a detached parent without branch-specific options", async () => {
+    const tree = await worker();
+    write(tree.path, "new.txt");
+    git(repo, "config", "branch.parent.mergeOptions", "--squash");
+    git(repo, "checkout", "--detach");
+    expect(await worktrees.applyWorktreeChanges(tree)).toEqual({ applied: true });
+    expect(readFileSync(join(repo, "new.txt"), "utf8")).toBe("worker sentinel\n");
+    expect(git(repo, "rev-list", "--parents", "-n", "1", "HEAD").split(" ")).toHaveLength(3);
+    expectParentClean();
+  });
+
   it.for([
     ["output.local", "OUTPUT.LOCAL"],
     ["outpút.local", "OUTPÚT.LOCAL"],
